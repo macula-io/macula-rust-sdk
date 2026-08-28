@@ -493,13 +493,34 @@ call one.
 `caller`, `source_route`) plus `stream_id` (16 bytes) and `mode` ∈
 `server_stream|client_stream|bidi`. Runs on its own dedicated QUIC
 stream, not the control stream — see §7. `stream_data` carries `seq` +
-`body` with `encoding` ∈ `raw|msgpack` (note: **msgpack**, not CBOR, for
-chunk bodies specifically — distinct from the frame envelope's own CBOR
-encoding). `stream_end`'s `role` ∈ `send|both` (half-close vs full
-close). Non-OPEN stream frames may carry an optional `signer` pubkey so a
-relaying station (not just the originating daemon) can be authenticated
-per-hop. See §13 for the full client-side usage pattern (caller and
-provider roles) on top of these frames.
+`body` with `encoding` ∈ `raw|msgpack`. `stream_end`'s `role` ∈
+`send|both` (half-close vs full close). Non-OPEN stream frames may carry
+an optional `signer` pubkey so a relaying station (not just the
+originating daemon) can be authenticated per-hop. See §13 for the full
+client-side usage pattern (caller and provider roles) on top of these
+frames.
+
+**Correction, 2026-08-28 — the `msgpack` encoding is not a second wire
+codec.** An earlier draft of this section (quoted above in the original
+form for the record) read `encoding`'s `msgpack` value as meaning
+`stream_data`'s `body` is pre-serialized through a real MessagePack
+codec, distinct from the frame envelope's own CBOR — implying a Rust
+port would need an `rmp-serde` dependency. Verified directly against
+`macula-io/macula` v10.10.0 and it's wrong: `msgpack` was **removed from
+macula's own dependencies in v3.0.0** (`rebar.config`'s own comment:
+"wire protocol switched to CBOR"); the one remaining `msgpack:pack` call
+in the entire repo is in an unrelated legacy DHT test, never on the
+`stream_data` path. Built a real `stream_data` frame with
+`encoding = msgpack` and a structured Erlang map as `body` in a live
+`rebar3 shell`, round-tripped it through `macula_frame:encode/1` +
+`decode/1`, and got the map straight back — `body` is embedded as an
+ordinary nested value in the frame's own canonical-CBOR envelope, same
+as CALL's `payload`. `encoding` is purely a semantic hint for the
+receiver; **no second codec, no `rmp-serde` dependency needed.**
+Confirmed at the crate level too:
+`stream_data_msgpack_frame_matches_the_reference_byte_for_byte` (Rust
+crate `macula-rust-sdk`, `src/frame.rs`) matches the reference's
+signature byte-for-byte with exactly this shape.
 
 ### 6.11 Content transfer (`want`, `have`, `block`, `manifest_req`,
 `manifest_res`, `cancel`)
@@ -831,10 +852,11 @@ Pattern, from `macula_stream_sink.erl`:
    path for that mode in practice, `bidi` for both directions).
 2. Drive a receive loop: `recv/2` blocks for the next `stream_data`
    frame, decoded per its own `encoding` field (`raw` → bytes, `msgpack`
-   → decoded term — remember this is msgpack, not the frame envelope's
-   CBOR, a second codec a mobile client needs). Loop until `eof`
-   (peer sent `stream_end`) or `{error, Reason}` (peer sent
-   `stream_error`, or the underlying connection died).
+   → a structured value — **not** a second wire codec, see §6.10/§13.3's
+   correction: `body` is an ordinary nested value in the frame's own
+   CBOR envelope either way). Loop until `eof` (peer sent `stream_end`)
+   or `{error, Reason}` (peer sent `stream_error`, or the underlying
+   connection died).
 3. For `client_stream`/`bidi` modes wanting a result: `send/2,3` each
    chunk in order (`stream_data`), `close_send/1` when done
    (`stream_end` with `role => send`), then `await_reply/1,2` blocks for
@@ -865,12 +887,14 @@ explicit abort rule as §13.1, symmetric.
 - One dedicated QUIC stream per streaming-RPC session (§7), never the
   control stream.
 - `stream_data`'s `encoding` field: `raw` (bytes as-is) or `msgpack`
-  (term-encoded) — a **second serialization format** distinct from the
-  frame envelope's own deterministic CBOR (§4). A Rust port needs a
-  msgpack codec (e.g. `rmp-serde`) in addition to the hand-rolled CBOR
-  codec already specced — msgpack here has no stated determinism
-  requirement (it's payload, not signed frame envelope), so any
-  conformant msgpack implementation should do.
+  (a structured value). **Corrected 2026-08-28, see §6.10 above: this is
+  NOT a second serialization format.** msgpack was removed from macula's
+  own dependencies in v3.0.0; `body` for `encoding = msgpack` is embedded
+  directly as an ordinary nested value in the frame's own deterministic
+  CBOR envelope (§4), verified by round-tripping a real frame through
+  `macula_frame:encode/1`/`decode/1`. No msgpack codec (`rmp-serde` or
+  otherwise) is needed in a Rust port — a plain `Value` covers both
+  `encoding` variants.
 - Sequencing: `seq_out`/`seq_in` counters per direction, tracked
   independently — not used for reordering (frames arrive in order on a
   single QUIC stream by construction) but as a sanity/debugging signal.
