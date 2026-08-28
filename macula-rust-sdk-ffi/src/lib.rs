@@ -101,7 +101,7 @@ fn to_mcid(bytes: Vec<u8>) -> Result<macula_rust_sdk::manifest::Mcid, FfiError> 
 /// recursion itself was never the obstacle, only finding time to wire
 /// it up.
 ///
-/// Named `Items`/`Fields` rather than mirroring [`cbor::Value`]'s own
+/// Named `Items`/`Fields` rather than mirroring [`macula_rust_sdk::cbor::Value`]'s own
 /// `List`/`Map` exactly: UniFFI's Kotlin codegen emits an unqualified
 /// `List<T>`/`Map<T>` field type for a `Vec`/dictionary-shaped variant,
 /// and inside `FfiValue`'s own sealed class body that unqualified name
@@ -115,7 +115,7 @@ fn to_mcid(bytes: Vec<u8>) -> Result<macula_rust_sdk::manifest::Mcid, FfiError> 
 /// names are reused here.
 ///
 /// [`Fields`](FfiValue::Fields) uses [`FfiMapEntry`] rather than
-/// `HashMap<String, FfiValue>`: [`cbor::Value::Map`]'s own keys are
+/// `HashMap<String, FfiValue>`: [`macula_rust_sdk::cbor::Value::Map`]'s own keys are
 /// arbitrary values, not just text (Part 6 §9's integer-keyed sub-maps
 /// are real, not hypothetical — mpong's per-wall game state is one), and
 /// UniFFI's dictionary type requires a hashable, non-recursive key.
@@ -131,7 +131,7 @@ pub enum FfiValue {
 }
 
 /// One key/value pair of an [`FfiValue::Fields`], in insertion order —
-/// mirrors [`cbor::Value::Map`]'s own `Vec<(Value, Value)>` exactly,
+/// mirrors [`macula_rust_sdk::cbor::Value::Map`]'s own `Vec<(Value, Value)>` exactly,
 /// including that canonical key sort happens at encode time, not here.
 #[derive(uniffi::Record, Debug, Clone, PartialEq)]
 pub struct FfiMapEntry {
@@ -998,8 +998,14 @@ mod ffi_value_tests {
 
     #[test]
     fn empty_list_and_map_round_trip() {
-        assert_eq!(round_trip(FfiValue::Items(vec![])).unwrap(), FfiValue::Items(vec![]));
-        assert_eq!(round_trip(FfiValue::Fields(vec![])).unwrap(), FfiValue::Fields(vec![]));
+        assert_eq!(
+            round_trip(FfiValue::Items(vec![])).unwrap(),
+            FfiValue::Items(vec![])
+        );
+        assert_eq!(
+            round_trip(FfiValue::Fields(vec![])).unwrap(),
+            FfiValue::Fields(vec![])
+        );
     }
 
     #[test]
@@ -1015,8 +1021,14 @@ mod ffi_value_tests {
     #[test]
     fn flat_map_round_trips() {
         let v = FfiValue::Fields(vec![
-            FfiMapEntry { key: FfiValue::Text("city".to_string()), value: FfiValue::Text("Milan".to_string()) },
-            FfiMapEntry { key: FfiValue::Text("lat".to_string()), value: FfiValue::Float(45.4642) },
+            FfiMapEntry {
+                key: FfiValue::Text("city".to_string()),
+                value: FfiValue::Text("Milan".to_string()),
+            },
+            FfiMapEntry {
+                key: FfiValue::Text("lat".to_string()),
+                value: FfiValue::Float(45.4642),
+            },
         ]);
         assert_eq!(round_trip(v.clone()).unwrap(), v);
     }
@@ -1030,8 +1042,14 @@ mod ffi_value_tests {
     fn map_containing_list_of_maps_round_trips() {
         let station = |city: &str| {
             FfiValue::Fields(vec![
-                FfiMapEntry { key: FfiValue::Text("city".to_string()), value: FfiValue::Text(city.to_string()) },
-                FfiMapEntry { key: FfiValue::Text("capabilities".to_string()), value: FfiValue::Int(0) },
+                FfiMapEntry {
+                    key: FfiValue::Text("city".to_string()),
+                    value: FfiValue::Text(city.to_string()),
+                },
+                FfiMapEntry {
+                    key: FfiValue::Text("capabilities".to_string()),
+                    value: FfiValue::Int(0),
+                },
             ])
         };
         let v = FfiValue::Fields(vec![FfiMapEntry {
@@ -1046,8 +1064,14 @@ mod ffi_value_tests {
     #[test]
     fn integer_keyed_map_round_trips() {
         let v = FfiValue::Fields(vec![
-            FfiMapEntry { key: FfiValue::Int(0), value: FfiValue::Text("a".to_string()) },
-            FfiMapEntry { key: FfiValue::Int(1), value: FfiValue::Text("b".to_string()) },
+            FfiMapEntry {
+                key: FfiValue::Int(0),
+                value: FfiValue::Text("a".to_string()),
+            },
+            FfiMapEntry {
+                key: FfiValue::Int(1),
+                value: FfiValue::Text("b".to_string()),
+            },
         ]);
         assert_eq!(round_trip(v.clone()).unwrap(), v);
     }
