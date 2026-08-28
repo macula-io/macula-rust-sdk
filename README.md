@@ -24,8 +24,8 @@
 > (`station-de-frankfurt.macula.io`) — handshake, unary RPC, PubSub,
 > content transfer, and streaming RPC, every primitive in both caller
 > and provider roles. Mobile bindings (Kotlin + Swift, via UniFFI) wrap
-> most of that surface, generated and CI-checked on every push, with one
-> named exception. See [Status](#status) for what's not there yet.
+> the entire surface, generated and CI-checked on every push. See
+> [Status](#status) for what's not there yet.
 
 ## What is this?
 
@@ -53,7 +53,7 @@ CLI, or WASM as any other Rust SDK.
 | Content transfer (single-block + chunked) | ✅ | ✅ | Content-addressed, BLAKE3/SHA-256 |
 | Streaming RPC (STREAM_OPEN/DATA/END/REPLY) | ✅ | ✅ | Both roles live-verified against the real fleet |
 | RPC advertise/unadvertise | ✅ | — | |
-| Mobile bindings (Kotlin, Swift) | ✅ | 🏗️ | Via [UniFFI](#mobile-bindings-uniffi) — `serve_one_call` not yet surfaced through FFI (a `Fn(Value) -> Result<Value,String>` callback crossing the FFI boundary is a separate, bounded piece of work) |
+| Mobile bindings (Kotlin, Swift) | ✅ | ✅ | Via [UniFFI](#mobile-bindings-uniffi) — provider role serves via `FfiCallHandler`, a foreign-implemented async trait (`suspend fun`/`async throws`), not a closure |
 | Pubkey-pinned trust | 🏗️ | — | `Trust::Pinned` exists in the core crate, not yet surfaced through FFI |
 
 `unsafe_code = "forbid"` at the crate level — the only unsafe in this
@@ -103,12 +103,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 `macula-rust-sdk-ffi` is a separate crate — not code bolted onto the
 core one — wrapping every application primitive (`FfiSession::connect`/
-`call`/`publish`/`subscribe`/`content_put`/`content_get`/`stream_open`/
-`advertise`/`accept_stream`) for Kotlin and Swift, in the modern
-proc-macro UniFFI style (`#[uniffi::export]`, native `async`/`await` and
-Kotlin coroutines, no `.udl` file). CI rebuilds the `cdylib` and
-regenerates both language bindings on every push as a codegen smoke
-test.
+`call`/`serve_one_call`/`publish`/`subscribe`/`content_put`/
+`content_get`/`stream_open`/`advertise`/`accept_stream`) for Kotlin and
+Swift, in the modern proc-macro UniFFI style (`#[uniffi::export]`,
+native `async`/`await` and Kotlin coroutines, no `.udl` file). CI
+rebuilds the `cdylib` and regenerates both language bindings on every
+push as a codegen smoke test.
+
+Serving an RPC from Kotlin or Swift means implementing `FfiCallHandler`
+— a **foreign trait** (`#[uniffi::export(foreign)]`), not a callback
+closure (UniFFI foreign traits can't carry a plain closure, so
+`handle` receives the full inbound call and does its own procedure
+routing if a session serves more than one):
+
+```kotlin
+class Doubler : FfiCallHandler {
+    override suspend fun handle(procedure: String, realm: ByteArray, payload: FfiValue): FfiValue {
+        val n = (payload as FfiValue.Int).v1
+        return FfiValue.Int(n * 2)
+    }
+}
+
+session.advertise("math.double", realm, identity)
+session.serveOneCall(Doubler(), timeoutMs = 30_000u, identity)
+```
+
+(`FfiValue` currently covers `Null`/`Int`/`Bytes`/`Text`/`Float` — see
+this crate's own module doc for why `List`/`Map` aren't there yet; a
+handler needing a structured payload should encode it as `Bytes`
+today.)
 
 ```bash
 cargo build -p macula-rust-sdk-ffi --release
@@ -157,14 +180,22 @@ and content-transfer provider roles landed — a service built on this
 crate could call RPCs and serve streams, but couldn't serve a
 request/response procedure at all. It's now built here and in
 [`macula-go-sdk`](https://github.com/macula-io/macula-go-sdk) in the
-same pass, so both SDKs serve RPCs, not just call them.
+same pass, so both SDKs serve RPCs, not just call them, and wrapped in
+the FFI layer the same day: [`FfiCallHandler`](#mobile-bindings-uniffi)
+is a **foreign trait** (`#[uniffi::export(foreign)]`), not a callback
+closure — UniFFI doesn't support passing a bare closure across the
+boundary, so `handle` receives the full inbound call and a Kotlin/Swift
+implementation does its own procedure routing if a session serves more
+than one. Verified past "it compiles": rebuilt the release `cdylib`,
+regenerated both Kotlin and Swift, and inspected the actual generated
+code — `FfiCallHandler.handle` renders as `suspend fun ... : FfiValue`
+in Kotlin and `func handle(...) async throws -> FfiValue` in Swift,
+`FfiSession.serveOneCall`/`serveOneCall` takes it as a parameter in
+both, not just as an exit-code smoke test.
 
 **Not yet built:**
 - Pubkey-pinned trust surfaced through the FFI layer (`Trust::Pinned`
   exists in the core crate)
-- `serve_one_call` surfaced through the FFI layer — passing a
-  Kotlin/Swift callback across the UniFFI boundary as a `CallHandler`
-  is a separate, bounded piece of work from the core-crate change
 
 See [`plans/PLAN_WIRE_PROTOCOL.md`](plans/PLAN_WIRE_PROTOCOL.md) for the
 full wire-format spec this crate is built against, section by section,

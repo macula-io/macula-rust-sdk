@@ -9,13 +9,12 @@
 //! or WASM as it was before this crate existed.
 //!
 //! Every application primitive the core crate has is wrapped: identity,
-//! CONNECT/HELLO, CALL/RESULT/ERROR, PUBLISH/SUBSCRIBE/EVENT, content
-//! transfer, and streaming RPC — both the caller/consumer role (§13.1)
-//! and the provider role (§13.2/§6.9, `advertise`/`accept_stream`). Not
-//! exposed: unary-RPC provider dispatch (accepting an inbound CALL and
-//! replying — the core crate doesn't implement that role either yet,
-//! only streaming's provider side) and pubkey-pinned trust (`connect`
-//! always uses WebPki).
+//! CONNECT/HELLO, CALL/RESULT/ERROR as both caller AND provider
+//! (`call`/[`FfiSession::serve_one_call`]), PUBLISH/SUBSCRIBE/EVENT,
+//! content transfer, and streaming RPC — both the caller/consumer role
+//! (§13.1) and the provider role (§13.2/§6.9,
+//! `advertise`/`accept_stream`). Not exposed: pubkey-pinned trust
+//! (`connect` always uses WebPki).
 //!
 //! [`FfiValue`] covers `Null`/`Int`/`Bytes`/`Text`/`Float` — the
 //! variants [`macula_rust_sdk::cbor::Value`] itself has, MINUS
@@ -60,6 +59,8 @@ pub enum FfiError {
     WrongByteLength { expected: u32, actual: u32 },
     #[error("this session is already closed")]
     Closed,
+    #[error("the call handler failed: {reason}")]
+    CallHandlerFailed { reason: String },
 }
 
 /// `Vec<u8>` -> `[u8; 32]`, with both lengths actually reported on
@@ -178,6 +179,45 @@ impl TryFrom<macula_rust_sdk::frame::CallResponse> for FfiCallResponse {
             }),
         }
     }
+}
+
+/// Provider role: implement this trait on the foreign side (Kotlin,
+/// Swift) to serve inbound unary CALLs — see
+/// [`FfiSession::serve_one_call`]. Adapts
+/// [`macula_rust_sdk::connection::CallHandler`] for the FFI boundary:
+/// `handle` receives the full inbound call (`procedure`/`realm`/
+/// `payload`) rather than being looked up from a table first, since a
+/// UniFFI foreign trait can't be handed a plain Rust closure the way
+/// the core crate's `CallLookup` is — do your own procedure routing
+/// inside `handle` if a single session serves more than one procedure.
+///
+/// An `Err` reply is always sent as a BOLT#4 `unknown_error` (0x0F)
+/// with `reason` as its `detail` — this trait has no way to
+/// distinguish "unknown procedure" from any other application-level
+/// failure the way the core crate's `CallLookup` can (a synchronous,
+/// local table lookup that either finds a handler or doesn't, checked
+/// *before* any handler runs): that distinction would need the foreign
+/// side to answer a synchronous "do I handle this?" question ahead of
+/// the necessarily-async `handle` call, which UniFFI foreign traits
+/// don't support today. Nothing behavioral is lost either way — BOLT#4
+/// `unknown_next_peer` and `unknown_error` carry the identical retry
+/// classification (`plans/PLAN_WIRE_PROTOCOL.md` §9) — only diagnostic
+/// precision.
+///
+/// A panic inside `handle` is caught the same way the core crate's own
+/// `serve_one_call` catches one (via `tokio::spawn` +
+/// `JoinError::is_panic()`) and reported to the caller as BOLT#4
+/// `temporary_relay_failure`, not propagated across the FFI boundary as
+/// a Rust panic.
+#[uniffi::export(foreign)]
+#[async_trait::async_trait]
+pub trait FfiCallHandler: Send + Sync {
+    async fn handle(
+        &self,
+        procedure: String,
+        realm: Vec<u8>,
+        payload: FfiValue,
+    ) -> Result<FfiValue, FfiError>;
 }
 
 /// What a subscriber receives: a mirror of
@@ -400,6 +440,61 @@ impl FfiSession {
                 reason: e.to_string(),
             })?;
         FfiCallResponse::try_from(response)
+    }
+
+    /// The provider role's counterpart to [`call`](Self::call): block
+    /// for the next inbound CALL frame, bounded by `timeout_ms`, and
+    /// dispatch it to `handler` — see [`FfiCallHandler`].
+    ///
+    /// Same "control stream, one thing at a time" limitation
+    /// [`call`](Self::call) itself carries, and the same lock-holding
+    /// behavior [`accept_stream`](Self::accept_stream) already
+    /// documents: no other method on this `FfiSession` can run
+    /// concurrently while a call to this one is in flight.
+    pub async fn serve_one_call(
+        &self,
+        handler: std::sync::Arc<dyn FfiCallHandler>,
+        timeout_ms: u64,
+        identity: &FfiKeyPair,
+    ) -> Result<(), FfiError> {
+        let mut guard = self.0.lock().await;
+        let session = guard.as_mut().ok_or(FfiError::Closed)?;
+
+        let lookup = move |realm: &[u8; 32], procedure: &str| {
+            let handler = handler.clone();
+            let realm = realm.to_vec();
+            let procedure = procedure.to_string();
+            let core_handler: macula_rust_sdk::connection::CallHandler =
+                std::sync::Arc::new(move |payload: macula_rust_sdk::cbor::Value| {
+                    let handler = handler.clone();
+                    let realm = realm.clone();
+                    let procedure = procedure.clone();
+                    Box::pin(async move {
+                        let ffi_payload = FfiValue::try_from(payload).map_err(|e| e.to_string())?;
+                        let reply = handler
+                            .handle(procedure, realm, ffi_payload)
+                            .await
+                            .map_err(|e| e.to_string())?;
+                        Ok(macula_rust_sdk::cbor::Value::from(reply))
+                    })
+                        as macula_rust_sdk::connection::BoxFuture<
+                            'static,
+                            Result<macula_rust_sdk::cbor::Value, String>,
+                        >
+                });
+            Some(core_handler)
+        };
+
+        session
+            .serve_one_call(
+                lookup,
+                &identity.0,
+                std::time::Duration::from_millis(timeout_ms),
+            )
+            .await
+            .map_err(|e| FfiError::Recv {
+                reason: e.to_string(),
+            })
     }
 
     /// Send a signed PUBLISH. Fire-and-forget — no reply is expected on

@@ -28,3 +28,4 @@ macula-rust-sdk = { path = ".." }
 uniffi = { version = "0.32", features = ["cli", "tokio"] }
 tokio = { version = "1", features = ["full"] }
 thiserror = "2"
+async-trait = "0.1"
