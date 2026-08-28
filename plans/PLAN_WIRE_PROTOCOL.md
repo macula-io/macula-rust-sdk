@@ -344,6 +344,21 @@ skipping it fails silently.** From `macula_identity.erl` (177 lines) and
   diagnose without Erlang-side introspection. Do not skip it, and don't
   bury the identity-generation step where a future implementer might
   reach for the cheap `generate()` instead of `generate(#{puzzle=>true})`.
+- **Empirical caveat, 2026-08-28 — tested directly, not assumed.** Against
+  the live `macula-station-frankfurt` (`macula-rust-sdk`'s
+  `tests/live_station.rs`), an **unhardened** identity was accepted
+  (`accepted = true`), not rejected — contradicting the incident above.
+  `macula-rust-sdk`'s own puzzle-evidence computation is independently
+  verified byte-for-byte against real Erlang `crypto:hash/2` output, so
+  this isn't a client-side computation bug; it means either this
+  particular dev-fleet station has enforcement disabled/lenient (it's
+  documented elsewhere as throwaway dev infra, not production), the
+  deployed image predates the enforcement described above, or
+  enforcement is scoped to a condition a plain CONNECT doesn't trigger.
+  Which one is true is a `macula-station`-side question, not chased here.
+  **Grind the puzzle regardless** — the cost is negligible and it's
+  unambiguously the documented, intended behavior; this caveat is a fact
+  about one dev station's current configuration, not license to skip it.
 
 **Lifecycle for the mobile port:** grind once — at first run/onboarding,
 not per connection — persist the resulting keypair in secure device

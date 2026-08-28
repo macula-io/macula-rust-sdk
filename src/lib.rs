@@ -8,6 +8,7 @@
 
 pub mod cbor;
 pub mod cert;
+pub mod connection;
 pub mod frame;
 pub mod identity;
 pub mod transport;

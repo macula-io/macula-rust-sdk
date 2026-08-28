@@ -23,6 +23,8 @@
 //! (`reference_demo_fleet_boxes`), confirmed still true today.
 
 use macula_rust_sdk::cert::ed25519_pubkey_from_cert;
+use macula_rust_sdk::connection;
+use macula_rust_sdk::identity::KeyPair;
 use macula_rust_sdk::transport::{connect, Trust};
 
 const STATION_HOST: &str = "station-de-frankfurt.macula.io";
@@ -87,4 +89,75 @@ async fn webpki_trust_succeeds_against_the_real_fleet() {
         .await
         .expect("CA-chain validation should succeed against a real Let's Encrypt cert");
     connection.close(0u32.into(), b"done");
+}
+
+/// The real milestone: not just a QUIC/TLS connection, but a complete
+/// macula application-layer handshake — signed CONNECT out, verified
+/// HELLO back, `accepted = true` — against a real production station.
+/// Uses a **puzzle-hardened** identity deliberately: see
+/// `plans/PLAN_WIRE_PROTOCOL.md` §5's callout on why an unhardened one
+/// fails this silently (QUIC/TLS looks fine, the station just never
+/// accepts).
+#[tokio::test]
+#[ignore = "requires network access to a live macula-station"]
+async fn full_handshake_succeeds_against_the_real_fleet() {
+    let identity = KeyPair::generate_with_default_puzzle();
+
+    let session = connection::connect(STATION_HOST, STATION_PORT, Trust::WebPki, &identity)
+        .await
+        .expect("CONNECT/HELLO handshake should succeed against a live station");
+
+    println!(
+        "handshake accepted: remote={} station_node_id={} negotiated_capabilities={}",
+        session.remote_address(),
+        hex::encode(session.station.node_id),
+        session.station.negotiated_capabilities,
+    );
+    assert!(session.station.accepted);
+
+    session
+        .close("normal", Some("integration test done"), &identity)
+        .await;
+}
+
+/// **Empirical finding, 2026-08-28 — contradicts the documented
+/// expectation, recorded honestly rather than papered over.** The plan
+/// (`plans/PLAN_WIRE_PROTOCOL.md` §5) and the production incident it's
+/// based on both describe every station enforcing puzzle admission on
+/// every CONNECT. Tested directly against `macula-station-frankfurt`: an
+/// **unhardened identity was accepted** (`accepted = true`, same shape
+/// as the hardened case). This crate's `puzzle_evidence` computation is
+/// independently verified byte-for-byte against real Erlang
+/// `crypto:hash/2` output (`src/identity.rs`'s own tests), so this isn't
+/// a computation bug here — it means either (a) this specific dev-fleet
+/// station has puzzle enforcement disabled or configured leniently (it's
+/// documented elsewhere as throwaway dev infra, not production), (b) the
+/// deployed image predates that enforcement, or (c) enforcement is
+/// scoped to some condition this plain CONNECT doesn't trigger. Which
+/// one is true is a `macula-station`-side question, out of scope for
+/// this crate to chase — recorded here as a fact about what actually
+/// happens against this fleet today, not a guarantee about macula's
+/// protocol in general. **Always grind the puzzle regardless** (the cost
+/// is negligible and it's clearly the intended, documented behavior) —
+/// this test does not license skipping it.
+#[tokio::test]
+#[ignore = "requires network access to a live macula-station"]
+async fn unhardened_identity_against_the_real_fleet_is_observed_not_assumed() {
+    let identity = KeyPair::generate(); // NOT puzzle-hardened, on purpose
+
+    let result = connection::connect(STATION_HOST, STATION_PORT, Trust::WebPki, &identity).await;
+    match result {
+        Ok(session) => {
+            println!(
+                "OBSERVED: unhardened identity was ACCEPTED (accepted={}) -- see this \
+                 test's doc comment for why that's a fleet-configuration fact, not \
+                 evidence this crate's puzzle handling is wrong",
+                session.station.accepted
+            );
+            session.close("normal", None, &identity).await;
+        }
+        Err(e) => {
+            println!("OBSERVED: unhardened identity was rejected, as: {e}");
+        }
+    }
 }
