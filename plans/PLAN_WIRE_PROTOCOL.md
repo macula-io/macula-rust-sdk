@@ -960,11 +960,10 @@ in the core crate. The doc comment at the top of `src/lib.rs`
 ("Mobile... is the flagship consumer driving this work, not the ceiling
 on it") is enforced structurally by this separation, not just stated.
 
-**What's exposed so far (the first slice, proving the pipeline rather
-than covering everything):**
+**What's exposed so far:**
 - `FfiKeyPair` — identity generation, `node_id()`.
 - `FfiSession` — `connect` (CONNECT/HELLO), `call` (CALL/RESULT/ERROR),
-  `close`.
+  `publish`/`subscribe`/`unsubscribe`/`recv_event` (§6.8), `close`.
 - `FfiValue` — a **restricted** mirror of `cbor::Value`: `Null`/`Int`/
   `Bytes`/`Text`/`Float`. Missing `List`/`Map` (need recursive UniFFI
   enums — deferred, not a wire limitation) and `Int` is narrowed from
@@ -972,11 +971,17 @@ than covering everything):**
   value returns an explicit `FfiError::UnrepresentableValue` rather than
   silently truncating).
 - `FfiCallResponse` — mirrors `frame::CallResponse`.
+- `FfiEvent` — mirrors `frame::EventInfo`. `publish`'s `seq`/
+  `published_at_ms` stay caller-supplied rather than tracked internally
+  by `FfiSession` (unlike streaming RPC's per-stream `seq_out` counter):
+  PUBLISH's `seq` is a per-publisher, per-topic gap-detection sequence, and
+  a client publishing to several topics has to own that bookkeeping
+  itself.
 
-**Not yet wrapped** (all already built and live-verified in the core
-crate — see §6.8, §12, §13 — this is purely FFI-surface work remaining,
-no new wire-protocol work): PUBLISH/SUBSCRIBE/EVENT, content transfer
-(`content::put`/`get`), streaming RPC (`StreamHandle`).
+**Not yet wrapped** (already built and live-verified in the core
+crate — see §12, §13 — this is purely FFI-surface work remaining, no new
+wire-protocol work): content transfer (`content::put`/`get`), streaming
+RPC (`StreamHandle`).
 
 **Verified past "it compiles":** built the release `cdylib` and actually
 ran `uniffi-bindgen generate` for both Kotlin and Swift, then inspected
