@@ -939,6 +939,473 @@ pub fn decode(buf: &[u8]) -> Result<Decoded, DecodeFrameError> {
     Ok(Decoded::Frame(value, 4 + len))
 }
 
+// ---------------------------------------------------------------------
+// Streaming RPC (§13 of `plans/PLAN_WIRE_PROTOCOL.md`): STREAM_OPEN,
+// STREAM_DATA, STREAM_END, STREAM_ERROR, STREAM_REPLY. Ported from
+// `macula_frame.erl`'s streaming constructors, verified against real
+// `rebar3` output the same way as every other frame type.
+//
+// **Real finding, empirically verified (2026-08-28), correcting an
+// assumption in an earlier draft of the wire-protocol spec:** despite
+// `encoding`'s `msgpack` value name, there is no second wire codec.
+// `msgpack` was removed from macula's own dependencies in v3.0.0
+// (`rebar.config`'s own comment: "wire protocol switched to CBOR"); the
+// one remaining `msgpack:pack` call in the whole macula repo is in an
+// unrelated legacy DHT test, never on the `stream_data` path. Confirmed
+// directly: building a `stream_data` frame with `encoding = msgpack` and
+// an arbitrary Erlang map as `body`, then round-tripping it through
+// `macula_frame:encode/1` + `decode/1`, hands the map straight back —
+// `body` is embedded as an ordinary nested value in the frame's own
+// canonical-CBOR envelope, exactly like CALL's `payload` or
+// `stream_reply`'s `payload`. So here, `encoding` is purely a semantic
+// hint for the receiver ("treat `body` as raw bytes" vs "treat it as a
+// structured value") — `StreamDataSpec::body` is just a [`Value`] either
+// way, and no `rmp-serde`/msgpack dependency is needed in this crate.
+//
+// **v1 scope, matching this crate's existing priority (also documented
+// in the plan): the caller/consumer role (§13.1) only.** These
+// constructors are enough to open a stream, send/receive chunks, close
+// or abort — the shape a mobile client actually needs. The provider
+// role (§13.2, exposing a streaming procedure *to* the mesh) isn't
+// built — nothing in this crate needs to *serve* RPCs yet.
+//
+// **`signer` (an optional field on STREAM_DATA/STREAM_END/STREAM_ERROR,
+// confirmed present in the reference via `maybe_add_signer/2`) is not
+// exposed here.** Its stated purpose is multi-hop relay authentication —
+// letting a relaying station attribute a frame to the originating daemon
+// rather than to itself. A direct-dial client talking to one station
+// has no relay hop to authenticate across, matching every other frame
+// type this crate already builds (CALL, PUBLISH, etc. — none expose a
+// `signer` field either).
+
+/// `mode` on a STREAM_OPEN — who's expected to push data. Matches
+/// `macula_stream:mode()`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamMode {
+    /// The provider pushes chunks at the caller.
+    ServerStream,
+    /// The caller pushes chunks at the provider (§12.3's push-upload
+    /// path is exactly this mode).
+    ClientStream,
+    /// Both directions.
+    Bidi,
+}
+
+impl StreamMode {
+    pub fn name(self) -> &'static str {
+        match self {
+            StreamMode::ServerStream => "server_stream",
+            StreamMode::ClientStream => "client_stream",
+            StreamMode::Bidi => "bidi",
+        }
+    }
+
+    // No `from_name`: nothing in this crate parses an *incoming*
+    // STREAM_OPEN (that's the provider role, §13.2, not built — see
+    // this section's module doc). Add it if/when that role is built.
+}
+
+/// `encoding` on a STREAM_DATA — a hint for how to interpret `body`, not
+/// a second wire codec. See this section's module-level note.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamEncoding {
+    /// `body` is opaque bytes.
+    Raw,
+    /// `body` is a structured [`Value`] (despite the name — no msgpack
+    /// byte-level encoding actually happens; see the note above).
+    Msgpack,
+}
+
+impl StreamEncoding {
+    pub fn name(self) -> &'static str {
+        match self {
+            StreamEncoding::Raw => "raw",
+            StreamEncoding::Msgpack => "msgpack",
+        }
+    }
+
+    fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "raw" => Some(StreamEncoding::Raw),
+            "msgpack" => Some(StreamEncoding::Msgpack),
+            _ => None,
+        }
+    }
+}
+
+/// `role` on a STREAM_END — which direction(s) are closing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamRole {
+    /// Half-close: this side is done sending, still willing to receive.
+    Send,
+    /// Full close: this side is done in both directions.
+    Both,
+}
+
+impl StreamRole {
+    pub fn name(self) -> &'static str {
+        match self {
+            StreamRole::Send => "send",
+            StreamRole::Both => "both",
+        }
+    }
+
+    fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "send" => Some(StreamRole::Send),
+            "both" => Some(StreamRole::Both),
+            _ => None,
+        }
+    }
+}
+
+/// Fields for a STREAM_OPEN frame. Mirrors CALL's auth/routing shape —
+/// `deadline_ms`/`caller`/`source_route`/`retry_budget` — plus the
+/// stream-specific `stream_id`/`mode`/`args`.
+#[derive(Debug, Clone)]
+pub struct StreamOpenSpec {
+    pub stream_id: [u8; 16],
+    pub procedure: String,
+    pub realm: [u8; 32],
+    pub mode: StreamMode,
+    pub args: Value,
+    pub deadline_ms: i128,
+    pub caller: [u8; 32],
+    pub source_route: Vec<u8>,
+    pub retry_budget: u64,
+}
+
+impl StreamOpenSpec {
+    pub fn new(
+        stream_id: [u8; 16],
+        procedure: impl Into<String>,
+        realm: [u8; 32],
+        mode: StreamMode,
+        args: Value,
+        deadline_ms: i128,
+        caller: [u8; 32],
+    ) -> Self {
+        Self {
+            stream_id,
+            procedure: procedure.into(),
+            realm,
+            mode,
+            args,
+            deadline_ms,
+            caller,
+            source_route: Vec::new(),
+            retry_budget: 0,
+        }
+    }
+}
+
+fn stream_open_value(spec: &StreamOpenSpec, frame_id: [u8; 16], sent_at_ms: u64) -> Value {
+    Value::Map(base("stream_open", 0, frame_id, sent_at_ms))
+        .with_field("stream_id", Value::Bytes(spec.stream_id.to_vec()))
+        // `procedure := binary()` -- bytes, not text. Same fix as CALL's
+        // `procedure`.
+        .with_field(
+            "procedure",
+            Value::Bytes(spec.procedure.as_bytes().to_vec()),
+        )
+        .with_field("realm", Value::Bytes(spec.realm.to_vec()))
+        .with_field("mode", Value::text(spec.mode.name()))
+        .with_field("args", spec.args.clone())
+        .with_field("deadline_ms", Value::Int(spec.deadline_ms))
+        .with_field("caller", Value::Bytes(spec.caller.to_vec()))
+        .with_field("source_route", Value::Bytes(spec.source_route.clone()))
+        .with_field("retry_budget", Value::Int(spec.retry_budget as i128))
+}
+
+/// Build a STREAM_OPEN frame with a fresh `frame_id`/`sent_at_ms`.
+/// Unsigned — pass the result to [`sign`] before sending.
+pub fn stream_open(spec: &StreamOpenSpec) -> Value {
+    stream_open_value(spec, fresh_frame_id(), current_millis())
+}
+
+/// Fields for a STREAM_DATA frame — one chunk. `body`'s shape follows
+/// `encoding`: [`Value::Bytes`] for [`StreamEncoding::Raw`], any
+/// structured [`Value`] for [`StreamEncoding::Msgpack`] (see this
+/// section's module-level note on why that's still a plain CBOR value,
+/// not a second codec).
+#[derive(Debug, Clone)]
+pub struct StreamDataSpec {
+    pub stream_id: [u8; 16],
+    pub seq: u64,
+    pub encoding: StreamEncoding,
+    pub body: Value,
+}
+
+impl StreamDataSpec {
+    pub fn new(stream_id: [u8; 16], seq: u64, encoding: StreamEncoding, body: Value) -> Self {
+        Self {
+            stream_id,
+            seq,
+            encoding,
+            body,
+        }
+    }
+}
+
+fn stream_data_value(spec: &StreamDataSpec, frame_id: [u8; 16], sent_at_ms: u64) -> Value {
+    // NOTE: like RESULT, STREAM_DATA does not touch the base envelope's
+    // `realm`/`call_id`/`source_route` — they stay `Null`, confirmed
+    // directly against the reference's own output, not assumed from
+    // STREAM_OPEN's pattern.
+    Value::Map(base("stream_data", 0, frame_id, sent_at_ms))
+        .with_field("stream_id", Value::Bytes(spec.stream_id.to_vec()))
+        .with_field("seq", Value::Int(spec.seq as i128))
+        .with_field("encoding", Value::text(spec.encoding.name()))
+        .with_field("body", spec.body.clone())
+}
+
+/// Build a STREAM_DATA frame with a fresh `frame_id`/`sent_at_ms`.
+pub fn stream_data(spec: &StreamDataSpec) -> Value {
+    stream_data_value(spec, fresh_frame_id(), current_millis())
+}
+
+/// Fields for a STREAM_END frame — a half-close (`role: Send`) or full
+/// close (`role: Both`) of one direction.
+#[derive(Debug, Clone)]
+pub struct StreamEndSpec {
+    pub stream_id: [u8; 16],
+    pub role: StreamRole,
+}
+
+impl StreamEndSpec {
+    pub fn new(stream_id: [u8; 16], role: StreamRole) -> Self {
+        Self { stream_id, role }
+    }
+}
+
+fn stream_end_value(spec: &StreamEndSpec, frame_id: [u8; 16], sent_at_ms: u64) -> Value {
+    Value::Map(base("stream_end", 0, frame_id, sent_at_ms))
+        .with_field("stream_id", Value::Bytes(spec.stream_id.to_vec()))
+        .with_field("role", Value::text(spec.role.name()))
+}
+
+/// Build a STREAM_END frame with a fresh `frame_id`/`sent_at_ms`.
+pub fn stream_end(spec: &StreamEndSpec) -> Value {
+    stream_end_value(spec, fresh_frame_id(), current_millis())
+}
+
+/// Fields for a STREAM_ERROR frame — the explicit abort a well-behaved
+/// peer sends instead of just dropping the stream on any non-normal
+/// termination (`plans/PLAN_WIRE_PROTOCOL.md` §13.1, point 4). `code`
+/// here is a free-form label (`is_binary(Code)` in the reference), NOT
+/// a BOLT#4 numeric code like an ERROR (§6.4) frame's `code` — streaming
+/// aborts and unary-call errors use unrelated error vocabularies.
+#[derive(Debug, Clone)]
+pub struct StreamErrorSpec {
+    pub stream_id: [u8; 16],
+    pub code: String,
+    pub message: String,
+}
+
+impl StreamErrorSpec {
+    pub fn new(stream_id: [u8; 16], code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            stream_id,
+            code: code.into(),
+            message: message.into(),
+        }
+    }
+}
+
+fn stream_error_value(spec: &StreamErrorSpec, frame_id: [u8; 16], sent_at_ms: u64) -> Value {
+    Value::Map(base("stream_error", 0, frame_id, sent_at_ms))
+        .with_field("stream_id", Value::Bytes(spec.stream_id.to_vec()))
+        .with_field("code", Value::Bytes(spec.code.as_bytes().to_vec()))
+        .with_field("message", Value::Bytes(spec.message.as_bytes().to_vec()))
+}
+
+/// Build a STREAM_ERROR frame with a fresh `frame_id`/`sent_at_ms`.
+pub fn stream_error(spec: &StreamErrorSpec) -> Value {
+    stream_error_value(spec, fresh_frame_id(), current_millis())
+}
+
+/// Fields for a STREAM_REPLY frame — the terminal result of a
+/// `client_stream`/`bidi` exchange, sent once by the provider after it
+/// has fully consumed and verified whatever the caller streamed.
+#[derive(Debug, Clone)]
+pub struct StreamReplySpec {
+    pub stream_id: [u8; 16],
+    pub payload: Value,
+    pub responded_by: [u8; 32],
+}
+
+impl StreamReplySpec {
+    pub fn new(stream_id: [u8; 16], payload: Value, responded_by: [u8; 32]) -> Self {
+        Self {
+            stream_id,
+            payload,
+            responded_by,
+        }
+    }
+}
+
+fn stream_reply_value(spec: &StreamReplySpec, frame_id: [u8; 16], sent_at_ms: u64) -> Value {
+    Value::Map(base("stream_reply", 0, frame_id, sent_at_ms))
+        .with_field("stream_id", Value::Bytes(spec.stream_id.to_vec()))
+        .with_field("payload", spec.payload.clone())
+        .with_field("responded_by", Value::Bytes(spec.responded_by.to_vec()))
+}
+
+/// Build a STREAM_REPLY frame with a fresh `frame_id`/`sent_at_ms`.
+pub fn stream_reply(spec: &StreamReplySpec) -> Value {
+    stream_reply_value(spec, fresh_frame_id(), current_millis())
+}
+
+/// Extract this frame's `stream_id`, regardless of frame type — used to
+/// correlate STREAM_DATA/STREAM_END/STREAM_ERROR/STREAM_REPLY frames
+/// back to the STREAM_OPEN that started the exchange. 16 bytes, matching
+/// `stream_id() :: <<_:128>>`.
+pub fn frame_stream_id(frame: &Value) -> Option<[u8; 16]> {
+    match frame.get("stream_id") {
+        Some(Value::Bytes(b)) => b.as_slice().try_into().ok(),
+        _ => None,
+    }
+}
+
+/// What a stream consumer actually receives — one parsed
+/// STREAM_DATA/STREAM_END/STREAM_ERROR/STREAM_REPLY frame.
+#[derive(Debug, Clone)]
+pub enum StreamEvent {
+    Data {
+        stream_id: [u8; 16],
+        seq: u64,
+        encoding: StreamEncoding,
+        body: Value,
+    },
+    End {
+        stream_id: [u8; 16],
+        role: StreamRole,
+    },
+    Error {
+        stream_id: [u8; 16],
+        code: String,
+        message: String,
+    },
+    Reply {
+        stream_id: [u8; 16],
+        payload: Value,
+        responded_by: [u8; 32],
+    },
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum ParseStreamEventError {
+    NotAStreamFrame,
+    MissingField(&'static str),
+    WrongFieldType(&'static str),
+}
+
+impl std::fmt::Display for ParseStreamEventError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ParseStreamEventError::NotAStreamFrame => write!(
+                f,
+                "frame_type is none of stream_data/stream_end/stream_error/stream_reply"
+            ),
+            ParseStreamEventError::MissingField(name) => {
+                write!(f, "missing required field {name:?}")
+            }
+            ParseStreamEventError::WrongFieldType(name) => {
+                write!(f, "field {name:?} has the wrong type")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ParseStreamEventError {}
+
+/// Parse a decoded frame as one of STREAM_DATA/STREAM_END/STREAM_ERROR/
+/// STREAM_REPLY.
+pub fn parse_stream_event(frame: &Value) -> Result<StreamEvent, ParseStreamEventError> {
+    let stream_id = match frame.get("stream_id") {
+        Some(Value::Bytes(b)) => b
+            .as_slice()
+            .try_into()
+            .map_err(|_| ParseStreamEventError::WrongFieldType("stream_id"))?,
+        Some(_) => return Err(ParseStreamEventError::WrongFieldType("stream_id")),
+        None => return Err(ParseStreamEventError::MissingField("stream_id")),
+    };
+    match frame.get("frame_type") {
+        Some(Value::Text(t)) if t == "stream_data" => {
+            let seq = match frame.get("seq") {
+                Some(Value::Int(n)) if *n >= 0 => *n as u64,
+                Some(_) => return Err(ParseStreamEventError::WrongFieldType("seq")),
+                None => return Err(ParseStreamEventError::MissingField("seq")),
+            };
+            let encoding = match frame.get("encoding") {
+                Some(Value::Text(t)) => StreamEncoding::from_name(t)
+                    .ok_or(ParseStreamEventError::WrongFieldType("encoding"))?,
+                Some(_) => return Err(ParseStreamEventError::WrongFieldType("encoding")),
+                None => return Err(ParseStreamEventError::MissingField("encoding")),
+            };
+            let body = frame
+                .get("body")
+                .cloned()
+                .ok_or(ParseStreamEventError::MissingField("body"))?;
+            Ok(StreamEvent::Data {
+                stream_id,
+                seq,
+                encoding,
+                body,
+            })
+        }
+        Some(Value::Text(t)) if t == "stream_end" => {
+            let role = match frame.get("role") {
+                Some(Value::Text(t)) => {
+                    StreamRole::from_name(t).ok_or(ParseStreamEventError::WrongFieldType("role"))?
+                }
+                Some(_) => return Err(ParseStreamEventError::WrongFieldType("role")),
+                None => return Err(ParseStreamEventError::MissingField("role")),
+            };
+            Ok(StreamEvent::End { stream_id, role })
+        }
+        Some(Value::Text(t)) if t == "stream_error" => {
+            let code = match frame.get("code") {
+                Some(Value::Bytes(b)) => String::from_utf8(b.clone())
+                    .map_err(|_| ParseStreamEventError::WrongFieldType("code"))?,
+                Some(_) => return Err(ParseStreamEventError::WrongFieldType("code")),
+                None => return Err(ParseStreamEventError::MissingField("code")),
+            };
+            let message = match frame.get("message") {
+                Some(Value::Bytes(b)) => String::from_utf8(b.clone())
+                    .map_err(|_| ParseStreamEventError::WrongFieldType("message"))?,
+                Some(_) => return Err(ParseStreamEventError::WrongFieldType("message")),
+                None => return Err(ParseStreamEventError::MissingField("message")),
+            };
+            Ok(StreamEvent::Error {
+                stream_id,
+                code,
+                message,
+            })
+        }
+        Some(Value::Text(t)) if t == "stream_reply" => {
+            let payload = frame
+                .get("payload")
+                .cloned()
+                .ok_or(ParseStreamEventError::MissingField("payload"))?;
+            let responded_by = match frame.get("responded_by") {
+                Some(Value::Bytes(b)) => b
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| ParseStreamEventError::WrongFieldType("responded_by"))?,
+                Some(_) => return Err(ParseStreamEventError::WrongFieldType("responded_by")),
+                None => return Err(ParseStreamEventError::MissingField("responded_by")),
+            };
+            Ok(StreamEvent::Reply {
+                stream_id,
+                payload,
+                responded_by,
+            })
+        }
+        Some(_) | None => Err(ParseStreamEventError::NotAStreamFrame),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1357,5 +1824,255 @@ mod tests {
         // NOT be accepted as a 16-byte call_id.
         let wrong_size = Value::Map(vec![(Value::text("call_id"), Value::Bytes(vec![9; 32]))]);
         assert_eq!(frame_call_id(&wrong_size), None);
+    }
+
+    // -------------------------------------------------------------
+    // Streaming RPC (§13) — same differential method as CALL above,
+    // vectors captured from a real `macula_frame:stream_open/1` +
+    // `stream_data/1` + `stream_end/1` + `stream_error/1` +
+    // `stream_reply/1` + `sign/2` in a live `rebar3 shell` session
+    // against the same identity/frame_id/sent_at_ms fixtures already
+    // defined above.
+    // -------------------------------------------------------------
+
+    const VECTOR_STREAM_ID: &str = "0102030405060708090A0B0C0D0E0F10";
+
+    fn vector_stream_id() -> [u8; 16] {
+        hex_bytes(VECTOR_STREAM_ID).try_into().expect("16 bytes")
+    }
+
+    #[test]
+    fn stream_open_frame_matches_the_reference_byte_for_byte() {
+        let pub_bytes = fixed_array(VECTOR_PUB);
+        let identity = vector_identity();
+        let spec = StreamOpenSpec::new(
+            vector_stream_id(),
+            "macula_rust_sdk.test_stream",
+            VECTOR_ZERO_REALM,
+            StreamMode::ClientStream,
+            Value::Map(vec![(Value::text("hello"), Value::text("world"))]),
+            1_700_000_030_000,
+            pub_bytes,
+        );
+        let signed = sign(
+            stream_open_value(&spec, vector_frame_id(), VECTOR_SENT_AT_MS),
+            &identity,
+        );
+        let sig = match signed.get("signature") {
+            Some(Value::Bytes(b)) => b.clone(),
+            other => panic!("expected a signature field, got {other:?}"),
+        };
+        assert_eq!(hex::encode_upper(&sig), "6070D8AB71F837591AC2C803C04F9E1D3FA01C9310D33C96A90434820C5E50550F9DEA8A764247EB49AF63447C037E192B7892A365C1A4ACB9BC46B98AA5670F");
+        let encoded = encode(&signed).expect("encodable frame");
+        assert_eq!(encoded.len(), 415);
+    }
+
+    #[test]
+    fn stream_data_raw_frame_matches_the_reference_byte_for_byte() {
+        let identity = vector_identity();
+        let spec = StreamDataSpec::new(
+            vector_stream_id(),
+            0,
+            StreamEncoding::Raw,
+            Value::Bytes(b"raw chunk bytes".to_vec()),
+        );
+        let signed = sign(
+            stream_data_value(&spec, vector_frame_id(), VECTOR_SENT_AT_MS),
+            &identity,
+        );
+        let sig = match signed.get("signature") {
+            Some(Value::Bytes(b)) => b.clone(),
+            other => panic!("expected a signature field, got {other:?}"),
+        };
+        assert_eq!(hex::encode_upper(&sig), "35770744FE5BD01B86DDA01AB4EF855E4E4FE0EDFEDC89FF690728C585C60A5CB035717E3EA9133C4AD833E226F4DB95E9A5AF9AC59E7BACBB8BDF72611F8003");
+        let encoded = encode(&signed).expect("encodable frame");
+        assert_eq!(encoded.len(), 269);
+    }
+
+    /// The real point of this vector: `encoding = msgpack` with a
+    /// structured `body` (`{a: 1, greeting: "hi"}`, mirroring the
+    /// reference's `#{a => 1, greeting => <<"hi">>}`) still matches the
+    /// reference's signature byte-for-byte — proving `body` is encoded
+    /// as an ordinary nested CBOR value in the frame's own envelope, not
+    /// pre-serialized through a separate msgpack codec this crate would
+    /// otherwise need to implement. See this section's module doc.
+    #[test]
+    fn stream_data_msgpack_frame_matches_the_reference_byte_for_byte() {
+        let identity = vector_identity();
+        let spec = StreamDataSpec::new(
+            vector_stream_id(),
+            1,
+            StreamEncoding::Msgpack,
+            Value::Map(vec![
+                (Value::text("a"), Value::Int(1)),
+                // `greeting`'s VALUE is a binary (`<<"hi">>`) in the
+                // reference, not an atom -- bytes, not text, unlike its
+                // (atom) key.
+                (Value::text("greeting"), Value::Bytes(b"hi".to_vec())),
+            ]),
+        );
+        let signed = sign(
+            stream_data_value(&spec, vector_frame_id(), VECTOR_SENT_AT_MS),
+            &identity,
+        );
+        let sig = match signed.get("signature") {
+            Some(Value::Bytes(b)) => b.clone(),
+            other => panic!("expected a signature field, got {other:?}"),
+        };
+        assert_eq!(hex::encode_upper(&sig), "99CA90B0C01FD349DBAF317D03872E5F460426789874D79B6FBE37F4AC92C2AD690A00CDB3734F262D5C58C8F3BFD06F8AE892A8B5655274718A283ABA1D4D08");
+        let encoded = encode(&signed).expect("encodable frame");
+        assert_eq!(encoded.len(), 273);
+    }
+
+    #[test]
+    fn stream_end_frame_matches_the_reference_byte_for_byte() {
+        let identity = vector_identity();
+        let spec = StreamEndSpec::new(vector_stream_id(), StreamRole::Send);
+        let signed = sign(
+            stream_end_value(&spec, vector_frame_id(), VECTOR_SENT_AT_MS),
+            &identity,
+        );
+        let sig = match signed.get("signature") {
+            Some(Value::Bytes(b)) => b.clone(),
+            other => panic!("expected a signature field, got {other:?}"),
+        };
+        assert_eq!(hex::encode_upper(&sig), "78F2B94BD5AC70901EABB31D8B17C89B58A88942300C6232545899AFB933B2C4B7399BB183A5660671981B6346DA27033C8F93A99E7EBA96F0F689B03D4F940A");
+        let encoded = encode(&signed).expect("encodable frame");
+        assert_eq!(encoded.len(), 239);
+    }
+
+    #[test]
+    fn stream_error_frame_matches_the_reference_byte_for_byte() {
+        let identity = vector_identity();
+        let spec = StreamErrorSpec::new(vector_stream_id(), "cancelled", "boom");
+        let signed = sign(
+            stream_error_value(&spec, vector_frame_id(), VECTOR_SENT_AT_MS),
+            &identity,
+        );
+        let sig = match signed.get("signature") {
+            Some(Value::Bytes(b)) => b.clone(),
+            other => panic!("expected a signature field, got {other:?}"),
+        };
+        assert_eq!(hex::encode_upper(&sig), "119F379518EC17C603ED5466A57D7AE53198A8AC4D5CA9849934A78994428CB3DAD40BC0EFECE1A0C8EEB0ACC28973C0F7E55DE6444827091814AF0715D9FF0B");
+        let encoded = encode(&signed).expect("encodable frame");
+        assert_eq!(encoded.len(), 259);
+    }
+
+    #[test]
+    fn stream_reply_frame_matches_the_reference_byte_for_byte() {
+        let pub_bytes = fixed_array(VECTOR_PUB);
+        let identity = vector_identity();
+        let spec = StreamReplySpec::new(
+            vector_stream_id(),
+            Value::Map(vec![(Value::text("ok"), Value::text("true"))]),
+            pub_bytes,
+        );
+        let signed = sign(
+            stream_reply_value(&spec, vector_frame_id(), VECTOR_SENT_AT_MS),
+            &identity,
+        );
+        let sig = match signed.get("signature") {
+            Some(Value::Bytes(b)) => b.clone(),
+            other => panic!("expected a signature field, got {other:?}"),
+        };
+        assert_eq!(hex::encode_upper(&sig), "ADF57AD58B253F175ADF72E4717E078C62F3E22CBDDBF8DDC0DD8A47CAAA061E8A37C73BAAB91E450D1D8472021B6A0161169D77E9D186C436D3E6580D48C703");
+        let encoded = encode(&signed).expect("encodable frame");
+        assert_eq!(encoded.len(), 295);
+    }
+
+    #[test]
+    fn frame_stream_id_reads_from_any_frame_type() {
+        let frame = Value::Map(vec![(Value::text("stream_id"), Value::Bytes(vec![9; 16]))]);
+        assert_eq!(frame_stream_id(&frame), Some([9u8; 16]));
+        let wrong_size = Value::Map(vec![(Value::text("stream_id"), Value::Bytes(vec![9; 32]))]);
+        assert_eq!(frame_stream_id(&wrong_size), None);
+    }
+
+    #[test]
+    fn parse_stream_event_reads_data_end_error_and_reply() {
+        let data = Value::Map(vec![
+            (Value::text("frame_type"), Value::text("stream_data")),
+            (Value::text("stream_id"), Value::Bytes(vec![1; 16])),
+            (Value::text("seq"), Value::Int(3)),
+            (Value::text("encoding"), Value::text("raw")),
+            (Value::text("body"), Value::Bytes(b"hi".to_vec())),
+        ]);
+        match parse_stream_event(&data).expect("well-formed stream_data") {
+            StreamEvent::Data {
+                stream_id,
+                seq,
+                encoding,
+                body,
+            } => {
+                assert_eq!(stream_id, [1u8; 16]);
+                assert_eq!(seq, 3);
+                assert_eq!(encoding, StreamEncoding::Raw);
+                assert_eq!(body, Value::Bytes(b"hi".to_vec()));
+            }
+            other => panic!("expected Data, got {other:?}"),
+        }
+
+        let end = Value::Map(vec![
+            (Value::text("frame_type"), Value::text("stream_end")),
+            (Value::text("stream_id"), Value::Bytes(vec![1; 16])),
+            (Value::text("role"), Value::text("both")),
+        ]);
+        match parse_stream_event(&end).expect("well-formed stream_end") {
+            StreamEvent::End { stream_id, role } => {
+                assert_eq!(stream_id, [1u8; 16]);
+                assert_eq!(role, StreamRole::Both);
+            }
+            other => panic!("expected End, got {other:?}"),
+        }
+
+        let error = Value::Map(vec![
+            (Value::text("frame_type"), Value::text("stream_error")),
+            (Value::text("stream_id"), Value::Bytes(vec![1; 16])),
+            (Value::text("code"), Value::Bytes(b"cancelled".to_vec())),
+            (Value::text("message"), Value::Bytes(b"boom".to_vec())),
+        ]);
+        match parse_stream_event(&error).expect("well-formed stream_error") {
+            StreamEvent::Error {
+                stream_id,
+                code,
+                message,
+            } => {
+                assert_eq!(stream_id, [1u8; 16]);
+                assert_eq!(code, "cancelled");
+                assert_eq!(message, "boom");
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+
+        let reply = Value::Map(vec![
+            (Value::text("frame_type"), Value::text("stream_reply")),
+            (Value::text("stream_id"), Value::Bytes(vec![1; 16])),
+            (Value::text("payload"), Value::text("done")),
+            (Value::text("responded_by"), Value::Bytes(vec![2; 32])),
+        ]);
+        match parse_stream_event(&reply).expect("well-formed stream_reply") {
+            StreamEvent::Reply {
+                stream_id,
+                payload,
+                responded_by,
+            } => {
+                assert_eq!(stream_id, [1u8; 16]);
+                assert_eq!(payload, Value::text("done"));
+                assert_eq!(responded_by, [2u8; 32]);
+            }
+            other => panic!("expected Reply, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_stream_event_rejects_a_non_stream_frame() {
+        let frame = Value::Map(vec![
+            (Value::text("frame_type"), Value::text("call")),
+            (Value::text("stream_id"), Value::Bytes(vec![1; 16])),
+        ]);
+        assert_eq!(
+            parse_stream_event(&frame).unwrap_err(),
+            ParseStreamEventError::NotAStreamFrame
+        );
     }
 }
