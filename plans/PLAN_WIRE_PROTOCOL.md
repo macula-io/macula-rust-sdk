@@ -996,34 +996,50 @@ in the core crate. The doc comment at the top of `src/lib.rs`
 ("Mobile... is the flagship consumer driving this work, not the ceiling
 on it") is enforced structurally by this separation, not just stated.
 
-**What's exposed:**
+**What's exposed — every application primitive the core crate has:**
 - `FfiKeyPair` — identity generation, `node_id()`.
 - `FfiSession` — `connect` (CONNECT/HELLO), `call` (CALL/RESULT/ERROR),
   `publish`/`subscribe`/`unsubscribe`/`recv_event` (§6.8), `content_put`/
-  `content_get` (§12), `stream_open` (§13, returns an `FfiStream`),
-  `close`.
-- `FfiStream` — `send_data`/`close_send`/`recv`/`await_reply`/`abort`,
-  the caller/consumer role only (§13.1) — mirrors `StreamHandle`.
+  `content_get` (§12), `stream_open` (§13.1, returns an `FfiStream`),
+  `advertise`/`unadvertise` (§6.9), `accept_stream` (§13.2, blocks for
+  the next inbound STREAM_OPEN, returns an `FfiAcceptedStream`), `close`.
+- `FfiStream` — `send_data`/`close_send`/`recv`/`await_reply`/`abort`
+  (caller role, §13.1) plus `send_reply` (provider role, §13.2) — the
+  same object serves either role, since a stream's wire vocabulary is
+  symmetric regardless of which side opened it (mirrors `StreamHandle`
+  exactly).
 - `FfiValue` — a **restricted** mirror of `cbor::Value`: `Null`/`Int`/
   `Bytes`/`Text`/`Float`. Missing `List`/`Map` (need recursive UniFFI
   enums — deferred, not a wire limitation) and `Int` is narrowed from
   `i128` to `i64` (UniFFI has no 128-bit integer type; an out-of-range
   value returns an explicit `FfiError::UnrepresentableValue` rather than
   silently truncating).
-- `FfiCallResponse`, `FfiEvent`, `FfiStreamItem`, `FfiStreamReply` —
-  mirror `frame::CallResponse`/`frame::EventInfo`/`stream::StreamItem`/
-  the `(payload, responded_by)` pair `StreamHandle::await_reply` returns.
-  `publish`'s `seq`/`published_at_ms` stay caller-supplied rather than
-  tracked internally by `FfiSession` (unlike streaming RPC's per-stream
-  `seq_out` counter): PUBLISH's `seq` is a per-publisher, per-topic
-  gap-detection sequence, and a client publishing to several topics has
-  to own that bookkeeping itself.
+- `FfiCallResponse`, `FfiEvent`, `FfiStreamItem`, `FfiStreamReply`,
+  `FfiStreamOpenInfo`, `FfiAcceptedStream` — mirror
+  `frame::CallResponse`/`frame::EventInfo`/`stream::StreamItem`/the
+  `(payload, responded_by)` pair `StreamHandle::await_reply` returns/
+  `frame::StreamOpenInfo`/the `(StreamHandle, StreamOpenInfo)` pair
+  `StreamHandle::accept` returns. `FfiAcceptedStream` embeds an
+  `Arc<FfiStream>` directly as a record field — confirmed UniFFI 0.32
+  supports an Object handle inside a Record, generating correctly in
+  both languages (Kotlin's version even picks up `Disposable`
+  automatically). `publish`'s `seq`/`published_at_ms` stay
+  caller-supplied rather than tracked internally by `FfiSession` (unlike
+  streaming RPC's per-stream `seq_out` counter): PUBLISH's `seq` is a
+  per-publisher, per-topic gap-detection sequence, and a client
+  publishing to several topics has to own that bookkeeping itself.
 
-**Not wrapped, and won't be until the core crate has it:** the
-streaming/RPC-advertise *provider* role (§13.2/§6.9 — exposing a
-procedure *to* the mesh; the core crate doesn't implement this role
-either) and pubkey-pinned trust (`connect` always uses WebPki — the
-core crate's `Trust::Pinned` exists but isn't surfaced here yet).
+**`accept_stream` holds the session's lock for as long as it waits** —
+no other `FfiSession` method can run concurrently during that wait. Not
+an FFI-layer restriction: the core crate's own `Session` has the same
+property, since its control stream is single-owner by construction.
+
+**Not wrapped, and won't be until the core crate has it:** unary-RPC
+provider dispatch (accepting an inbound CALL on the control stream and
+replying — the core crate doesn't implement that role either, only
+streaming's provider side needed it so far) and pubkey-pinned trust
+(`connect` always uses WebPki — the core crate's `Trust::Pinned` exists
+but isn't surfaced here yet).
 
 **Verified past "it compiles":** built the release `cdylib` and actually
 ran `uniffi-bindgen generate` for both Kotlin and Swift, then inspected
