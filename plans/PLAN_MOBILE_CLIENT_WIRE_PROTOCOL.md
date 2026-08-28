@@ -48,10 +48,12 @@ three; nothing in the live peering connection state machine calls them.
 
 A Rust client depending on the same `quinn`/`rustls` combination macula
 already trusts should be wire-compatible at the transport level with zero
-station-side changes. Whether the `iroh` crate specifically can be used as
-the dial mechanism (vs. bare `quinn`) depends on whether its `Endpoint`
-exposes raw-address dialing with a custom `rustls::ClientConfig` — not yet
-verified; doesn't change anything below either way.
+station-side changes. Dial directly on `quinn` — see §11.4 for why `iroh`
+was considered and dropped: macula's edges are dial-out only, and macula
+already owns discovery/gossip/pubsub/identity, so Iroh's actual
+distinguishing features (NAT traversal, its own discovery, its own
+gossip/doc-sync) would compete with macula's stack rather than fill a
+gap in it.
 
 ## 2. Identity and trust model
 
@@ -478,9 +480,24 @@ fixed layout above), and the puzzle-evidence handshake field (unresolved,
 3. **`macula_record:encode/1`.** Needed for DHT `store`/`replicate`/
    `value` frames (record payloads are encoded by a separate codec, not
    `macula_frame`'s own `to_wire/1`). Not needed for CALL/PUBLISH-only v1.
-4. **Iroh raw-dial capability**, per the earlier discussion — decides
-   whether the mobile core depends on the `iroh` crate directly or builds
-   on bare `quinn` with Iroh's mobile-packaging pattern as reference only.
+4. ~~Iroh raw-dial capability.~~ **DECIDED, 2026-08-28 — not pursuing
+   Iroh.** Reassessed against what's now confirmed about macula's actual
+   architecture: edges are dial-out only (no NAT-traversal/relay gap for
+   Iroh to fill), and macula already owns its own discovery (Kademlia
+   DHT), gossip (Plumtree/HyParView), pubsub, and pubkey-pinned identity
+   — all things Iroh would otherwise bring, and all things that would
+   *compete* with macula's own stack rather than complement it if
+   adopted. The one real remaining candidate, QUIC connection migration
+   for WiFi↔cellular handover, is a baseline feature of QUIC itself
+   (RFC 9000 Connection IDs) that `quinn` — already a macula dependency —
+   should already support; any extra mobile-specific network-change
+   detection glue can be hand-written directly against `quinn` later if
+   real-world testing shows it's needed, without adopting Iroh's whole
+   addressing/discovery/gossip stack to get it. The one genuinely useful
+   thing Iroh demonstrated — shipping a Rust core to iOS/Android via
+   UniFFI — doesn't require Iroh either: UniFFI is a separate,
+   general-purpose Mozilla tool that `macula-mobile` can depend on
+   directly.
 5. **v1 scope decision.** Given the above, a defensible first cut is:
    transport + handshake (§2-§5) + `call`/`result`/`error` (§6.4) +
    `publish`/`subscribe`/`event` (§6.8) + `advertise`/`unadvertise`
