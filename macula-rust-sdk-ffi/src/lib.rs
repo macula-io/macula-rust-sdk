@@ -8,11 +8,13 @@
 //! keeps `macula-rust-sdk` itself just as usable from plain Rust, a CLI,
 //! or WASM as it was before this crate existed.
 //!
-//! **Growing, not complete.** Identity generation, CONNECT/HELLO,
-//! CALL/RESULT/ERROR, and PUBLISH/SUBSCRIBE/EVENT are wrapped. Not yet
-//! exposed: content transfer, streaming RPC — both already built and
-//! live-verified in the core crate (`plans/PLAN_WIRE_PROTOCOL.md`), just
-//! not wrapped here yet.
+//! Identity generation, CONNECT/HELLO, CALL/RESULT/ERROR,
+//! PUBLISH/SUBSCRIBE/EVENT, content transfer, and streaming RPC (caller
+//! role) are all wrapped — every application primitive the core crate
+//! has, matching `plans/PLAN_WIRE_PROTOCOL.md`'s v1 scope. Not exposed:
+//! the streaming/RPC-advertise *provider* role (§13.2/§6.9 — the core
+//! crate doesn't implement that role either yet) and pubkey-pinned trust
+//! (`connect` always uses WebPki).
 //!
 //! [`FfiValue`] covers `Null`/`Int`/`Bytes`/`Text`/`Float` — the
 //! variants [`macula_rust_sdk::cbor::Value`] itself has, MINUS
@@ -49,23 +51,37 @@ pub enum FfiError {
     Send { reason: String },
     #[error("receiving failed: {reason}")]
     Recv { reason: String },
+    #[error("content operation failed: {reason}")]
+    Content { reason: String },
     #[error("a value could not cross the FFI boundary: {reason}")]
     UnrepresentableValue { reason: String },
-    #[error("expected exactly 32 bytes, got {len}")]
-    WrongByteLength { len: u32 },
+    #[error("expected exactly {expected} bytes, got {actual}")]
+    WrongByteLength { expected: u32, actual: u32 },
     #[error("this session is already closed")]
     Closed,
 }
 
-/// `Vec<u8>` -> `[u8; 32]`, with the length actually reported on
+/// `Vec<u8>` -> `[u8; 32]`, with both lengths actually reported on
 /// mismatch — UniFFI has no fixed-size byte array type, so every 32-byte
 /// field (`realm`, node ids) crosses the boundary as `Vec<u8>` and gets
 /// validated here.
 fn to_32(bytes: Vec<u8>) -> Result<[u8; 32], FfiError> {
-    let len = bytes.len() as u32;
-    bytes
-        .try_into()
-        .map_err(|_| FfiError::WrongByteLength { len })
+    let actual = bytes.len() as u32;
+    bytes.try_into().map_err(|_| FfiError::WrongByteLength {
+        expected: 32,
+        actual,
+    })
+}
+
+/// `Vec<u8>` -> `[u8; 34]` — same as [`to_32`], for an MCID
+/// (`<<Version:8, Codec:8, Hash:32/binary>>`, `plans/PLAN_WIRE_PROTOCOL.md`
+/// §12.1).
+fn to_mcid(bytes: Vec<u8>) -> Result<macula_rust_sdk::manifest::Mcid, FfiError> {
+    let actual = bytes.len() as u32;
+    bytes.try_into().map_err(|_| FfiError::WrongByteLength {
+        expected: 34,
+        actual,
+    })
 }
 
 /// A restricted mirror of [`macula_rust_sdk::cbor::Value`] — see this
@@ -188,6 +204,71 @@ impl TryFrom<macula_rust_sdk::frame::EventInfo> for FfiEvent {
             delivered_via: e.delivered_via,
         })
     }
+}
+
+/// `mode` on a stream — mirrors [`macula_rust_sdk::frame::StreamMode`].
+#[derive(uniffi::Enum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FfiStreamMode {
+    ServerStream,
+    ClientStream,
+    Bidi,
+}
+
+impl From<FfiStreamMode> for macula_rust_sdk::frame::StreamMode {
+    fn from(m: FfiStreamMode) -> Self {
+        match m {
+            FfiStreamMode::ServerStream => macula_rust_sdk::frame::StreamMode::ServerStream,
+            FfiStreamMode::ClientStream => macula_rust_sdk::frame::StreamMode::ClientStream,
+            FfiStreamMode::Bidi => macula_rust_sdk::frame::StreamMode::Bidi,
+        }
+    }
+}
+
+/// `encoding` on a stream chunk — mirrors
+/// [`macula_rust_sdk::frame::StreamEncoding`]. A semantic hint, not a
+/// second wire codec — see that type's own doc.
+#[derive(uniffi::Enum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FfiStreamEncoding {
+    Raw,
+    Msgpack,
+}
+
+impl From<FfiStreamEncoding> for macula_rust_sdk::frame::StreamEncoding {
+    fn from(e: FfiStreamEncoding) -> Self {
+        match e {
+            FfiStreamEncoding::Raw => macula_rust_sdk::frame::StreamEncoding::Raw,
+            FfiStreamEncoding::Msgpack => macula_rust_sdk::frame::StreamEncoding::Msgpack,
+        }
+    }
+}
+
+impl From<macula_rust_sdk::frame::StreamEncoding> for FfiStreamEncoding {
+    fn from(e: macula_rust_sdk::frame::StreamEncoding) -> Self {
+        match e {
+            macula_rust_sdk::frame::StreamEncoding::Raw => FfiStreamEncoding::Raw,
+            macula_rust_sdk::frame::StreamEncoding::Msgpack => FfiStreamEncoding::Msgpack,
+        }
+    }
+}
+
+/// One item received from a stream: a chunk, or a clean end-of-stream.
+/// Mirrors [`macula_rust_sdk::stream::StreamItem`].
+#[derive(uniffi::Enum, Debug, Clone)]
+pub enum FfiStreamItem {
+    Data {
+        seq: u64,
+        encoding: FfiStreamEncoding,
+        body: FfiValue,
+    },
+    Eof,
+}
+
+/// The terminal result of a `client_stream`/`bidi` exchange — the pair
+/// [`macula_rust_sdk::stream::StreamHandle::await_reply`] returns.
+#[derive(uniffi::Record, Debug, Clone)]
+pub struct FfiStreamReply {
+    pub payload: FfiValue,
+    pub responded_by: Vec<u8>,
 }
 
 /// An Ed25519 identity, puzzle-hardened by construction — see
@@ -366,11 +447,177 @@ impl FfiSession {
         FfiEvent::try_from(event)
     }
 
+    /// Store `data` under a content-address, returning its MCID (34
+    /// bytes). `name` is attached to the manifest when `data` is large
+    /// enough to be chunked; silently unused for a single block, which
+    /// is addressed purely by content hash — see
+    /// [`macula_rust_sdk::content::put`]'s own doc.
+    pub async fn content_put(
+        &self,
+        data: Vec<u8>,
+        name: String,
+        identity: &FfiKeyPair,
+    ) -> Result<Vec<u8>, FfiError> {
+        let mut guard = self.0.lock().await;
+        let session = guard.as_mut().ok_or(FfiError::Closed)?;
+        let mcid = macula_rust_sdk::content::put(session, &data, name, &identity.0)
+            .await
+            .map_err(|e| FfiError::Content {
+                reason: e.to_string(),
+            })?;
+        Ok(mcid.to_vec())
+    }
+
+    /// Fetch and verify the content addressed by `mcid` (34 bytes).
+    pub async fn content_get(
+        &self,
+        mcid: Vec<u8>,
+        identity: &FfiKeyPair,
+    ) -> Result<Vec<u8>, FfiError> {
+        let mcid = to_mcid(mcid)?;
+        let mut guard = self.0.lock().await;
+        let session = guard.as_mut().ok_or(FfiError::Closed)?;
+        macula_rust_sdk::content::get(session, mcid, &identity.0)
+            .await
+            .map_err(|e| FfiError::Content {
+                reason: e.to_string(),
+            })
+    }
+
+    /// Open a dedicated stream and send a signed STREAM_OPEN. `realm`
+    /// must be exactly 32 bytes. `timeout_ms` bounds the frame's own
+    /// `deadline_ms` field (`now + timeout_ms`); there's no open-time
+    /// acknowledgement to wait for on the wire — the provider starts
+    /// reacting to it directly.
+    pub async fn stream_open(
+        &self,
+        procedure: String,
+        realm: Vec<u8>,
+        mode: FfiStreamMode,
+        args: FfiValue,
+        timeout_ms: u64,
+        identity: &FfiKeyPair,
+    ) -> Result<FfiStream, FfiError> {
+        let realm = to_32(realm)?;
+        let deadline_ms = (now_ms() + timeout_ms) as i128;
+        let mut guard = self.0.lock().await;
+        let session = guard.as_mut().ok_or(FfiError::Closed)?;
+        let handle = macula_rust_sdk::stream::StreamHandle::open(
+            session,
+            &procedure,
+            realm,
+            mode.into(),
+            args.into(),
+            deadline_ms,
+            &identity.0,
+        )
+        .await
+        .map_err(|e| FfiError::Send {
+            reason: e.to_string(),
+        })?;
+        Ok(FfiStream(tokio::sync::Mutex::new(Some(handle))))
+    }
+
     /// Close the session with a GOODBYE frame. A no-op if already closed.
     pub async fn close(&self, identity: &FfiKeyPair) {
         let mut guard = self.0.lock().await;
         if let Some(session) = guard.take() {
             session.close("normal", None, &identity.0).await;
+        }
+    }
+}
+
+/// A streaming RPC exchange, caller/consumer role — wraps
+/// [`macula_rust_sdk::stream::StreamHandle`] the same way [`FfiSession`]
+/// wraps [`macula_rust_sdk::connection::Session`]: a mutex bridges
+/// UniFFI's `&self` methods to the core type's `&mut self` ones. Created
+/// via [`FfiSession::stream_open`].
+#[derive(uniffi::Object)]
+pub struct FfiStream(tokio::sync::Mutex<Option<macula_rust_sdk::stream::StreamHandle>>);
+
+#[uniffi::export(async_runtime = "tokio")]
+impl FfiStream {
+    /// Send one chunk.
+    pub async fn send_data(
+        &self,
+        encoding: FfiStreamEncoding,
+        body: FfiValue,
+        identity: &FfiKeyPair,
+    ) -> Result<(), FfiError> {
+        let mut guard = self.0.lock().await;
+        let handle = guard.as_mut().ok_or(FfiError::Closed)?;
+        handle
+            .send_data(encoding.into(), body.into(), &identity.0)
+            .await
+            .map_err(|e| FfiError::Send {
+                reason: e.to_string(),
+            })
+    }
+
+    /// Half-close: signal this side is done sending. For
+    /// `client_stream`/`bidi` modes, follow with
+    /// [`await_reply`](Self::await_reply).
+    pub async fn close_send(&self, identity: &FfiKeyPair) -> Result<(), FfiError> {
+        let mut guard = self.0.lock().await;
+        let handle = guard.as_mut().ok_or(FfiError::Closed)?;
+        handle
+            .close_send(&identity.0)
+            .await
+            .map_err(|e| FfiError::Send {
+                reason: e.to_string(),
+            })
+    }
+
+    /// Receive the next chunk or end-of-stream, bounded by `timeout_ms`.
+    pub async fn recv(&self, timeout_ms: u64) -> Result<FfiStreamItem, FfiError> {
+        let mut guard = self.0.lock().await;
+        let handle = guard.as_mut().ok_or(FfiError::Closed)?;
+        let item = handle
+            .recv(std::time::Duration::from_millis(timeout_ms))
+            .await
+            .map_err(|e| FfiError::Recv {
+                reason: e.to_string(),
+            })?;
+        Ok(match item {
+            macula_rust_sdk::stream::StreamItem::Data {
+                seq,
+                encoding,
+                body,
+            } => FfiStreamItem::Data {
+                seq,
+                encoding: encoding.into(),
+                body: FfiValue::try_from(body)?,
+            },
+            macula_rust_sdk::stream::StreamItem::Eof => FfiStreamItem::Eof,
+        })
+    }
+
+    /// Block for the provider's terminal STREAM_REPLY (`client_stream`/
+    /// `bidi` modes only) — call after [`close_send`](Self::close_send).
+    pub async fn await_reply(&self, timeout_ms: u64) -> Result<FfiStreamReply, FfiError> {
+        let mut guard = self.0.lock().await;
+        let handle = guard.as_mut().ok_or(FfiError::Closed)?;
+        let (payload, responded_by) = handle
+            .await_reply(std::time::Duration::from_millis(timeout_ms))
+            .await
+            .map_err(|e| FfiError::Recv {
+                reason: e.to_string(),
+            })?;
+        Ok(FfiStreamReply {
+            payload: FfiValue::try_from(payload)?,
+            responded_by: responded_by.to_vec(),
+        })
+    }
+
+    /// Non-normal termination: send an explicit STREAM_ERROR abort,
+    /// rather than just dropping the stream — the peer's only signal to
+    /// tell a cancellation/failure apart from a dropped connection
+    /// (`plans/PLAN_WIRE_PROTOCOL.md` §13.1, point 4). A no-op if
+    /// already closed/aborted.
+    pub async fn abort(&self, code: String, message: String, identity: &FfiKeyPair) {
+        let mut guard = self.0.lock().await;
+        if let Some(handle) = guard.take() {
+            handle.abort(code, message, &identity.0).await;
         }
     }
 }
