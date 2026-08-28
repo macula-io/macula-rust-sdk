@@ -938,3 +938,65 @@ duration"). Expose live `client_stream` publishing as its own API surface
 manifest-based upload path, so the day a receiving procedure exists on the
 SDK/station side, this crate points at a new procedure name with no
 protocol-level rework. A seam, not a feature.
+
+## 14. UniFFI mobile bindings — crate architecture, started 2026-08-28
+
+**Started, not finished.** A separate crate, `macula-rust-sdk-ffi`,
+depending on the core `macula-rust-sdk` crate via a path dependency —
+structurally identical to `iroh-ffi`'s relationship to `iroh`, confirmed
+by reading the live `n0-computer/iroh-ffi` repo directly rather than
+assuming: same crate separation, same modern UniFFI proc-macro style
+(`uniffi::setup_scaffolding!()`, `#[uniffi::export]`, `#[derive(uniffi::
+Object/Enum/Error)]`) instead of the older `.udl`-file approach, same
+`tokio` async-runtime feature (native async support, no callback/blocking
+rewrite needed since this crate is already tokio-based throughout), same
+`crate-type = ["staticlib", "cdylib"]` plus a `uniffi-bindgen` binary
+target for codegen.
+
+**Why a separate crate, not code inside the core one:** this is what
+keeps `macula-rust-sdk` itself exactly as usable from plain Rust, a CLI,
+or WASM as it was before — zero UniFFI dependency, zero FFI-shaped types,
+in the core crate. The doc comment at the top of `src/lib.rs`
+("Mobile... is the flagship consumer driving this work, not the ceiling
+on it") is enforced structurally by this separation, not just stated.
+
+**What's exposed so far (the first slice, proving the pipeline rather
+than covering everything):**
+- `FfiKeyPair` — identity generation, `node_id()`.
+- `FfiSession` — `connect` (CONNECT/HELLO), `call` (CALL/RESULT/ERROR),
+  `close`.
+- `FfiValue` — a **restricted** mirror of `cbor::Value`: `Null`/`Int`/
+  `Bytes`/`Text`/`Float`. Missing `List`/`Map` (need recursive UniFFI
+  enums — deferred, not a wire limitation) and `Int` is narrowed from
+  `i128` to `i64` (UniFFI has no 128-bit integer type; an out-of-range
+  value returns an explicit `FfiError::UnrepresentableValue` rather than
+  silently truncating).
+- `FfiCallResponse` — mirrors `frame::CallResponse`.
+
+**Not yet wrapped** (all already built and live-verified in the core
+crate — see §6.8, §12, §13 — this is purely FFI-surface work remaining,
+no new wire-protocol work): PUBLISH/SUBSCRIBE/EVENT, content transfer
+(`content::put`/`get`), streaming RPC (`StreamHandle`).
+
+**Verified past "it compiles":** built the release `cdylib` and actually
+ran `uniffi-bindgen generate` for both Kotlin and Swift, then inspected
+the *generated source* — not just the build exit code — for the expected
+async surface: Kotlin's `suspend fun connect(...)`/`suspend fun call(...)`
+(proper coroutine integration, `AutoCloseable` object handles), Swift's
+`static func connect(...) async throws -> FfiSession`/`func call(...)
+async throws -> FfiCallResponse` (`Sendable` conformance, `Data` for byte
+arrays). CI gained a `ffi-bindings` job that rebuilds the `cdylib` and
+regenerates both languages on every push, as a codegen smoke test — it
+doesn't (and, without a macOS/Android runner, can't) compile the
+generated Kotlin/Swift against the real platform SDKs; that's the next
+gap once actual mobile app integration starts.
+
+**Also fixed while wiring this up:** the existing CI workflow's
+`clippy`/`test`/`doc` jobs were missing `--workspace` — Cargo's default
+behavior for a workspace root that is *also* a package member is to
+operate on just that root package unless `--workspace` is passed
+explicitly, so before this fix those three jobs were silently never
+touching the new crate at all (only `fmt --all` already covered it,
+since `--all` is fmt's own workspace flag, spelled differently from the
+others for historical reasons). Caught by directly comparing `cargo test`
+vs `cargo test --workspace`'s own `Running` output, not assumed.
