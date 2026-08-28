@@ -20,17 +20,21 @@ Source files read in full for this spec: `native/macula_quic/{Cargo.toml,
 src/cert.rs, src/config.rs}`, `native/macula_cbor_nif/src/deterministic.rs`,
 `src/identity/macula_identity.erl`, `src/peering/{macula_protocol_types.erl,
 macula_frame.erl, macula_peering_conn.erl, macula_bolt4.erl,
-macula_source_route.erl}`, plus lines 890-964 of `src/client/macula_client.erl`
-(identity-resolution/puzzle-lifecycle context). Skimmed for scope only
-(not needed for a client, station/config-side): `macula_tls.erl`,
-`macula_peering.erl`, `macula_quic.erl`. Not yet read: the rest of
-`macula_client.erl` (1376 lines total — only the identity-resolution
-section was needed so far), `macula_record_cbor.erl` (the Erlang
-reference `deterministic.rs` is differentially tested against —
-corroborating source, not primary, since a Rust port transcribes the
-Rust file directly), `macula_crypto_nif`'s `grind_puzzle` implementation
-(not needed — the algorithm is fully specified from the Erlang side).
-Confirmed dead:
+macula_source_route.erl}`, `src/content/macula_manifest.erl`,
+`src/macula_content_transfer.erl`, `src/macula_upload.erl`,
+`src/macula_pusher.erl`, `src/macula_download.erl`, `src/macula_stream.erl`,
+`src/macula_streamer.erl`, `src/macula_stream_sink.erl`, plus lines 890-964
+of `src/client/macula_client.erl` (identity-resolution/puzzle-lifecycle
+context). Skimmed for scope only (not needed for a client, station/config-side):
+`macula_tls.erl`, `macula_peering.erl`, `macula_quic.erl`. Not read, role
+inferred from siblings (§12.3): `macula_feeder.erl`,
+`macula_content_transfer_registry.erl`, `macula_stream_local.erl`,
+`macula_streamer_sup.erl`, `macula_feeder_sup.erl`, `macula_download_sup.erl`.
+Not yet read: the rest of `macula_client.erl` (1376 lines total — only the
+identity-resolution section was needed so far), `macula_record_cbor.erl`
+(corroborating source for the CBOR codec, not primary), `macula_crypto_nif`'s
+`grind_puzzle` implementation (not needed — algorithm fully specified from
+the Erlang side). Confirmed dead:
 `macula_protocol_types.erl`, `macula_protocol_encoder.erl`,
 `macula_protocol_decoder.erl` — an unreferenced legacy (V1, msgpack/byte-tag)
 scheme, superseded entirely by `macula_frame.erl` ("Macula V2"). Ignore all
@@ -419,13 +423,28 @@ chunk bodies specifically — distinct from the frame envelope's own CBOR
 encoding). `stream_end`'s `role` ∈ `send|both` (half-close vs full
 close). Non-OPEN stream frames may carry an optional `signer` pubkey so a
 relaying station (not just the originating daemon) can be authenticated
-per-hop.
+per-hop. See §13 for the full client-side usage pattern (caller and
+provider roles) on top of these frames.
 
 ### 6.11 Content transfer (`want`, `have`, `block`, `manifest_req`,
 `manifest_res`, `cancel`)
 Bitswap-style block exchange keyed by 34-byte MCID
-(`<<Version:8, Codec:8, Hash:32/binary>>`). Lower priority for a v1
-mobile client.
+(`<<Version:8, Codec:8, Hash:32/binary>>`).
+
+**Correction, 2026-08-28: these frame types are very likely
+station-to-station only, not something a mobile client needs at all.**
+A full read of the client-side content-sharing stack
+(`macula_content_transfer.erl`, `macula_upload.erl`, `macula_download.erl`,
+`macula_pusher.erl`, `macula_manifest.erl`) found **zero references** to
+`want`/`have`/`block`/`manifest_req`/`manifest_res`/`cancel` anywhere in
+the client SDK. The client-facing content API uses ordinary `call`/
+`result` (§6.4) against well-known `_content.*` procedure names instead
+— see §12. These frame types are plausible station-to-station DHT
+replication/gossip primitives (matching `macula/CLAUDE.md`'s listing of
+"content" as a Relay, not SDK, concern), not part of what a client speaks.
+Not fully confirmed (would need to read macula-station's own source to
+be certain), but strong enough evidence to deprioritize this section
+entirely for a mobile client — see §12 for the actual mechanism to build.
 
 ## 7. Stream model
 
@@ -552,9 +571,213 @@ fixed layout above), and the puzzle-evidence handshake field (unresolved,
    UniFFI — doesn't require Iroh either: UniFFI is a separate,
    general-purpose Mozilla tool that `macula-mobile` can depend on
    directly.
-5. **v1 scope decision.** Given the above, a defensible first cut is:
-   transport + handshake (§2-§5) + `call`/`result`/`error` (§6.4) +
-   `publish`/`subscribe`/`event` (§6.8) + `advertise`/`unadvertise`
-   (§6.9), deferring DHT, HyParView, Plumtree, streaming RPC, and content
-   transfer. That covers "connect to a station and use pubsub + RPC,"
-   which is what was asked for.
+5. **v1 scope decision — superseded, 2026-08-28.** The original cut
+   deferred streaming RPC and content transfer wholesale. Both have now
+   been fully traced (§12-§13) and turn out to be cheap additions, not
+   separate protocols: content sharing's core path reuses `call`/`result`
+   (§6.4) verbatim, and push-upload reuses streaming RPC (§6.10)
+   verbatim. Revised v1 cut: transport + handshake (§2-§5) +
+   `call`/`result`/`error` (§6.4) + `publish`/`subscribe`/`event` (§6.8)
+   + `advertise`/`unadvertise` (§6.9) + streaming RPC caller role (§13.1)
+   + content get/put, single-block and chunked (§12), still deferring
+   DHT, HyParView, Plumtree, and the streaming/content *provider* roles
+   (§13.2) as v2. See §12-§13 for what's now specced and what's still
+   open within them.
+
+## 12. Content sharing (upload/download) — client-side mechanism
+
+Traced in full from `macula_content_transfer.erl` (799 lines — the core),
+`macula_manifest.erl` (268 — chunking/hashing, §4's "Rust crate reuse"
+table already covers reuse), `macula_upload.erl` (299), `macula_pusher.erl`
+(308), `macula_download.erl` (270). `macula_feeder.erl` (278,
+`macula_content_transfer_registry.erl`, 81, and the trivial `*_sup.erl`
+files) were not read in full — their role is inferable from what their
+callers/siblings already show (see §12.3), and none of it is wire-level.
+
+**Headline finding: this is not a separate wire protocol.** Content
+put/get is ordinary `call`/`result` (§6.4) against four well-known
+procedure names, sent over a *dedicated* QUIC stream (§7) instead of the
+control stream. Push-upload (§12.3) is ordinary streaming RPC (§6.10),
+full stop. Nothing here needs new frame types — §6.11's `want`/`have`/
+`block` frames appear to be unused by the client entirely (see the
+correction there).
+
+### 12.1 The four procedures
+
+All calls use realm `<<0:256>>` (32 zero bytes — a reserved sentinel for
+content operations, distinct from any real realm), and run over a
+dedicated stream opened via the same "dedicated stream" mechanism as
+streaming RPC (§7), not the control stream.
+
+| Procedure | Payload (call) | Reply (result) |
+|---|---|---|
+| `_content.put_block` | `#{mcid, payload}` — `payload` is the raw chunk bytes | `ok` \| `hash_mismatch` |
+| `_content.get_block` | `#{mcid}` | raw binary (the block) \| `not_found` |
+| `_content.put_manifest` | `#{manifest}` — the full manifest map (§4's crate-reuse table, chunking algorithm) | `ok` |
+| `_content.get_manifest` | `#{mcid}` | the manifest map \| `not_found` |
+
+**MCID for a single block** is computed client-side before the call:
+`<<1, 0x55, blake3(bytes)>>` (`macula_content_transfer.erl:put_single_block/3`).
+**Always re-verify a fetched block's hash client-side against its MCID**,
+even though the station verified it at put time — you may be fetching
+from a station that only relayed it, not the one that stored it, so its
+answer isn't inherently trustworthy. `verify_block_hash/2` is the
+reference: recompute `blake3(bytes)`, compare to the MCID's embedded
+hash.
+
+### 12.2 Single-block vs. chunked
+
+Determined without any network round trip:
+- **Put:** chunked iff `byte_size(Bytes) > 262144` (256 KiB, `macula_manifest:default_chunk_size/0`).
+- **Get:** chunked iff the MCID's codec byte is `0x56` (`CODEC_MANIFEST`); single-block iff `0x55` (`CODEC_RAW`).
+
+**Single-block** is one dedicated stream, one CALL/RESULT round trip.
+Nothing more to it.
+
+**Chunked** runs a "multi-stream lanes" algorithm
+(`macula_content_transfer.erl` lines 539-765):
+- **Put:** the manifest is computed entirely locally
+  (`macula_manifest:create/1`, pure, no network) — chunks and their MCIDs
+  are all known upfront. Chunks are distributed round-robin
+  (`index rem stream_count`) across up to `stream_count` dedicated
+  streams (default 4, capped at the actual chunk count — a 2-chunk
+  transfer never opens more than 2). Each stream ("lane") runs its own
+  independent sequential queue: one `_content.put_block` in flight at a
+  time per lane, next chunk starts only once the current one's
+  CALL/RESULT completes. Once every lane's queue is empty, fire one
+  final `_content.put_manifest` on the primal stream (the first stream
+  opened) to register it.
+- **Get:** the manifest is unknown upfront, so it's fetched first — one
+  `_content.get_manifest` call on the single stream the initial connect
+  opened. Once it's back (with `chunk_count`), lanes are set up the same
+  way, this time distributing chunk *indices* rather than bytes. Each
+  lane sequentially `_content.get_block`s its assigned indices,
+  accumulating results into a map keyed by index (lanes finish in
+  whatever order their own network calls complete, not necessarily
+  index order). Once every lane is done, reassemble bytes in index order
+  and verify against the manifest's root hash via `macula_manifest:verify/2`
+  — this final step is pure, no network.
+- **Extra streams are cheap to open** (a local QUIC operation on an
+  already-live connection — allocate a stream id, no peer round trip)
+  and opening one is allowed to fail without failing the transfer: it
+  just degrades to fewer lanes.
+- **Retry:** each `_content.*` call is retried up to 3 times (200 ms
+  backoff) if the BOLT#4 error code it failed with is itself flagged
+  retryable (§9's table) — directly reuses the taxonomy already specced,
+  no separate retry policy to invent.
+- **Cancel is QUIC-level, not application-level:** resets every
+  currently-open lane stream via QUIC `RESET_STREAM`
+  (`macula_station_link:abort_content_stream/4`), **not** a
+  `stream_error` application frame — a genuinely different abort
+  mechanism from general streaming RPC (§13), because a content-transfer
+  stream is a raw dedicated QUIC stream, not a `macula_stream`-managed
+  one. Don't conflate the two when porting.
+- **Pause/resume** (chunked only): gates whether a lane starts its *next*
+  queued item; whatever's already in flight always finishes; resume
+  continues each lane from wherever it left off. A reasonable thing to
+  skip for a first mobile port — v1 can always run to completion or
+  cancel outright.
+
+### 12.3 Two ways content moves: pull vs. push
+
+**Pull (`macula_download`/`macula_feeder`):** fetch by an already-known
+MCID, or announce content into the mesh for others to discover and pull
+later (`macula_feeder`, not read in full — inferred role from
+`macula_download`'s module doc: a provider's station auto-publishes a
+signed `content_announcement` DHT record on receipt, so there's nothing
+to explicitly advertise on the feeder side, unlike RPC procedures).
+Trust model is deliberately lighter than RPC's direct-dial path — content
+is self-verifying by hash, so `macula_download`'s direct-dial fetch can
+use `pin_tls_cert => false, verify => none` for the QUIC dial itself and
+still be safe, because §12.1's client-side hash re-verification is what
+actually protects the caller, not the station's identity.
+
+**Push (`macula_pusher`/`macula_upload`):** actively sends bytes AT a
+specific, already-known recipient advertising an upload procedure —
+**and this path uses zero content-transfer machinery at all.** It's
+`client_stream`-mode streaming RPC (§6.10/§13), full stop: the manifest
+(`macula_manifest:create/2`) rides as `stream_open`'s `args`, each chunk
+is one `stream_data` frame sent in order over the ONE stream (no
+multi-lane parallelism — that's explicitly a content-transfer-only
+mechanism, per `macula_pusher.erl`'s own doc comment correcting an
+earlier draft of the plan that claimed otherwise), `close_send` half-closes,
+and the terminal `stream_reply` (§6.10) carries the receiver's verified
+`{ok, Mcid}` or `{error, Reason}` — the receiver (`macula_upload`)
+reassembles and verifies against the manifest before ever setting that
+reply, so a caller blocking on it knows the bytes actually arrived
+intact, not merely that local `send/2,3` calls returned `ok`.
+
+**For a mobile client:** push is the better fit for "upload a photo to a
+known destination" (simpler, reuses §13's already-specced streaming
+primitive, no new mechanism). Pull is the better fit for "fetch a piece
+of content by its content-address" (§12.1-§12.2). Both are worth having;
+neither requires touching §6.11's frames.
+
+## 13. General-purpose streaming RPC — client-side mechanism
+
+Traced in full from `macula_stream.erl` (581 lines — the per-stream wire
+state machine), `macula_streamer.erl` (452 — provider/server role),
+`macula_stream_sink.erl` (253 — caller/consumer role). Not read:
+`macula_stream_local.erl` (195, an in-process test-only carrier, not
+wire-relevant) and `macula_streamer_sup.erl` (33, trivial supervisor
+boilerplate).
+
+### 13.1 Caller (consumer) role — the one a mobile client mostly wants
+
+Pattern, from `macula_stream_sink.erl`:
+
+1. `call_stream(Pool, Realm, Procedure, Args, Opts)` sends `stream_open`
+   (§6.10) and returns a stream handle once opened. `Opts` selects
+   `mode` (`server_stream` for "the provider pushes chunks at me,"
+   `client_stream` for "I push chunks at the provider" — see §12.3's push
+   path for that mode in practice, `bidi` for both directions).
+2. Drive a receive loop: `recv/2` blocks for the next `stream_data`
+   frame, decoded per its own `encoding` field (`raw` → bytes, `msgpack`
+   → decoded term — remember this is msgpack, not the frame envelope's
+   CBOR, a second codec a mobile client needs). Loop until `eof`
+   (peer sent `stream_end`) or `{error, Reason}` (peer sent
+   `stream_error`, or the underlying connection died).
+3. For `client_stream`/`bidi` modes wanting a result: `send/2,3` each
+   chunk in order (`stream_data`), `close_send/1` when done
+   (`stream_end` with `role => send`), then `await_reply/1,2` blocks for
+   the provider's terminal `stream_reply`.
+4. **Non-normal termination must send an explicit abort, not just drop
+   the connection.** `macula_stream_sink.erl`'s own rule: a clean stop
+   (eof reached, or the consumer's own callback choosing to stop
+   cleanly) closes both sides normally; anything else (a `recv` error, a
+   crash, a non-normal stop) sends the peer an explicit `stream_error`
+   abort — so the other side learns this was a cancellation/failure
+   rather than mistaking a dropped connection for a clean end-of-stream.
+   Worth replicating exactly: the distinction is the only signal the
+   peer gets.
+
+### 13.2 Provider (server) role — lower priority for a first mobile port
+
+Pattern, from `macula_streamer.erl`, only worth building once a mobile
+app wants to *expose* a streaming procedure to the mesh (e.g. a live
+sensor feed), not just call one: `advertise_stream/5` registers a
+handler invoked per inbound `stream_open`; the module drives `recv/2` on
+the provider's own stream for `client_stream`-mode procedures (mirroring
+§13.1's loop, just on the other end) and exposes `send/2,3`/`close/1` for
+`server_stream`-mode ones to push with. Same non-normal-termination →
+explicit abort rule as §13.1, symmetric.
+
+### 13.3 Wire-level notes that apply to both roles
+
+- One dedicated QUIC stream per streaming-RPC session (§7), never the
+  control stream.
+- `stream_data`'s `encoding` field: `raw` (bytes as-is) or `msgpack`
+  (term-encoded) — a **second serialization format** distinct from the
+  frame envelope's own deterministic CBOR (§4). A Rust port needs a
+  msgpack codec (e.g. `rmp-serde`) in addition to the hand-rolled CBOR
+  codec already specced — msgpack here has no stated determinism
+  requirement (it's payload, not signed frame envelope), so any
+  conformant msgpack implementation should do.
+- Sequencing: `seq_out`/`seq_in` counters per direction, tracked
+  independently — not used for reordering (frames arrive in order on a
+  single QUIC stream by construction) but as a sanity/debugging signal.
+- `handle_down`/owner-death semantics (`macula_stream.erl`) matter less
+  for a Rust port — that's Erlang-process-monitor plumbing with no wire
+  equivalent; the wire-relevant rule is just "stream owner gone ⇒ close
+  or abort the stream," which any reasonable async-Rust structured-
+  concurrency approach gets for free.
