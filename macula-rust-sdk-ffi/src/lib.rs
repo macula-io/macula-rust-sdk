@@ -93,13 +93,13 @@ fn to_mcid(bytes: Vec<u8>) -> Result<macula_rust_sdk::manifest::Mcid, FfiError> 
 /// no 128-bit integer type; an out-of-range value returns
 /// [`FfiError::UnrepresentableValue`] rather than silently truncating —
 /// see [`FfiValue::try_from`]). `Items`/`Fields` recurse through `Vec`,
-/// which UniFFI 0.32 generates correctly — confirmed for Kotlin, both
-/// by this crate's own round-trip tests and by a real
-/// `compileDebugKotlin` run against the generated bindings in
-/// `macula-apps/macula-cam2me`; NOT yet exercised against the Swift
-/// bindings (no macOS/Xcode available where this was written) — the
-/// recursion itself was never the obstacle, only finding time to wire
-/// it up.
+/// which UniFFI 0.32 generates correctly in both Kotlin and Swift —
+/// confirmed by this crate's own round-trip tests, a real
+/// `compileDebugKotlin` run, and `macula-apps/macula-cam2me`'s own
+/// Android AND iOS CI (real `xcodebuild` against real Xcode on
+/// `macos-latest`) both going green against the generated bindings —
+/// the recursion itself was never the obstacle, only finding time to
+/// wire it up.
 ///
 /// Named `Items`/`Fields` rather than mirroring [`macula_rust_sdk::cbor::Value`]'s own
 /// `List`/`Map` exactly: UniFFI's Kotlin codegen emits an unqualified
@@ -109,10 +109,8 @@ fn to_mcid(bytes: Vec<u8>) -> Result<macula_rust_sdk::manifest::Mcid, FfiError> 
 /// `kotlin.collections.List` — confirmed by compiling the generated
 /// bindings (`No type arguments expected for data class List :
 /// FfiValue`) before this rename. `Array`/`Dictionary` would trade that
-/// collision for the identical one against Swift's own stdlib types
-/// (unconfirmed either way — Swift's bindings haven't been compiled
-/// against this change yet), so neither language's collection type
-/// names are reused here.
+/// collision for the identical one against Swift's own stdlib types, so
+/// neither language's collection type names are reused here.
 ///
 /// [`Fields`](FfiValue::Fields) uses [`FfiMapEntry`] rather than
 /// `HashMap<String, FfiValue>`: [`macula_rust_sdk::cbor::Value::Map`]'s own keys are
