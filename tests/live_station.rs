@@ -283,3 +283,110 @@ async fn pubsub_round_trip_against_the_real_fleet() {
         .close("normal", Some("pubsub test done"), &identity)
         .await;
 }
+
+/// A real single-block put/get round trip: content small enough
+/// (`<= manifest::DEFAULT_CHUNK_SIZE`) to be addressed purely by content
+/// hash, no manifest involved. Every byte is randomized per run so
+/// there's no risk of colliding with content some other run already
+/// stored under the same MCID.
+#[tokio::test]
+#[ignore = "requires network access to a live macula-station"]
+async fn single_block_put_get_round_trip_against_the_real_fleet() {
+    let identity = KeyPair::generate_with_default_puzzle();
+    let mut session = connection::connect(STATION_HOST, STATION_PORT, Trust::WebPki, &identity)
+        .await
+        .expect("handshake should succeed");
+
+    let data: Vec<u8> = (0..4096).map(|_| rand::random::<u8>()).collect();
+    let mcid = macula_rust_sdk::content::put(&mut session, &data, "test-block", &identity)
+        .await
+        .expect("put should succeed");
+    assert!(
+        !macula_rust_sdk::manifest::mcid_is_chunked(&mcid),
+        "4096 bytes is well under the chunking threshold"
+    );
+    println!(
+        "OBSERVED: stored single block under mcid={}",
+        hex::encode(mcid)
+    );
+
+    let fetched = macula_rust_sdk::content::get(&mut session, mcid, &identity)
+        .await
+        .expect("get should succeed for content this session just put");
+    assert_eq!(
+        fetched, data,
+        "fetched bytes must match what was put, exactly"
+    );
+
+    session
+        .close("normal", Some("content single-block test done"), &identity)
+        .await;
+}
+
+/// A real chunked put/get round trip: content large enough to force
+/// `manifest::create`'s multi-chunk path, exercising `_content.put_block`
+/// (several times, sequentially — see `src/content.rs`'s module doc on
+/// why this crate doesn't parallelize lanes), `_content.put_manifest`,
+/// `_content.get_manifest`, and `_content.get_block` (again several
+/// times) all against a real station, then verifies the reassembled
+/// bytes against the manifest's Merkle root.
+#[tokio::test]
+#[ignore = "requires network access to a live macula-station"]
+async fn chunked_put_get_round_trip_against_the_real_fleet() {
+    let identity = KeyPair::generate_with_default_puzzle();
+    let mut session = connection::connect(STATION_HOST, STATION_PORT, Trust::WebPki, &identity)
+        .await
+        .expect("handshake should succeed");
+
+    let size = macula_rust_sdk::manifest::DEFAULT_CHUNK_SIZE * 2 + 12_345;
+    let data: Vec<u8> = (0..size).map(|_| rand::random::<u8>()).collect();
+    let mcid = macula_rust_sdk::content::put(&mut session, &data, "test-chunked", &identity)
+        .await
+        .expect("chunked put should succeed");
+    assert!(
+        macula_rust_sdk::manifest::mcid_is_chunked(&mcid),
+        "{size} bytes is well over the chunking threshold"
+    );
+    println!(
+        "OBSERVED: stored {size} bytes as a manifest under mcid={}",
+        hex::encode(mcid)
+    );
+
+    let fetched = macula_rust_sdk::content::get(&mut session, mcid, &identity)
+        .await
+        .expect("chunked get should succeed for content this session just put");
+    assert_eq!(
+        fetched, data,
+        "reassembled bytes must match what was put, exactly"
+    );
+
+    session
+        .close("normal", Some("content chunked test done"), &identity)
+        .await;
+}
+
+/// A made-up MCID that (with overwhelming probability) nothing has ever
+/// stored — proves the wire-level `not_found` reply is reached and
+/// parsed correctly, not just the happy path.
+#[tokio::test]
+#[ignore = "requires network access to a live macula-station"]
+async fn get_of_an_unknown_block_reports_not_found_against_the_real_fleet() {
+    let identity = KeyPair::generate_with_default_puzzle();
+    let mut session = connection::connect(STATION_HOST, STATION_PORT, Trust::WebPki, &identity)
+        .await
+        .expect("handshake should succeed");
+
+    let random_hash: [u8; 32] = rand::random();
+    let mcid = macula_rust_sdk::manifest::block_mcid(&random_hash);
+
+    match macula_rust_sdk::content::get(&mut session, mcid, &identity).await {
+        Err(macula_rust_sdk::content::GetError::NotFound) => {
+            println!("OBSERVED: not_found reported correctly for an unknown mcid");
+        }
+        other => panic!("expected GetError::NotFound, got {other:?}"),
+    }
+
+    session
+        .close("normal", Some("content not-found test done"), &identity)
+        .await;
+}
