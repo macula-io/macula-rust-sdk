@@ -17,15 +17,18 @@ why every section below is traced to specific files and line ranges in
 `macula-io/macula` at v10.10.0 rather than reconstructed from memory.
 
 Source files read in full for this spec: `native/macula_quic/{Cargo.toml,
-src/cert.rs, src/config.rs}`, `src/peering/{macula_protocol_types.erl,
-macula_frame.erl, macula_peering_conn.erl, macula_bolt4.erl,
-macula_source_route.erl}`. Skimmed for scope only (not needed for a
-client, station/config-side): `macula_tls.erl`, `macula_peering.erl`,
-`macula_quic.erl`. Confirmed dead: `macula_protocol_types.erl`,
-`macula_protocol_encoder.erl`, `macula_protocol_decoder.erl` — an
-unreferenced legacy (V1, msgpack/byte-tag) scheme, superseded entirely by
-`macula_frame.erl` ("Macula V2"). Ignore all three; nothing in the live
-peering connection state machine calls them.
+src/cert.rs, src/config.rs}`, `native/macula_cbor_nif/src/deterministic.rs`,
+`src/peering/{macula_protocol_types.erl, macula_frame.erl,
+macula_peering_conn.erl, macula_bolt4.erl, macula_source_route.erl}`.
+Skimmed for scope only (not needed for a client, station/config-side):
+`macula_tls.erl`, `macula_peering.erl`, `macula_quic.erl`. Not yet read:
+`macula_record_cbor.erl` (the Erlang reference `deterministic.rs` is
+differentially tested against — corroborating source, not primary, since
+a Rust port transcribes the Rust file directly). Confirmed dead:
+`macula_protocol_types.erl`, `macula_protocol_encoder.erl`,
+`macula_protocol_decoder.erl` — an unreferenced legacy (V1, msgpack/byte-tag)
+scheme, superseded entirely by `macula_frame.erl` ("Macula V2"). Ignore all
+three; nothing in the live peering connection state machine calls them.
 
 ---
 
@@ -149,11 +152,78 @@ just a style choice.** Every frame's Ed25519 signature is computed over
 the canonical CBOR bytes of the unsigned frame (§5). If a Rust CBOR
 encoder produces different bytes for the same logical map (different key
 ordering, non-minimal integer encoding, etc.), signatures will not
-verify against station-produced frames and vice versa. `ciborium` (used
-by macula's own `macula_cbor_nif`) needs to be checked for whether its
-default output actually matches RFC 8949 §4.2.1 canonical form, or
-whether canonicalization needs to be done as a separate pass — do not
-assume this is free.
+verify against station-produced frames and vice versa.
+
+**RESOLVED — `ciborium` is not involved at all, and that's good news, not
+a gap.** `macula_cbor_nif` has two separate code paths
+(`native/macula_cbor_nif/src/`): `nif_pack`/`nif_unpack` go through
+`ciborium::value::Value` and are genuinely non-deterministic (not what
+the wire uses). `pack_deterministic`/`unpack_deterministic` — what
+`macula_frame.erl` actually calls — live in a **separate, hand-rolled
+encoder** (`deterministic.rs`, 410 lines) that bypasses `ciborium`
+entirely and operates directly on `rustler::Term`. Its own doc comment
+says it "mirrors `macula_record_cbor.erl` byte-for-byte" and the two are
+kept in sync by a differential test
+(`test/macula_cbor_deterministic_diff_tests.erl`). This means the exact
+canonical algorithm is fully known, small, and directly portable —
+nothing to "verify against the RFC," just a mechanical Rust-to-Rust
+transcription of an already-correct 200-line core:
+
+- **Integers:** non-negative → major 0; negative → major 1, encoded value
+  `-1 - N`. Both use **minimal-length encoding**: inline if ≤23, else the
+  smallest of 1/2/4/8 extra bytes that fits (AI 24/25/26/27). Range:
+  positive up to `u64::MAX`; negative down to `-(2^64)` (via `i128`
+  internally, since plain `i64::MIN` is one bit short). Anything outside
+  that range is a hard encode error, not silent bignum handling.
+- **Binary** → major 2 (byte string), raw bytes, unchanged.
+- **`{text, Binary}`** → major 3 (text string), bytes used **as-is, no
+  UTF-8 validation** (matches the Erlang encoder's own leniency — don't
+  add validation a Rust port that isn't there in the source).
+- **Atom (not `null`)** → major 3, via the atom's own UTF-8 name. This
+  NIF encodes atoms directly to text on the way out, but **on decode
+  every major-3 value always comes back as `{text, Binary}`, never a bare
+  atom** — atom reconstitution (`binary_to_existing_atom`) happens one
+  layer up, in `macula_frame.erl`'s own `from_wire_envelope/1` (§ above).
+  A Rust port has no atom-table-exhaustion risk to defend against, so
+  this two-layer split collapses to nothing: just decode major-3 as a
+  `String`/`&str` and match it against the fixed vocabulary in §6
+  directly.
+- **List** → major 4 (array).
+- **Tuple**: the **only** encodable tuple shape is `{text, Binary}` —
+  anything else is a hard encode error. There is no general tuple
+  encoding.
+- **Map** → major 5. Keys are sorted by the **bytewise lexicographic
+  order of their own already-encoded bytes** (encode each key
+  independently first, then sort the `(key_bytes, value_bytes)` pairs by
+  `key_bytes` using plain byte-vector `Ord`, then concatenate). This is
+  the one rule a naive implementation is most likely to get wrong —
+  sorting by the *original* key representation instead of its *encoded*
+  bytes will diverge from station output for keys of different CBOR
+  major types.
+- **`null` (Erlang `undefined`)** → major 7, AI 22 (`0xF6`).
+- **Float → ALWAYS binary64** (major 7, AI 27, `0xFB` prefix) on encode,
+  regardless of whether the value would round-trip in fewer bits. This is
+  a **deliberate divergence from RFC 8949's own canonical-form
+  recommendation** (which prefers the shortest float width that
+  round-trips) — done so the byte derivation is independent of platform
+  float encoding. A generic "canonical CBOR" crate that follows the RFC's
+  shortest-float rule instead of this will silently produce
+  non-matching, non-verifying bytes. Decode accepts binary16/32/64 for
+  interop, converting all to `f64`.
+- **Decode rejects major type 6 (tags) outright** — not supported at all.
+  Major 7 only supports `null` and the three float widths; no booleans,
+  no "undefined" simple value, nothing else. Duplicate map keys on decode
+  are last-write-wins, not an error.
+- Every decode path is panic-free by construction (explicit bounds checks
+  throughout, no `unwrap`/`expect`/panicking slice index) — worth
+  matching in a Rust port that will also be parsing untrusted
+  network input.
+
+Net effect: this open item is closed. Define a small Rust `Value` enum
+mirroring these variants (`UInt`, `NegInt`, `Bytes`, `Text`, `List`,
+`Map`, `Null`, `Float`) and transcribe `encode_value`/`decode_one` from
+`deterministic.rs` directly — no external crate needed for this part at
+all.
 
 **Atom ↔ wire-string mapping** (`to_wire/1` / `from_wire_envelope/1`,
 lines 1855-1909): every Erlang atom (frame type names, field names like
@@ -387,7 +457,7 @@ Confirmed from the NIF `Cargo.toml`s in `native/*`:
 | Pubkey-pin verifier | (hand-written, ~150 lines in `cert.rs`) | Port near-verbatim |
 | Ed25519 sign/verify | `ed25519-dalek` 2.1 | Yes |
 | Hashing | `blake3` 1.5 (where BLAKE3 is used; source-route hop-hash uses SHA-256 via Erlang's `crypto:hash/2`, a separate primitive — confirm which Rust crate covers that path, likely `sha2`) | Yes for BLAKE3 uses |
-| CBOR | `ciborium` 0.2 | Verify canonical-mode correctness first (§4) |
+| CBOR (deterministic wire codec) | none — hand-rolled in `native/macula_cbor_nif/src/deterministic.rs` (410 lines) | Transcribe directly, algorithm fully known (§4). `ciborium` is a *different*, non-deterministic code path in the same NIF crate and is irrelevant to the wire format. |
 | MRI parsing | (custom, `macula_mri_nif`) | Study before porting |
 | DID/UCAN | `ed25519-dalek`-based (`macula_did_nif`/`macula_ucan_nif`) | Study before porting |
 
@@ -399,9 +469,9 @@ fixed layout above), and the puzzle-evidence handshake field (unresolved,
 
 ## 11. Open items before any Rust code gets written
 
-1. **Canonical CBOR verification.** Confirm `ciborium`'s output matches
-   RFC 8949 §4.2.1 deterministic encoding exactly, or find/write a
-   canonicalization pass. This blocks every signature check.
+1. ~~Canonical CBOR verification.~~ **RESOLVED, 2026-08-28** — see §4.
+   `ciborium` was never the actual wire codec; the real algorithm is
+   hand-rolled, fully traced, and directly portable.
 2. **`puzzle_evidence`.** Read `macula_identity.erl`'s puzzle
    implementation — not yet traced. The CONNECT handshake cannot complete
    without producing a valid one.
