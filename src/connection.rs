@@ -387,6 +387,29 @@ impl Session {
         Ok(FrameStream::new(send, recv))
     }
 
+    /// Accept the next dedicated stream the *peer* opens toward us —
+    /// e.g. the station routing an inbound STREAM_OPEN for a procedure
+    /// this session has [`advertise`](Self::advertise)d (§13.2). Blocks
+    /// until one arrives.
+    ///
+    /// The receiving side has no advance notice of why a new stream
+    /// arrived; §7 of `plans/PLAN_WIRE_PROTOCOL.md` says to read the
+    /// stream's own first frame to learn its purpose, which is exactly
+    /// what a caller of this method does next via the returned
+    /// `FrameStream`'s own `recv_frame`. The reference (`quicer`-backed
+    /// Erlang) has a documented race here — the peer's first bytes can
+    /// arrive before the owning process is notified the stream exists at
+    /// all, because its NIF stream resources start passive and only
+    /// begin delivering once explicitly armed *after* the notification.
+    /// That race doesn't apply here: `quinn`/QUIC buffers inbound stream
+    /// data at the transport layer regardless of whether or when the
+    /// application starts reading, so nothing analogous to arm before
+    /// read is needed on this side.
+    pub async fn accept_dedicated_stream(&mut self) -> Result<FrameStream, quinn::ConnectionError> {
+        let (send, recv) = self.connection.accept_bi().await?;
+        Ok(FrameStream::new(send, recv))
+    }
+
     /// Any bytes already read past the HELLO frame during the handshake
     /// (belonging to whatever the station sent next) that a caller
     /// building further protocol handling on top of this `Session`
@@ -451,6 +474,31 @@ impl Session {
         identity: &KeyPair,
     ) -> Result<(), SendFrameError> {
         let signed = frame::sign(frame::unsubscribe(spec), identity);
+        self.control.send_frame(signed).await
+    }
+
+    /// Send a signed ADVERTISE (§6.9) — registers this connection as the
+    /// handler for `spec`'s `(realm, procedure)`. Fire-and-forget on the
+    /// wire; the station then routes inbound CALLs (control stream) and
+    /// STREAM_OPENs (a fresh dedicated stream — see
+    /// [`accept_dedicated_stream`](Self::accept_dedicated_stream)) for
+    /// that procedure back to this connection.
+    pub async fn advertise(
+        &mut self,
+        spec: &frame::AdvertiseSpec,
+        identity: &KeyPair,
+    ) -> Result<(), SendFrameError> {
+        let signed = frame::sign(frame::advertise(spec), identity);
+        self.control.send_frame(signed).await
+    }
+
+    /// Send a signed UNADVERTISE. Fire-and-forget.
+    pub async fn unadvertise(
+        &mut self,
+        spec: &frame::UnadvertiseSpec,
+        identity: &KeyPair,
+    ) -> Result<(), SendFrameError> {
+        let signed = frame::sign(frame::unadvertise(spec), identity);
         self.control.send_frame(signed).await
     }
 

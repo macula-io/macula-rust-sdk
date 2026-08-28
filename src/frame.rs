@@ -1084,9 +1084,14 @@ impl StreamMode {
         }
     }
 
-    // No `from_name`: nothing in this crate parses an *incoming*
-    // STREAM_OPEN (that's the provider role, §13.2, not built — see
-    // this section's module doc). Add it if/when that role is built.
+    fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "server_stream" => Some(StreamMode::ServerStream),
+            "client_stream" => Some(StreamMode::ClientStream),
+            "bidi" => Some(StreamMode::Bidi),
+            _ => None,
+        }
+    }
 }
 
 /// `encoding` on a STREAM_DATA — a hint for how to interpret `body`, not
@@ -1205,6 +1210,110 @@ fn stream_open_value(spec: &StreamOpenSpec, frame_id: [u8; 16], sent_at_ms: u64)
 /// Unsigned — pass the result to [`sign`] before sending.
 pub fn stream_open(spec: &StreamOpenSpec) -> Value {
     stream_open_value(spec, fresh_frame_id(), current_millis())
+}
+
+/// The fields a provider needs from an *inbound* STREAM_OPEN — the
+/// first frame on a freshly-accepted dedicated stream (§13.2). Doesn't
+/// carry `source_route`/`retry_budget`: nothing in the provider role
+/// built so far acts on either.
+#[derive(Debug, Clone)]
+pub struct StreamOpenInfo {
+    pub stream_id: [u8; 16],
+    pub procedure: String,
+    pub realm: [u8; 32],
+    pub mode: StreamMode,
+    pub args: Value,
+    pub deadline_ms: i128,
+    pub caller: [u8; 32],
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum ParseStreamOpenError {
+    NotAStreamOpenFrame,
+    MissingField(&'static str),
+    WrongFieldType(&'static str),
+}
+
+impl std::fmt::Display for ParseStreamOpenError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ParseStreamOpenError::NotAStreamOpenFrame => {
+                write!(f, "frame_type is not \"stream_open\"")
+            }
+            ParseStreamOpenError::MissingField(name) => {
+                write!(f, "missing required field {name:?}")
+            }
+            ParseStreamOpenError::WrongFieldType(name) => {
+                write!(f, "field {name:?} has the wrong type")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ParseStreamOpenError {}
+
+/// Parse a decoded frame as a STREAM_OPEN.
+pub fn parse_stream_open(frame: &Value) -> Result<StreamOpenInfo, ParseStreamOpenError> {
+    match frame.get("frame_type") {
+        Some(Value::Text(t)) if t == "stream_open" => {}
+        _ => return Err(ParseStreamOpenError::NotAStreamOpenFrame),
+    }
+    let stream_id = match frame.get("stream_id") {
+        Some(Value::Bytes(b)) => b
+            .as_slice()
+            .try_into()
+            .map_err(|_| ParseStreamOpenError::WrongFieldType("stream_id"))?,
+        Some(_) => return Err(ParseStreamOpenError::WrongFieldType("stream_id")),
+        None => return Err(ParseStreamOpenError::MissingField("stream_id")),
+    };
+    // `procedure := binary()` on the wire -- bytes, not text.
+    let procedure = match frame.get("procedure") {
+        Some(Value::Bytes(b)) => String::from_utf8(b.clone())
+            .map_err(|_| ParseStreamOpenError::WrongFieldType("procedure"))?,
+        Some(_) => return Err(ParseStreamOpenError::WrongFieldType("procedure")),
+        None => return Err(ParseStreamOpenError::MissingField("procedure")),
+    };
+    let realm = match frame.get("realm") {
+        Some(Value::Bytes(b)) => b
+            .as_slice()
+            .try_into()
+            .map_err(|_| ParseStreamOpenError::WrongFieldType("realm"))?,
+        Some(_) => return Err(ParseStreamOpenError::WrongFieldType("realm")),
+        None => return Err(ParseStreamOpenError::MissingField("realm")),
+    };
+    let mode = match frame.get("mode") {
+        Some(Value::Text(t)) => {
+            StreamMode::from_name(t).ok_or(ParseStreamOpenError::WrongFieldType("mode"))?
+        }
+        Some(_) => return Err(ParseStreamOpenError::WrongFieldType("mode")),
+        None => return Err(ParseStreamOpenError::MissingField("mode")),
+    };
+    let args = frame
+        .get("args")
+        .cloned()
+        .ok_or(ParseStreamOpenError::MissingField("args"))?;
+    let deadline_ms = match frame.get("deadline_ms") {
+        Some(Value::Int(n)) => *n,
+        Some(_) => return Err(ParseStreamOpenError::WrongFieldType("deadline_ms")),
+        None => return Err(ParseStreamOpenError::MissingField("deadline_ms")),
+    };
+    let caller = match frame.get("caller") {
+        Some(Value::Bytes(b)) => b
+            .as_slice()
+            .try_into()
+            .map_err(|_| ParseStreamOpenError::WrongFieldType("caller"))?,
+        Some(_) => return Err(ParseStreamOpenError::WrongFieldType("caller")),
+        None => return Err(ParseStreamOpenError::MissingField("caller")),
+    };
+    Ok(StreamOpenInfo {
+        stream_id,
+        procedure,
+        realm,
+        mode,
+        args,
+        deadline_ms,
+        caller,
+    })
 }
 
 /// Fields for a STREAM_DATA frame — one chunk. `body`'s shape follows
@@ -1949,6 +2058,50 @@ mod tests {
         assert_eq!(hex::encode_upper(&sig), "6070D8AB71F837591AC2C803C04F9E1D3FA01C9310D33C96A90434820C5E50550F9DEA8A764247EB49AF63447C037E192B7892A365C1A4ACB9BC46B98AA5670F");
         let encoded = encode(&signed).expect("encodable frame");
         assert_eq!(encoded.len(), 415);
+    }
+
+    /// `parse_stream_open` round-tripped against the SAME
+    /// already-byte-verified construction above: since
+    /// `stream_open_frame_matches_the_reference_byte_for_byte` already
+    /// proves the constructor's encoding is bit-for-bit correct,
+    /// getting the same field values back out here proves the parser
+    /// inverts it correctly too, without needing a second live vector.
+    #[test]
+    fn parse_stream_open_round_trips_a_well_formed_frame() {
+        let pub_bytes = fixed_array(VECTOR_PUB);
+        let spec = StreamOpenSpec::new(
+            vector_stream_id(),
+            "macula_rust_sdk.test_stream",
+            VECTOR_ZERO_REALM,
+            StreamMode::ClientStream,
+            Value::Map(vec![(Value::text("hello"), Value::text("world"))]),
+            1_700_000_030_000,
+            pub_bytes,
+        );
+        let frame = stream_open_value(&spec, vector_frame_id(), VECTOR_SENT_AT_MS);
+        let info = parse_stream_open(&frame).expect("well-formed stream_open");
+        assert_eq!(info.stream_id, vector_stream_id());
+        assert_eq!(info.procedure, "macula_rust_sdk.test_stream");
+        assert_eq!(info.realm, VECTOR_ZERO_REALM);
+        assert_eq!(info.mode, StreamMode::ClientStream);
+        assert_eq!(
+            info.args,
+            Value::Map(vec![(Value::text("hello"), Value::text("world"))])
+        );
+        assert_eq!(info.deadline_ms, 1_700_000_030_000);
+        assert_eq!(info.caller, pub_bytes);
+    }
+
+    #[test]
+    fn parse_stream_open_rejects_the_wrong_frame_type() {
+        let frame = Value::Map(vec![(
+            Value::text("frame_type"),
+            Value::text("stream_data"),
+        )]);
+        assert_eq!(
+            parse_stream_open(&frame).unwrap_err(),
+            ParseStreamOpenError::NotAStreamOpenFrame
+        );
     }
 
     #[test]

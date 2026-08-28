@@ -6,11 +6,24 @@
 //! [`Session::open_dedicated_stream`](crate::connection::Session::open_dedicated_stream)
 //! rather than the control stream.
 //!
-//! **Provider role (§13.2, exposing a streaming procedure TO the mesh)
-//! is not built** — see `src/frame.rs`'s module doc on this same scope
-//! decision. Nothing in this crate needs to *serve* RPCs yet.
+//! **Both roles are built.** Caller/consumer (§13.1) opens a stream and
+//! is the natural fit for pulling/pushing against a procedure that
+//! already exists somewhere. Provider (§13.2) advertises a procedure
+//! (§6.9, [`Session::advertise`](crate::connection::Session::advertise))
+//! and answers inbound STREAM_OPENs the station routes back —
+//! [`Session::accept_dedicated_stream`](crate::connection::Session::accept_dedicated_stream)
+//! accepts the fresh dedicated stream the station opens toward us,
+//! [`StreamHandle::accept`] reads and parses the STREAM_OPEN that's
+//! always its first frame. Both roles end up holding the same
+//! [`StreamHandle`] afterward — a stream's wire vocabulary
+//! (STREAM_DATA/END/ERROR/REPLY) is symmetric regardless of which side
+//! opened it, so `send_data`/`recv`/`close_send`/`abort` all mean the
+//! same thing either way. [`StreamHandle::send_reply`] is the one
+//! provider-only addition: sending the terminal STREAM_REPLY a
+//! `client_stream`/`bidi` caller's own
+//! [`await_reply`](StreamHandle::await_reply) is waiting on.
 //!
-//! Usage, matching the reference's own pattern:
+//! Caller/consumer usage, matching the reference's own pattern:
 //! 1. [`StreamHandle::open`] sends STREAM_OPEN and returns a handle once
 //!    the frame is on the wire — there's no open-time acknowledgement to
 //!    wait for; the provider starts reacting to it directly.
@@ -24,6 +37,20 @@
 //!    just drop the handle** — the peer's only signal to tell a
 //!    cancellation/failure apart from a dropped connection
 //!    (`plans/PLAN_WIRE_PROTOCOL.md` §13.1, point 4).
+//!
+//! Provider usage:
+//! 1. [`Session::advertise`](crate::connection::Session::advertise) once
+//!    per procedure this session will answer.
+//! 2. Loop on [`StreamHandle::accept`], which blocks for the next
+//!    inbound STREAM_OPEN and hands back a ready-to-use handle plus the
+//!    parsed [`frame::StreamOpenInfo`] (check its `procedure` — a single
+//!    connection's dedicated streams aren't partitioned by which
+//!    procedure they're for, so a session that's advertised more than
+//!    one needs this to route).
+//! 3. Drive it exactly like the caller side, from the opposite chair:
+//!    `server_stream` mode pushes with `send_data`/`close_send`;
+//!    `client_stream` mode drains with `recv` and finishes with
+//!    `send_reply`.
 
 use std::time::Duration;
 
@@ -55,6 +82,27 @@ impl std::fmt::Display for OpenError {
 }
 
 impl std::error::Error for OpenError {}
+
+#[derive(Debug)]
+pub enum AcceptError {
+    AcceptStream(quinn::ConnectionError),
+    Timeout,
+    Recv(RecvFrameError),
+    Parse(frame::ParseStreamOpenError),
+}
+
+impl std::fmt::Display for AcceptError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AcceptError::AcceptStream(e) => write!(f, "accepting a dedicated stream: {e}"),
+            AcceptError::Timeout => write!(f, "no inbound stream within the given timeout"),
+            AcceptError::Recv(e) => write!(f, "reading the stream's first frame: {e}"),
+            AcceptError::Parse(e) => write!(f, "expected a stream_open frame: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for AcceptError {}
 
 /// One item [`StreamHandle::recv`] hands back: a chunk, or a clean
 /// end-of-stream.
@@ -145,6 +193,46 @@ impl StreamHandle {
             mode,
             seq_out: 0,
         })
+    }
+
+    /// Provider role: block for the next inbound STREAM_OPEN on
+    /// `session`'s connection, bounded by `timeout`. Only ever succeeds
+    /// after [`Session::advertise`](crate::connection::Session::advertise)
+    /// has registered at least one procedure — otherwise the station has
+    /// nothing to route here. Returns the ready-to-use handle alongside
+    /// the parsed [`frame::StreamOpenInfo`] (check its `procedure` if
+    /// this session advertised more than one).
+    pub async fn accept(
+        session: &mut Session,
+        timeout: Duration,
+    ) -> Result<(Self, frame::StreamOpenInfo), AcceptError> {
+        let mut stream = tokio::time::timeout(timeout, session.accept_dedicated_stream())
+            .await
+            .map_err(|_| AcceptError::Timeout)?
+            .map_err(AcceptError::AcceptStream)?;
+        let first = stream.recv_frame().await.map_err(AcceptError::Recv)?;
+        let open = frame::parse_stream_open(&first).map_err(AcceptError::Parse)?;
+        let handle = Self {
+            stream,
+            stream_id: open.stream_id,
+            mode: open.mode,
+            seq_out: 0,
+        };
+        Ok((handle, open))
+    }
+
+    /// Provider role: send the terminal STREAM_REPLY a `client_stream`/
+    /// `bidi` caller's own [`await_reply`](Self::await_reply) is waiting
+    /// on, once this side has fully consumed and verified whatever the
+    /// caller streamed.
+    pub async fn send_reply(
+        &mut self,
+        payload: Value,
+        identity: &KeyPair,
+    ) -> Result<(), SendFrameError> {
+        let spec = frame::StreamReplySpec::new(self.stream_id, payload, identity.node_id());
+        let signed = frame::sign(frame::stream_reply(&spec), identity);
+        self.stream.send_frame(signed).await
     }
 
     /// Send one chunk. `seq` is tracked internally, starting at 0 and
