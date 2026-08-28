@@ -76,6 +76,50 @@ impl Value {
     pub fn text(s: impl Into<String>) -> Self {
         Value::Text(s.into())
     }
+
+    /// Look up a field by text key. `None` if this isn't a `Map` or the
+    /// key isn't present — mirrors macula's own field vocabulary, which
+    /// is always text keys (see the module doc's atom/text note).
+    pub fn get(&self, key: &str) -> Option<&Value> {
+        match self {
+            Value::Map(pairs) => pairs
+                .iter()
+                .find(|(k, _)| matches!(k, Value::Text(t) if t == key))
+                .map(|(_, v)| v),
+            _ => None,
+        }
+    }
+
+    /// A new `Map` with the given text keys removed. Non-maps pass
+    /// through unchanged. Used to compute a frame's signable bytes (the
+    /// frame minus `signature`/`publisher_sig`) — see `crate::frame`.
+    pub fn without(&self, keys: &[&str]) -> Value {
+        match self {
+            Value::Map(pairs) => Value::Map(
+                pairs
+                    .iter()
+                    .filter(|(k, _)| !matches!(k, Value::Text(t) if keys.contains(&t.as_str())))
+                    .cloned()
+                    .collect(),
+            ),
+            other => other.clone(),
+        }
+    }
+
+    /// Insert or replace a field in a `Map` by text key, consuming and
+    /// returning `self` for chaining. A no-op on a non-map value.
+    pub fn with_field(mut self, key: &str, value: Value) -> Value {
+        if let Value::Map(pairs) = &mut self {
+            match pairs
+                .iter_mut()
+                .find(|(k, _)| matches!(k, Value::Text(t) if t == key))
+            {
+                Some(entry) => entry.1 = value,
+                None => pairs.push((Value::text(key), value)),
+            }
+        }
+        self
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -604,5 +648,48 @@ mod tests {
             }
             other => panic!("expected a map, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn get_finds_a_field_by_text_key() {
+        let map = Value::Map(vec![(Value::text("a"), Value::Int(1))]);
+        assert_eq!(map.get("a"), Some(&Value::Int(1)));
+        assert_eq!(map.get("missing"), None);
+    }
+
+    #[test]
+    fn get_on_a_non_map_is_none() {
+        assert_eq!(Value::Int(1).get("a"), None);
+    }
+
+    #[test]
+    fn without_removes_only_the_named_keys() {
+        let map = Value::Map(vec![
+            (Value::text("a"), Value::Int(1)),
+            (Value::text("b"), Value::Int(2)),
+            (Value::text("c"), Value::Int(3)),
+        ]);
+        let stripped = map.without(&["b"]);
+        assert_eq!(stripped.get("a"), Some(&Value::Int(1)));
+        assert_eq!(stripped.get("b"), None);
+        assert_eq!(stripped.get("c"), Some(&Value::Int(3)));
+    }
+
+    #[test]
+    fn with_field_replaces_an_existing_key_in_place() {
+        let map =
+            Value::Map(vec![(Value::text("a"), Value::Int(1))]).with_field("a", Value::Int(2));
+        assert_eq!(map.get("a"), Some(&Value::Int(2)));
+        // Replacing, not appending — still exactly one pair.
+        match map {
+            Value::Map(pairs) => assert_eq!(pairs.len(), 1),
+            _ => panic!("expected a map"),
+        }
+    }
+
+    #[test]
+    fn with_field_appends_a_new_key() {
+        let map = Value::Map(vec![]).with_field("a", Value::Int(1));
+        assert_eq!(map.get("a"), Some(&Value::Int(1)));
     }
 }

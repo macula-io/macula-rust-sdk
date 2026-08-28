@@ -23,6 +23,7 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "logg
 webpki-roots = "0.26"
 x509-parser = "0.16"
 tokio = { version = "1", features = ["full"] }
+uuid = { version = "1", features = ["v7"] }
 
 [dev-dependencies]
 hex = "0.4"
