@@ -1,3 +1,6 @@
+[workspace]
+members = ["macula-rust-sdk-ffi"]
+
 [package]
 name = "macula-rust-sdk"
 version = "0.1.0"
