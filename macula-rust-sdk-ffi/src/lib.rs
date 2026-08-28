@@ -413,9 +413,31 @@ impl FfiKeyPair {
         Self(macula_rust_sdk::identity::KeyPair::generate_with_default_puzzle())
     }
 
+    /// Reconstruct a keypair from its 32-byte seed (see
+    /// [`FfiKeyPair::private_bytes`]) — deterministic, the same seed
+    /// always yields the same node_id. The seed came from a
+    /// puzzle-hardened [`generate`](Self::generate) call, so
+    /// reconstructing from it stays puzzle-valid too; puzzle validity is
+    /// a property of the public key this seed determines, not something
+    /// re-checked at reconstruction time.
+    #[uniffi::constructor]
+    pub fn from_seed_bytes(seed: Vec<u8>) -> Result<Self, FfiError> {
+        Ok(Self(macula_rust_sdk::identity::KeyPair::from_seed_bytes(
+            to_32(seed)?,
+        )))
+    }
+
     /// This identity's node_id (its Ed25519 public key), 32 bytes.
     pub fn node_id(&self) -> Vec<u8> {
         self.0.node_id().to_vec()
+    }
+
+    /// This identity's 32-byte seed. Persist it to restore the SAME
+    /// identity (same node_id) across restarts via
+    /// [`FfiKeyPair::from_seed_bytes`] — treat it like a private key,
+    /// since it deterministically reconstructs this keypair.
+    pub fn private_bytes(&self) -> Vec<u8> {
+        self.0.private_bytes().to_vec()
     }
 }
 
