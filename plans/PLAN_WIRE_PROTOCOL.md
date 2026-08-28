@@ -941,7 +941,7 @@ protocol-level rework. A seam, not a feature.
 
 ## 14. UniFFI mobile bindings — crate architecture, started 2026-08-28
 
-**Started, not finished.** A separate crate, `macula-rust-sdk-ffi`,
+**Every application primitive wrapped, same day.** A separate crate, `macula-rust-sdk-ffi`,
 depending on the core `macula-rust-sdk` crate via a path dependency —
 structurally identical to `iroh-ffi`'s relationship to `iroh`, confirmed
 by reading the live `n0-computer/iroh-ffi` repo directly rather than
@@ -960,28 +960,34 @@ in the core crate. The doc comment at the top of `src/lib.rs`
 ("Mobile... is the flagship consumer driving this work, not the ceiling
 on it") is enforced structurally by this separation, not just stated.
 
-**What's exposed so far:**
+**What's exposed:**
 - `FfiKeyPair` — identity generation, `node_id()`.
 - `FfiSession` — `connect` (CONNECT/HELLO), `call` (CALL/RESULT/ERROR),
-  `publish`/`subscribe`/`unsubscribe`/`recv_event` (§6.8), `close`.
+  `publish`/`subscribe`/`unsubscribe`/`recv_event` (§6.8), `content_put`/
+  `content_get` (§12), `stream_open` (§13, returns an `FfiStream`),
+  `close`.
+- `FfiStream` — `send_data`/`close_send`/`recv`/`await_reply`/`abort`,
+  the caller/consumer role only (§13.1) — mirrors `StreamHandle`.
 - `FfiValue` — a **restricted** mirror of `cbor::Value`: `Null`/`Int`/
   `Bytes`/`Text`/`Float`. Missing `List`/`Map` (need recursive UniFFI
   enums — deferred, not a wire limitation) and `Int` is narrowed from
   `i128` to `i64` (UniFFI has no 128-bit integer type; an out-of-range
   value returns an explicit `FfiError::UnrepresentableValue` rather than
   silently truncating).
-- `FfiCallResponse` — mirrors `frame::CallResponse`.
-- `FfiEvent` — mirrors `frame::EventInfo`. `publish`'s `seq`/
-  `published_at_ms` stay caller-supplied rather than tracked internally
-  by `FfiSession` (unlike streaming RPC's per-stream `seq_out` counter):
-  PUBLISH's `seq` is a per-publisher, per-topic gap-detection sequence, and
-  a client publishing to several topics has to own that bookkeeping
-  itself.
+- `FfiCallResponse`, `FfiEvent`, `FfiStreamItem`, `FfiStreamReply` —
+  mirror `frame::CallResponse`/`frame::EventInfo`/`stream::StreamItem`/
+  the `(payload, responded_by)` pair `StreamHandle::await_reply` returns.
+  `publish`'s `seq`/`published_at_ms` stay caller-supplied rather than
+  tracked internally by `FfiSession` (unlike streaming RPC's per-stream
+  `seq_out` counter): PUBLISH's `seq` is a per-publisher, per-topic
+  gap-detection sequence, and a client publishing to several topics has
+  to own that bookkeeping itself.
 
-**Not yet wrapped** (already built and live-verified in the core
-crate — see §12, §13 — this is purely FFI-surface work remaining, no new
-wire-protocol work): content transfer (`content::put`/`get`), streaming
-RPC (`StreamHandle`).
+**Not wrapped, and won't be until the core crate has it:** the
+streaming/RPC-advertise *provider* role (§13.2/§6.9 — exposing a
+procedure *to* the mesh; the core crate doesn't implement this role
+either) and pubkey-pinned trust (`connect` always uses WebPki — the
+core crate's `Trust::Pinned` exists but isn't surfaced here yet).
 
 **Verified past "it compiles":** built the release `cdylib` and actually
 ran `uniffi-bindgen generate` for both Kotlin and Swift, then inspected
