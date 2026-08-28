@@ -461,3 +461,137 @@ async fn stream_open_round_trip_against_the_real_fleet() {
         .close("normal", Some("stream test done"), &identity)
         .await;
 }
+
+/// The real point of §13.2's whole existence: two independent
+/// connections to the SAME live station — one advertises a procedure
+/// and accepts inbound streams for it (the provider role), the other
+/// dials in and pushes/pulls data against it (the caller role, already
+/// live-verified elsewhere). This is the first test in this crate where
+/// this process is on the RECEIVING end of a mesh interaction it didn't
+/// initiate — everything before this dialed out and waited for a
+/// response; here, one session sits idle after `advertise` until the
+/// station itself routes a stranger's request back to it.
+///
+/// Same station on purpose: cross-station routing depends on gossip
+/// propagation between stations, which isn't instant and isn't this
+/// crate's concern to wait out — same-station is the direct case
+/// `plans/PLAN_WIRE_PROTOCOL.md` §6.9 describes ("registers the handler
+/// with the pool's advertise-gossip mechanism"), and it's what a real
+/// provider dialed into one station actually needs day to day.
+#[tokio::test]
+#[ignore = "requires network access to a live macula-station"]
+async fn streaming_provider_round_trip_against_the_real_fleet() {
+    let provider_identity = KeyPair::generate_with_default_puzzle();
+    let caller_identity = KeyPair::generate_with_default_puzzle();
+
+    let mut provider_session = connection::connect(
+        STATION_HOST,
+        STATION_PORT,
+        Trust::WebPki,
+        &provider_identity,
+    )
+    .await
+    .expect("provider handshake should succeed");
+    let mut caller_session =
+        connection::connect(STATION_HOST, STATION_PORT, Trust::WebPki, &caller_identity)
+            .await
+            .expect("caller handshake should succeed");
+
+    let realm: [u8; 32] = rand::random();
+    let procedure = format!(
+        "macula_rust_sdk.test_provider.{}",
+        hex::encode(rand::random::<[u8; 8]>())
+    );
+
+    let advertise_spec = macula_rust_sdk::frame::AdvertiseSpec::new(
+        realm,
+        procedure.clone(),
+        provider_identity.node_id(),
+    );
+    provider_session
+        .advertise(&advertise_spec, &provider_identity)
+        .await
+        .expect("advertise should send");
+
+    // Give the station a moment to register the advertisement before
+    // the caller dials in against it.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    let accept_task = tokio::spawn(async move {
+        let result = macula_rust_sdk::stream::StreamHandle::accept(
+            &mut provider_session,
+            std::time::Duration::from_secs(10),
+        )
+        .await;
+        (result, provider_session)
+    });
+
+    let mut caller_handle = macula_rust_sdk::stream::StreamHandle::open(
+        &mut caller_session,
+        &procedure,
+        realm,
+        macula_rust_sdk::frame::StreamMode::ServerStream,
+        macula_rust_sdk::cbor::Value::Null,
+        (now_ms() + 10_000) as i128,
+        &caller_identity,
+    )
+    .await
+    .expect("caller should open a stream");
+
+    let (accept_result, provider_session) =
+        accept_task.await.expect("accept task should not panic");
+    let (mut provider_handle, open_info) =
+        accept_result.expect("provider should accept the inbound STREAM_OPEN");
+
+    println!(
+        "OBSERVED: provider accepted stream_open for procedure={} mode={:?}",
+        open_info.procedure, open_info.mode
+    );
+    assert_eq!(open_info.procedure, procedure);
+    assert_eq!(
+        open_info.mode,
+        macula_rust_sdk::frame::StreamMode::ServerStream
+    );
+
+    provider_handle
+        .send_data(
+            macula_rust_sdk::frame::StreamEncoding::Raw,
+            macula_rust_sdk::cbor::Value::Bytes(b"hello from the provider".to_vec()),
+            &provider_identity,
+        )
+        .await
+        .expect("provider should push a chunk");
+    provider_handle
+        .close_send(&provider_identity)
+        .await
+        .expect("provider should close its send side");
+
+    match caller_handle
+        .recv(std::time::Duration::from_secs(5))
+        .await
+        .expect("caller should receive the pushed chunk")
+    {
+        macula_rust_sdk::stream::StreamItem::Data { body, .. } => {
+            assert_eq!(
+                body,
+                macula_rust_sdk::cbor::Value::Bytes(b"hello from the provider".to_vec())
+            );
+        }
+        other => panic!("expected Data, got {other:?}"),
+    }
+    match caller_handle
+        .recv(std::time::Duration::from_secs(5))
+        .await
+        .expect("caller should see end-of-stream")
+    {
+        macula_rust_sdk::stream::StreamItem::Eof => {}
+        other => panic!("expected Eof, got {other:?}"),
+    }
+
+    provider_session
+        .close("normal", Some("provider test done"), &provider_identity)
+        .await;
+    caller_session
+        .close("normal", Some("caller test done"), &caller_identity)
+        .await;
+}
