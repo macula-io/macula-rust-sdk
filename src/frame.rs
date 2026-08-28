@@ -359,6 +359,97 @@ pub fn call_error(spec: &CallErrorSpec) -> Value {
     call_error_value(spec, fresh_frame_id(), current_millis())
 }
 
+/// The fields a provider needs from an *inbound* CALL — the
+/// counterpart to [`CallResponse`] for the receiving side. Doesn't
+/// carry `source_route`/`retry_budget`/`ucan_token`: nothing in the
+/// provider role built so far acts on any of them.
+#[derive(Debug, Clone)]
+pub struct CallInfo {
+    pub call_id: [u8; 16],
+    pub procedure: String,
+    pub realm: [u8; 32],
+    pub payload: Value,
+    pub deadline_ms: i128,
+    pub caller: [u8; 32],
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum ParseCallError {
+    NotACallFrame,
+    MissingField(&'static str),
+    WrongFieldType(&'static str),
+}
+
+impl std::fmt::Display for ParseCallError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ParseCallError::NotACallFrame => write!(f, "frame_type is not \"call\""),
+            ParseCallError::MissingField(name) => write!(f, "missing required field {name:?}"),
+            ParseCallError::WrongFieldType(name) => write!(f, "field {name:?} has the wrong type"),
+        }
+    }
+}
+
+impl std::error::Error for ParseCallError {}
+
+/// Parse a decoded frame as a CALL — the provider-side counterpart to
+/// [`parse_call_response`].
+pub fn parse_call(frame: &Value) -> Result<CallInfo, ParseCallError> {
+    match frame.get("frame_type") {
+        Some(Value::Text(t)) if t == "call" => {}
+        _ => return Err(ParseCallError::NotACallFrame),
+    }
+    let call_id = match frame.get("call_id") {
+        Some(Value::Bytes(b)) => b
+            .as_slice()
+            .try_into()
+            .map_err(|_| ParseCallError::WrongFieldType("call_id"))?,
+        Some(_) => return Err(ParseCallError::WrongFieldType("call_id")),
+        None => return Err(ParseCallError::MissingField("call_id")),
+    };
+    // `procedure := binary()` on the wire -- bytes, not text.
+    let procedure = match frame.get("procedure") {
+        Some(Value::Bytes(b)) => {
+            String::from_utf8(b.clone()).map_err(|_| ParseCallError::WrongFieldType("procedure"))?
+        }
+        Some(_) => return Err(ParseCallError::WrongFieldType("procedure")),
+        None => return Err(ParseCallError::MissingField("procedure")),
+    };
+    let realm = match frame.get("realm") {
+        Some(Value::Bytes(b)) => b
+            .as_slice()
+            .try_into()
+            .map_err(|_| ParseCallError::WrongFieldType("realm"))?,
+        Some(_) => return Err(ParseCallError::WrongFieldType("realm")),
+        None => return Err(ParseCallError::MissingField("realm")),
+    };
+    let payload = frame
+        .get("payload")
+        .cloned()
+        .ok_or(ParseCallError::MissingField("payload"))?;
+    let deadline_ms = match frame.get("deadline_ms") {
+        Some(Value::Int(n)) => *n,
+        Some(_) => return Err(ParseCallError::WrongFieldType("deadline_ms")),
+        None => return Err(ParseCallError::MissingField("deadline_ms")),
+    };
+    let caller = match frame.get("caller") {
+        Some(Value::Bytes(b)) => b
+            .as_slice()
+            .try_into()
+            .map_err(|_| ParseCallError::WrongFieldType("caller"))?,
+        Some(_) => return Err(ParseCallError::WrongFieldType("caller")),
+        None => return Err(ParseCallError::MissingField("caller")),
+    };
+    Ok(CallInfo {
+        call_id,
+        procedure,
+        realm,
+        payload,
+        deadline_ms,
+        caller,
+    })
+}
+
 /// Parsed fields of a RESULT or ERROR response to a CALL, correlated by
 /// `call_id`. Returned by [`crate::connection::Session::call`].
 #[derive(Debug, Clone)]

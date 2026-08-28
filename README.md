@@ -22,10 +22,10 @@
 > **Status, 2026-08-28:** the client/leaf side of the wire protocol is
 > built and **live-verified against the production station fleet**
 > (`station-de-frankfurt.macula.io`) — handshake, unary RPC, PubSub,
-> content transfer, and streaming RPC in both caller and provider roles.
-> Mobile bindings (Kotlin + Swift, via UniFFI) wrap the entire surface,
-> generated and CI-checked on every push. See [Status](#status) for what's
-> not there yet.
+> content transfer, and streaming RPC, every primitive in both caller
+> and provider roles. Mobile bindings (Kotlin + Swift, via UniFFI) wrap
+> most of that surface, generated and CI-checked on every push, with one
+> named exception. See [Status](#status) for what's not there yet.
 
 ## What is this?
 
@@ -48,12 +48,12 @@ CLI, or WASM as any other Rust SDK.
 | Primitive | Caller | Provider | Notes |
 |---|---|---|---|
 | Handshake (CONNECT/HELLO) | ✅ | — | Ed25519 identity, S/Kademlia puzzle-hardened |
-| Unary RPC (CALL/RESULT/ERROR) | ✅ | ⏳ | Provider dispatch not yet implemented |
+| Unary RPC (CALL/RESULT/ERROR) | ✅ | ✅ | `Session::serve_one_call`, BOLT#4 error mapping live-verified |
 | PubSub (PUBLISH/SUBSCRIBE/EVENT) | ✅ | ✅ | A subscriber gets its own publish, verified live |
 | Content transfer (single-block + chunked) | ✅ | ✅ | Content-addressed, BLAKE3/SHA-256 |
 | Streaming RPC (STREAM_OPEN/DATA/END/REPLY) | ✅ | ✅ | Both roles live-verified against the real fleet |
 | RPC advertise/unadvertise | ✅ | — | |
-| Mobile bindings (Kotlin, Swift) | ✅ | — | Via [UniFFI](#mobile-bindings-uniffi), same-day parity with the core surface |
+| Mobile bindings (Kotlin, Swift) | ✅ | 🏗️ | Via [UniFFI](#mobile-bindings-uniffi) — `serve_one_call` not yet surfaced through FFI (a `Fn(Value) -> Result<Value,String>` callback crossing the FFI boundary is a separate, bounded piece of work) |
 | Pubkey-pinned trust | 🏗️ | — | `Trust::Pinned` exists in the core crate, not yet surfaced through FFI |
 
 `unsafe_code = "forbid"` at the crate level — the only unsafe in this
@@ -134,18 +134,37 @@ cargo test --test live_station -- --ignored --nocapture
 
 ## Status
 
-**Live-verified, 2026-08-28:** handshake, CALL/RESULT/ERROR, PUBLISH/
+**Live-verified, 2026-08-28 — full parity, both directions:** handshake,
+CALL/RESULT/ERROR as both caller (`Session::call`) and provider
+(`Session::serve_one_call`, BOLT#4 error mapping — `unknown_next_peer`
+on a lookup miss, `temporary_relay_failure` on a handler panic (caught
+via `tokio::spawn`, one task per call, the same shape
+`macula_station_link.erl`'s one-process-per-call already uses),
+`unknown_error` with detail on a handler-returned error, all ported
+field-for-field from that module's `handle_inbound_call/2`), PUBLISH/
 SUBSCRIBE/EVENT (a subscriber does receive its own publish), content
 transfer, and streaming RPC in both the caller and provider roles — all
 against `station-de-frankfurt.macula.io`, the real fleet, not a local
-mock. Three real protocol bugs were caught by differential-vector tests
+mock. Two independent connections to the same station (one advertising
+and serving, the other calling in) is the pattern behind every
+provider-role test — see `tests/live_station.rs`'s
+`unary_call_provider_round_trip_against_the_real_fleet` for the unary
+case. Three real protocol bugs were caught by differential-vector tests
 before ever touching production.
 
+Unary-RPC provider dispatch was the one gap left after the streaming
+and content-transfer provider roles landed — a service built on this
+crate could call RPCs and serve streams, but couldn't serve a
+request/response procedure at all. It's now built here and in
+[`macula-go-sdk`](https://github.com/macula-io/macula-go-sdk) in the
+same pass, so both SDKs serve RPCs, not just call them.
+
 **Not yet built:**
-- Unary-RPC provider dispatch (accepting an inbound CALL and replying —
-  only streaming's provider side needed this so far)
 - Pubkey-pinned trust surfaced through the FFI layer (`Trust::Pinned`
   exists in the core crate)
+- `serve_one_call` surfaced through the FFI layer — passing a
+  Kotlin/Swift callback across the UniFFI boundary as a `CallHandler`
+  is a separate, bounded piece of work from the core-crate change
 
 See [`plans/PLAN_WIRE_PROTOCOL.md`](plans/PLAN_WIRE_PROTOCOL.md) for the
 full wire-format spec this crate is built against, section by section,

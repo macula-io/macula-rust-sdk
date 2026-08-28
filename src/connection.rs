@@ -10,12 +10,29 @@
 //! (§13), which both run on dedicated streams rather than the control
 //! stream.
 
+use std::sync::Arc;
 use std::time::Duration;
 
+use crate::bolt4;
 use crate::cbor::Value;
 use crate::frame::{self, Decoded, HelloInfo};
 use crate::identity::KeyPair;
 use crate::transport::{self, ConnectError, Trust};
+
+/// A boxed, `'static` future — hand-rolled rather than pulling in the
+/// `futures` crate for one type alias.
+pub type BoxFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
+
+/// Answers one inbound CALL. `Ok(payload)` sends a RESULT; `Err(reason)`
+/// sends an ERROR (BOLT#4 `unknown_error`, `detail = reason`); a panic
+/// inside the handler (caught via [`tokio::spawn`], the same "one
+/// transient task per call" shape `macula_station_link.erl` uses one
+/// process per call for) is sent as ERROR `temporary_relay_failure` —
+/// matching that module's own `safe_invoke_handler/4` mapping exactly
+/// (including sending no `detail` on a crash, since the reference
+/// doesn't either — it only logs locally).
+pub type CallHandler =
+    Arc<dyn Fn(Value) -> BoxFuture<'static, Result<Value, String>> + Send + Sync>;
 
 /// Matches `HANDSHAKE_TIMEOUT_MS` in `macula_peering_conn.erl`: CONNECT
 /// -> HELLO is sub-second on a healthy peer; this is generous. The most
@@ -519,6 +536,78 @@ impl Session {
         frame::parse_event(&value).map_err(RecvEventError::Parse)
     }
 
+    /// The provider role's counterpart to [`call`](Self::call): block
+    /// for the next inbound CALL frame on the control stream, bounded
+    /// by `timeout`, look it up via `lookup`, invoke the matching
+    /// handler, and send the resulting RESULT or ERROR back over this
+    /// same connection — see `plans/PLAN_WIRE_PROTOCOL.md` §6.9's
+    /// routing description and `macula_station_link.erl`'s
+    /// `handle_inbound_call/2`, which this mirrors field for field,
+    /// including its BOLT#4 error-code mapping.
+    ///
+    /// Any non-CALL frame that arrives first (e.g. a stray EVENT from
+    /// an active [`subscribe`](Self::subscribe), or a RESULT/ERROR for
+    /// some other in-flight [`call`](Self::call)) is discarded, not
+    /// queued — the same "control stream, one thing at a time"
+    /// limitation [`call`](Self::call)'s own doc already carries. A
+    /// session that needs to serve CALLs and also act as a
+    /// caller/subscriber concurrently should use a second `Session`,
+    /// exactly like this crate's own streaming-provider live test does.
+    ///
+    /// A caller wanting a long-lived server loops on this:
+    ///
+    /// ```no_run
+    /// # use std::time::Duration;
+    /// # async fn example(session: &mut macula_rust_sdk::connection::Session, identity: &macula_rust_sdk::identity::KeyPair, lookup: impl Fn(&[u8; 32], &str) -> Option<macula_rust_sdk::connection::CallHandler>) {
+    /// loop {
+    ///     if let Err(e) = session.serve_one_call(&lookup, identity, Duration::from_secs(30)).await {
+    ///         // ServeCallError::Timeout just means nothing arrived -- keep looping.
+    ///         eprintln!("{e}");
+    ///     }
+    /// }
+    /// # }
+    /// ```
+    pub async fn serve_one_call<L>(
+        &mut self,
+        lookup: L,
+        identity: &KeyPair,
+        timeout: Duration,
+    ) -> Result<(), ServeCallError>
+    where
+        L: Fn(&[u8; 32], &str) -> Option<CallHandler>,
+    {
+        tokio::time::timeout(timeout, self.serve_one_call_inner(lookup, identity))
+            .await
+            .unwrap_or(Err(ServeCallError::Timeout))
+    }
+
+    async fn serve_one_call_inner<L>(
+        &mut self,
+        lookup: L,
+        identity: &KeyPair,
+    ) -> Result<(), ServeCallError>
+    where
+        L: Fn(&[u8; 32], &str) -> Option<CallHandler>,
+    {
+        loop {
+            let value = self
+                .control
+                .recv_frame()
+                .await
+                .map_err(ServeCallError::Recv)?;
+            let Ok(call_info) = frame::parse_call(&value) else {
+                continue; // not ours -- see this method's doc on the limitation
+            };
+            let reply = build_call_reply(call_info, &lookup, identity.node_id()).await;
+            let signed = frame::sign(reply, identity);
+            self.control
+                .send_frame(signed)
+                .await
+                .map_err(ServeCallError::Send)?;
+            return Ok(());
+        }
+    }
+
     /// Close the control stream and connection gracefully with a GOODBYE
     /// frame, matching `macula_peering_conn.erl`'s `connected -> draining`
     /// transition (minus the drain-timeout bookkeeping, since this crate
@@ -549,3 +638,62 @@ impl std::fmt::Display for RecvEventError {
 }
 
 impl std::error::Error for RecvEventError {}
+
+#[derive(Debug)]
+pub enum ServeCallError {
+    Recv(RecvFrameError),
+    Send(SendFrameError),
+    /// No inbound CALL arrived within the requested timeout.
+    Timeout,
+}
+
+impl std::fmt::Display for ServeCallError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ServeCallError::Recv(e) => write!(f, "{e}"),
+            ServeCallError::Send(e) => write!(f, "sending the reply: {e}"),
+            ServeCallError::Timeout => write!(f, "timed out waiting for an inbound CALL"),
+        }
+    }
+}
+
+impl std::error::Error for ServeCallError {}
+
+/// Build the RESULT/ERROR reply for one inbound CALL — mirrors
+/// `macula_station_link.erl`'s `handle_inbound_call/2` +
+/// `safe_invoke_handler/4` exactly: a lookup miss is
+/// `unknown_next_peer`; the handler running to completion produces a
+/// RESULT (`Ok`) or `unknown_error` with `detail` (`Err`); a handler
+/// panic — caught via `tokio::spawn`, the same "one transient task per
+/// call" shape the reference's own "one process per call" uses — is
+/// `temporary_relay_failure`, with no `detail`, matching the reference
+/// not sending one on a crash either.
+async fn build_call_reply<L>(call_info: frame::CallInfo, lookup: &L, self_pub: [u8; 32]) -> Value
+where
+    L: Fn(&[u8; 32], &str) -> Option<CallHandler>,
+{
+    let Some(handler) = lookup(&call_info.realm, &call_info.procedure) else {
+        return frame::call_error(&frame::CallErrorSpec::new(
+            call_info.call_id,
+            bolt4::Code::UnknownNextPeer,
+            self_pub,
+        ));
+    };
+
+    let payload = call_info.payload;
+    let outcome = tokio::spawn(async move { handler(payload).await }).await;
+    match outcome {
+        Ok(Ok(value)) => frame::result(&frame::ResultSpec::new(call_info.call_id, value, self_pub)),
+        Ok(Err(reason)) => {
+            let mut spec =
+                frame::CallErrorSpec::new(call_info.call_id, bolt4::Code::UnknownError, self_pub);
+            spec.detail = Some(reason);
+            frame::call_error(&spec)
+        }
+        Err(_join_error) => frame::call_error(&frame::CallErrorSpec::new(
+            call_info.call_id,
+            bolt4::Code::TemporaryRelayFailure,
+            self_pub,
+        )),
+    }
+}

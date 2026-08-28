@@ -22,6 +22,7 @@
 //! the DNS-repoint gotcha already on file in project memory
 //! (`reference_demo_fleet_boxes`), confirmed still true today.
 
+use macula_rust_sdk::cbor::Value;
 use macula_rust_sdk::cert::ed25519_pubkey_from_cert;
 use macula_rust_sdk::connection;
 use macula_rust_sdk::identity::KeyPair;
@@ -593,5 +594,220 @@ async fn streaming_provider_round_trip_against_the_real_fleet() {
         .await;
     caller_session
         .close("normal", Some("caller test done"), &caller_identity)
+        .await;
+}
+
+/// The unary-RPC counterpart to `streaming_provider_round_trip_against_the_real_fleet`
+/// above, and the gap this crate's own README used to list as "not yet
+/// built": two independent connections to the SAME live station, one
+/// advertising a procedure and serving inbound CALLs for it via
+/// [`connection::Session::serve_one_call`], the other dialing in and
+/// calling it — the caller role already covered by
+/// `call_round_trip_against_the_real_fleet`. Without this, a service
+/// built on this crate could call RPCs and serve streams, but could
+/// never serve a request/response procedure at all.
+#[tokio::test]
+#[ignore = "requires network access to a live macula-station"]
+async fn unary_call_provider_round_trip_against_the_real_fleet() {
+    let provider_identity = KeyPair::generate_with_default_puzzle();
+    let caller_identity = KeyPair::generate_with_default_puzzle();
+
+    let mut provider_session = connection::connect(
+        STATION_HOST,
+        STATION_PORT,
+        Trust::WebPki,
+        &provider_identity,
+    )
+    .await
+    .expect("provider handshake should succeed");
+    let mut caller_session =
+        connection::connect(STATION_HOST, STATION_PORT, Trust::WebPki, &caller_identity)
+            .await
+            .expect("caller handshake should succeed");
+
+    let realm: [u8; 32] = rand::random();
+    let procedure = format!(
+        "macula_rust_sdk.test_add.{}",
+        hex::encode(rand::random::<[u8; 8]>())
+    );
+
+    let advertise_spec = macula_rust_sdk::frame::AdvertiseSpec::new(
+        realm,
+        procedure.clone(),
+        provider_identity.node_id(),
+    );
+    provider_session
+        .advertise(&advertise_spec, &provider_identity)
+        .await
+        .expect("advertise should send");
+
+    // Give the station a moment to register the advertisement before
+    // the caller dials in against it.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    let target_procedure = procedure.clone();
+    let lookup = move |_realm: &[u8; 32], proc: &str| -> Option<connection::CallHandler> {
+        if proc != target_procedure {
+            return None;
+        }
+        let handler: connection::CallHandler = std::sync::Arc::new(|payload: Value| {
+            Box::pin(async move {
+                let a = match payload.get("a") {
+                    Some(Value::Int(n)) => *n,
+                    _ => return Err("missing or non-integer field \"a\"".to_string()),
+                };
+                let b = match payload.get("b") {
+                    Some(Value::Int(n)) => *n,
+                    _ => return Err("missing or non-integer field \"b\"".to_string()),
+                };
+                Ok(Value::Int(a + b))
+            }) as connection::BoxFuture<'static, Result<Value, String>>
+        });
+        Some(handler)
+    };
+
+    let serve_task = tokio::spawn(async move {
+        let result = provider_session
+            .serve_one_call(
+                lookup,
+                &provider_identity,
+                std::time::Duration::from_secs(15),
+            )
+            .await;
+        (result, provider_session, provider_identity)
+    });
+
+    let payload = Value::Map(vec![
+        (Value::text("a"), Value::Int(3)),
+        (Value::text("b"), Value::Int(4)),
+    ]);
+    let response = caller_session
+        .call(
+            &procedure,
+            realm,
+            payload,
+            (now_ms() + 10_000) as i128,
+            &caller_identity,
+            std::time::Duration::from_secs(10),
+        )
+        .await
+        .expect("call should succeed");
+
+    let (serve_result, provider_session, provider_identity) =
+        serve_task.await.expect("serve task should not panic");
+    serve_result.expect("provider should serve the inbound CALL");
+
+    match response {
+        macula_rust_sdk::frame::CallResponse::Result { payload, .. } => {
+            assert_eq!(payload, Value::Int(7), "3 + 4 should reply with RESULT 7");
+        }
+        other => panic!("expected a RESULT, got {other:?}"),
+    }
+    println!(
+        "OBSERVED: provider served the inbound CALL for procedure={procedure}, caller got RESULT 7"
+    );
+
+    provider_session
+        .close(
+            "normal",
+            Some("unary provider test done"),
+            &provider_identity,
+        )
+        .await;
+    caller_session
+        .close("normal", Some("unary caller test done"), &caller_identity)
+        .await;
+}
+
+/// Confirms the BOLT#4 error path: a provider that's advertised but
+/// whose lookup (deliberately, here) can't find a handler replies with
+/// the exact same `unknown_next_peer` code the reference sends for this
+/// race (`macula_station_link.erl`'s `handle_inbound_call/2`, "unknown
+/// (realm, procedure)" branch).
+#[tokio::test]
+#[ignore = "requires network access to a live macula-station"]
+async fn unary_call_provider_reports_unknown_next_peer_on_lookup_miss_against_the_real_fleet() {
+    let provider_identity = KeyPair::generate_with_default_puzzle();
+    let caller_identity = KeyPair::generate_with_default_puzzle();
+
+    let mut provider_session = connection::connect(
+        STATION_HOST,
+        STATION_PORT,
+        Trust::WebPki,
+        &provider_identity,
+    )
+    .await
+    .expect("provider handshake should succeed");
+    let mut caller_session =
+        connection::connect(STATION_HOST, STATION_PORT, Trust::WebPki, &caller_identity)
+            .await
+            .expect("caller handshake should succeed");
+
+    let realm: [u8; 32] = rand::random();
+    let procedure = format!(
+        "macula_rust_sdk.test_miss.{}",
+        hex::encode(rand::random::<[u8; 8]>())
+    );
+
+    let advertise_spec = macula_rust_sdk::frame::AdvertiseSpec::new(
+        realm,
+        procedure.clone(),
+        provider_identity.node_id(),
+    );
+    provider_session
+        .advertise(&advertise_spec, &provider_identity)
+        .await
+        .expect("advertise should send");
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    let no_handlers = |_realm: &[u8; 32], _proc: &str| -> Option<connection::CallHandler> { None };
+    let serve_task = tokio::spawn(async move {
+        let result = provider_session
+            .serve_one_call(
+                no_handlers,
+                &provider_identity,
+                std::time::Duration::from_secs(15),
+            )
+            .await;
+        (result, provider_session, provider_identity)
+    });
+
+    let response = caller_session
+        .call(
+            &procedure,
+            realm,
+            Value::Null,
+            (now_ms() + 10_000) as i128,
+            &caller_identity,
+            std::time::Duration::from_secs(10),
+        )
+        .await
+        .expect("call should succeed");
+
+    let (serve_result, provider_session, provider_identity) =
+        serve_task.await.expect("serve task should not panic");
+    serve_result.expect("provider should serve the inbound CALL (with an error reply)");
+
+    match response {
+        macula_rust_sdk::frame::CallResponse::Error { code, name, .. } => {
+            assert_eq!(code, macula_rust_sdk::bolt4::Code::UnknownNextPeer.as_u8());
+            println!("OBSERVED: lookup miss correctly reported as ERROR code={code} name={name}");
+        }
+        other => panic!("expected an ERROR, got {other:?}"),
+    }
+
+    provider_session
+        .close(
+            "normal",
+            Some("unary provider miss test done"),
+            &provider_identity,
+        )
+        .await;
+    caller_session
+        .close(
+            "normal",
+            Some("unary caller miss test done"),
+            &caller_identity,
+        )
         .await;
 }
