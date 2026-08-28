@@ -8,13 +8,14 @@
 //! keeps `macula-rust-sdk` itself just as usable from plain Rust, a CLI,
 //! or WASM as it was before this crate existed.
 //!
-//! Identity generation, CONNECT/HELLO, CALL/RESULT/ERROR,
-//! PUBLISH/SUBSCRIBE/EVENT, content transfer, and streaming RPC (caller
-//! role) are all wrapped — every application primitive the core crate
-//! has, matching `plans/PLAN_WIRE_PROTOCOL.md`'s v1 scope. Not exposed:
-//! the streaming/RPC-advertise *provider* role (§13.2/§6.9 — the core
-//! crate doesn't implement that role either yet) and pubkey-pinned trust
-//! (`connect` always uses WebPki).
+//! Every application primitive the core crate has is wrapped: identity,
+//! CONNECT/HELLO, CALL/RESULT/ERROR, PUBLISH/SUBSCRIBE/EVENT, content
+//! transfer, and streaming RPC — both the caller/consumer role (§13.1)
+//! and the provider role (§13.2/§6.9, `advertise`/`accept_stream`). Not
+//! exposed: unary-RPC provider dispatch (accepting an inbound CALL and
+//! replying — the core crate doesn't implement that role either yet,
+//! only streaming's provider side) and pubkey-pinned trust (`connect`
+//! always uses WebPki).
 //!
 //! [`FfiValue`] covers `Null`/`Int`/`Bytes`/`Text`/`Float` — the
 //! variants [`macula_rust_sdk::cbor::Value`] itself has, MINUS
@@ -224,6 +225,16 @@ impl From<FfiStreamMode> for macula_rust_sdk::frame::StreamMode {
     }
 }
 
+impl From<macula_rust_sdk::frame::StreamMode> for FfiStreamMode {
+    fn from(m: macula_rust_sdk::frame::StreamMode) -> Self {
+        match m {
+            macula_rust_sdk::frame::StreamMode::ServerStream => FfiStreamMode::ServerStream,
+            macula_rust_sdk::frame::StreamMode::ClientStream => FfiStreamMode::ClientStream,
+            macula_rust_sdk::frame::StreamMode::Bidi => FfiStreamMode::Bidi,
+        }
+    }
+}
+
 /// `encoding` on a stream chunk — mirrors
 /// [`macula_rust_sdk::frame::StreamEncoding`]. A semantic hint, not a
 /// second wire codec — see that type's own doc.
@@ -269,6 +280,44 @@ pub enum FfiStreamItem {
 pub struct FfiStreamReply {
     pub payload: FfiValue,
     pub responded_by: Vec<u8>,
+}
+
+/// Provider role: the fields of an inbound STREAM_OPEN needed to decide
+/// how to handle it (which procedure, whose call, what arguments) —
+/// mirrors [`macula_rust_sdk::frame::StreamOpenInfo`].
+#[derive(uniffi::Record, Debug, Clone)]
+pub struct FfiStreamOpenInfo {
+    pub stream_id: Vec<u8>,
+    pub procedure: String,
+    pub realm: Vec<u8>,
+    pub mode: FfiStreamMode,
+    pub args: FfiValue,
+    pub deadline_ms: i64,
+    pub caller: Vec<u8>,
+}
+
+impl TryFrom<macula_rust_sdk::frame::StreamOpenInfo> for FfiStreamOpenInfo {
+    type Error = FfiError;
+
+    fn try_from(o: macula_rust_sdk::frame::StreamOpenInfo) -> Result<Self, FfiError> {
+        Ok(FfiStreamOpenInfo {
+            stream_id: o.stream_id.to_vec(),
+            procedure: o.procedure,
+            realm: o.realm.to_vec(),
+            mode: o.mode.into(),
+            args: FfiValue::try_from(o.args)?,
+            deadline_ms: o.deadline_ms as i64,
+            caller: o.caller.to_vec(),
+        })
+    }
+}
+
+/// What [`FfiSession::accept_stream`] hands back: a ready-to-use
+/// [`FfiStream`] plus the STREAM_OPEN info that came with it.
+#[derive(uniffi::Record)]
+pub struct FfiAcceptedStream {
+    pub stream: std::sync::Arc<FfiStream>,
+    pub info: FfiStreamOpenInfo,
 }
 
 /// An Ed25519 identity, puzzle-hardened by construction — see
@@ -429,6 +478,77 @@ impl FfiSession {
             .map_err(|e| FfiError::Send {
                 reason: e.to_string(),
             })
+    }
+
+    /// Send a signed ADVERTISE (§6.9) — registers this session as the
+    /// handler for `procedure` under `realm`. Fire-and-forget; the
+    /// station then routes inbound STREAM_OPENs for it back to us as a
+    /// fresh dedicated stream — see
+    /// [`accept_stream`](Self::accept_stream).
+    pub async fn advertise(
+        &self,
+        procedure: String,
+        realm: Vec<u8>,
+        identity: &FfiKeyPair,
+    ) -> Result<(), FfiError> {
+        let realm = to_32(realm)?;
+        let spec =
+            macula_rust_sdk::frame::AdvertiseSpec::new(realm, procedure, identity.0.node_id());
+        let mut guard = self.0.lock().await;
+        let session = guard.as_mut().ok_or(FfiError::Closed)?;
+        session
+            .advertise(&spec, &identity.0)
+            .await
+            .map_err(|e| FfiError::Send {
+                reason: e.to_string(),
+            })
+    }
+
+    /// Send a signed UNADVERTISE. Fire-and-forget.
+    pub async fn unadvertise(
+        &self,
+        procedure: String,
+        realm: Vec<u8>,
+        identity: &FfiKeyPair,
+    ) -> Result<(), FfiError> {
+        let realm = to_32(realm)?;
+        let spec =
+            macula_rust_sdk::frame::UnadvertiseSpec::new(realm, procedure, identity.0.node_id());
+        let mut guard = self.0.lock().await;
+        let session = guard.as_mut().ok_or(FfiError::Closed)?;
+        session
+            .unadvertise(&spec, &identity.0)
+            .await
+            .map_err(|e| FfiError::Send {
+                reason: e.to_string(),
+            })
+    }
+
+    /// Provider role: block for the next inbound STREAM_OPEN, bounded by
+    /// `timeout_ms`. Only ever succeeds after
+    /// [`advertise`](Self::advertise) has registered at least one
+    /// procedure — otherwise the station has nothing to route here.
+    ///
+    /// Holds this session's lock for as long as it waits: no other
+    /// method on this `FfiSession` can run concurrently while a call to
+    /// `accept_stream` is in flight, matching the core crate's own
+    /// `Session` (its control stream is single-owner by construction —
+    /// this isn't an extra restriction the FFI layer adds).
+    pub async fn accept_stream(&self, timeout_ms: u64) -> Result<FfiAcceptedStream, FfiError> {
+        let mut guard = self.0.lock().await;
+        let session = guard.as_mut().ok_or(FfiError::Closed)?;
+        let (handle, info) = macula_rust_sdk::stream::StreamHandle::accept(
+            session,
+            std::time::Duration::from_millis(timeout_ms),
+        )
+        .await
+        .map_err(|e| FfiError::Recv {
+            reason: e.to_string(),
+        })?;
+        Ok(FfiAcceptedStream {
+            stream: std::sync::Arc::new(FfiStream(tokio::sync::Mutex::new(Some(handle)))),
+            info: FfiStreamOpenInfo::try_from(info)?,
+        })
     }
 
     /// Block for the next EVENT delivery, bounded by `timeout_ms`. Any
@@ -607,6 +727,24 @@ impl FfiStream {
             payload: FfiValue::try_from(payload)?,
             responded_by: responded_by.to_vec(),
         })
+    }
+
+    /// Provider role: send the terminal STREAM_REPLY a `client_stream`/
+    /// `bidi` caller's own `await_reply` is waiting on, once this side
+    /// has fully consumed and verified whatever the caller streamed.
+    pub async fn send_reply(
+        &self,
+        payload: FfiValue,
+        identity: &FfiKeyPair,
+    ) -> Result<(), FfiError> {
+        let mut guard = self.0.lock().await;
+        let handle = guard.as_mut().ok_or(FfiError::Closed)?;
+        handle
+            .send_reply(payload.into(), &identity.0)
+            .await
+            .map_err(|e| FfiError::Send {
+                reason: e.to_string(),
+            })
     }
 
     /// Non-normal termination: send an explicit STREAM_ERROR abort,
