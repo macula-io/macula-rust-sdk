@@ -480,12 +480,20 @@ publisher*, independent of which station relayed it.
 generalize to every delivery path (`plumtree`/`dht` weren't exercised),
 but confirms the direct case works end-to-end, wire format included.
 
-### 6.9 RPC advertise (`advertise`, `unadvertise`)
+### 6.9 RPC advertise (`advertise`, `unadvertise`) — frame types BUILT 2026-08-28
 A peer registers itself as the handler for `procedure` under `realm` on
 its own connection; the station routes inbound CALLs for that procedure
 back over that connection. Tombstoned on UNADVERTISE or disconnect.
 Needed if a mobile client wants to *expose* an RPC procedure, not just
-call one.
+call one. Frame construction (`src/frame.rs`'s `AdvertiseSpec`/
+`UnadvertiseSpec`) is built and byte-verified; `Session::advertise`/
+`unadvertise` (`src/connection.rs`) send them. Consumed today by the
+streaming provider role (§13.2, live-verified) — unary CALL routing to
+an advertised procedure (accepting an inbound CALL on the control stream
+and replying with RESULT/ERROR, mirroring
+`macula_station_link.erl`'s `handle_inbound_call`) is not built yet;
+nothing in this crate has needed to serve unary RPC so far, only
+streams.
 
 ### 6.10 Streaming RPC (`stream_open`, `stream_data`, `stream_end`,
 `stream_error`, `stream_reply`)
@@ -871,16 +879,44 @@ Pattern, from `macula_stream_sink.erl`:
    Worth replicating exactly: the distinction is the only signal the
    peer gets.
 
-### 13.2 Provider (server) role — lower priority for a first port
+### 13.2 Provider (server) role — BUILT + LIVE-VERIFIED 2026-08-28
 
-Pattern, from `macula_streamer.erl`, only worth building once a consumer
-of this crate wants to *expose* a streaming procedure to the mesh (e.g. a
-live sensor feed), not just call one: `advertise_stream/5` registers a
-handler invoked per inbound `stream_open`; the module drives `recv/2` on
-the provider's own stream for `client_stream`-mode procedures (mirroring
-§13.1's loop, just on the other end) and exposes `send/2,3`/`close/1` for
-`server_stream`-mode ones to push with. Same non-normal-termination →
-explicit abort rule as §13.1, symmetric.
+Pattern, from `macula_streamer.erl` and `macula_station_link.erl`
+(`handle_inbound_stream_open`, `dispatch_dedicated_frame`,
+`macula_peering_conn.erl`'s inbound-`new_dedicated_stream` handoff):
+`advertise_stream/5` registers a handler invoked per inbound
+`stream_open`; the module drives `recv/2` on the provider's own stream
+for `client_stream`-mode procedures (mirroring §13.1's loop, just on the
+other end) and exposes `send/2,3`/`close/1` for `server_stream`-mode
+ones to push with. Same non-normal-termination → explicit abort rule as
+§13.1, symmetric. **Wire mechanics, confirmed from source before any
+Rust was written:** an inbound `stream_open` for an advertised procedure
+arrives as the first frame on a *fresh dedicated QUIC stream the station
+opens toward the advertiser* — the advertiser has no other notice it's
+coming; ADVERTISE itself (§6.9) flows on the shared control stream and
+is the SAME wire frame whether registering for unary CALL routing or
+streaming.
+
+**Rust port (`src/frame.rs`'s `parse_stream_open`, `src/connection.rs`'s
+`Session::advertise`/`accept_dedicated_stream`, `src/stream.rs`'s
+`StreamHandle::accept`/`send_reply`) built and live-verified same day**
+against `station-de-frankfurt.macula.io`: two independent connections,
+one advertises and accepts an inbound stream, the other dials in and
+pushes/pulls data — the station really does open a fresh dedicated
+stream toward the advertiser and route the caller's `stream_open` onto
+it, exactly as the Erlang source says. First time this crate has been on
+the *receiving* end of a mesh interaction it didn't initiate.
+
+The Erlang reference's own inbound-stream handoff has a documented race
+(`macula_peering_conn.erl`'s "notify before enabling active mode" — a
+fast/local peer's first bytes can arrive before the owning Erlang process
+even knows the stream exists, because the `quicer` NIF's stream
+resources start passive). **Confirmed this doesn't apply to the Rust
+port:** `quinn`/QUIC buffers inbound stream data at the transport layer
+regardless of when the application calls `accept_bi()`/starts reading,
+so there's no analogous "arm before read" step needed here — the race is
+specific to macula-station's own NIF architecture, not a general QUIC
+property.
 
 ### 13.3 Wire-level notes that apply to both roles
 
