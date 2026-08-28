@@ -17,12 +17,13 @@
 //! `advertise`/`accept_stream`). Not exposed: `Trust::Insecure` —
 //! deliberately, see [`FfiTrust`]'s own doc.
 //!
-//! [`FfiValue`] covers `Null`/`Int`/`Bytes`/`Text`/`Float` — the
-//! variants [`macula_rust_sdk::cbor::Value`] itself has, MINUS
-//! `List`/`Map` (recursive UniFFI enums; deferred, not a wire
-//! limitation) and with `Int` narrowed from `i128` to `i64` (UniFFI has
-//! no 128-bit integer type; out-of-range values round-trip as an
-//! [`FfiError::UnrepresentableValue`] rather than silently truncating).
+//! [`FfiValue`] mirrors every variant [`macula_rust_sdk::cbor::Value`]
+//! has, including recursive list/map shapes (`Items`/`Fields`, via
+//! `Vec` — see the type's own doc for why they aren't named `List`/
+//! `Map` like the core type), narrowed only where the FFI boundary
+//! forces it: `Int` is `i64` not `i128` (out-of-range values round-trip
+//! as an [`FfiError::UnrepresentableValue`] rather than silently
+//! truncating).
 //!
 //! Generate the bindings with the `uniffi-bindgen` binary this crate
 //! also builds, e.g.:
@@ -87,15 +88,55 @@ fn to_mcid(bytes: Vec<u8>) -> Result<macula_rust_sdk::manifest::Mcid, FfiError> 
     })
 }
 
-/// A restricted mirror of [`macula_rust_sdk::cbor::Value`] — see this
-/// crate's module doc for exactly what's missing and why.
-#[derive(uniffi::Enum, Debug, Clone)]
+/// A mirror of [`macula_rust_sdk::cbor::Value`], narrowed only where the
+/// FFI boundary itself forces it: `Int` is `i64` not `i128` (UniFFI has
+/// no 128-bit integer type; an out-of-range value returns
+/// [`FfiError::UnrepresentableValue`] rather than silently truncating —
+/// see [`FfiValue::try_from`]). `Items`/`Fields` recurse through `Vec`,
+/// which UniFFI 0.32 generates correctly — confirmed for Kotlin, both
+/// by this crate's own round-trip tests and by a real
+/// `compileDebugKotlin` run against the generated bindings in
+/// `macula-apps/macula-cam2me`; NOT yet exercised against the Swift
+/// bindings (no macOS/Xcode available where this was written) — the
+/// recursion itself was never the obstacle, only finding time to wire
+/// it up.
+///
+/// Named `Items`/`Fields` rather than mirroring [`cbor::Value`]'s own
+/// `List`/`Map` exactly: UniFFI's Kotlin codegen emits an unqualified
+/// `List<T>`/`Map<T>` field type for a `Vec`/dictionary-shaped variant,
+/// and inside `FfiValue`'s own sealed class body that unqualified name
+/// resolves to the SIBLING variant class of the same name, not
+/// `kotlin.collections.List` — confirmed by compiling the generated
+/// bindings (`No type arguments expected for data class List :
+/// FfiValue`) before this rename. `Array`/`Dictionary` would trade that
+/// collision for the identical one against Swift's own stdlib types
+/// (unconfirmed either way — Swift's bindings haven't been compiled
+/// against this change yet), so neither language's collection type
+/// names are reused here.
+///
+/// [`Fields`](FfiValue::Fields) uses [`FfiMapEntry`] rather than
+/// `HashMap<String, FfiValue>`: [`cbor::Value::Map`]'s own keys are
+/// arbitrary values, not just text (Part 6 §9's integer-keyed sub-maps
+/// are real, not hypothetical — mpong's per-wall game state is one), and
+/// UniFFI's dictionary type requires a hashable, non-recursive key.
+#[derive(uniffi::Enum, Debug, Clone, PartialEq)]
 pub enum FfiValue {
     Null,
     Int(i64),
     Bytes(Vec<u8>),
     Text(String),
     Float(f64),
+    Items(Vec<FfiValue>),
+    Fields(Vec<FfiMapEntry>),
+}
+
+/// One key/value pair of an [`FfiValue::Fields`], in insertion order —
+/// mirrors [`cbor::Value::Map`]'s own `Vec<(Value, Value)>` exactly,
+/// including that canonical key sort happens at encode time, not here.
+#[derive(uniffi::Record, Debug, Clone, PartialEq)]
+pub struct FfiMapEntry {
+    pub key: FfiValue,
+    pub value: FfiValue,
 }
 
 impl From<FfiValue> for macula_rust_sdk::cbor::Value {
@@ -107,6 +148,13 @@ impl From<FfiValue> for macula_rust_sdk::cbor::Value {
             FfiValue::Bytes(b) => Value::Bytes(b),
             FfiValue::Text(t) => Value::Text(t),
             FfiValue::Float(f) => Value::Float(f),
+            FfiValue::Items(items) => Value::List(items.into_iter().map(Into::into).collect()),
+            FfiValue::Fields(entries) => Value::Map(
+                entries
+                    .into_iter()
+                    .map(|e| (e.key.into(), e.value.into()))
+                    .collect(),
+            ),
         }
     }
 }
@@ -128,12 +176,21 @@ impl TryFrom<macula_rust_sdk::cbor::Value> for FfiValue {
             Value::Bytes(b) => Ok(FfiValue::Bytes(b)),
             Value::Text(t) => Ok(FfiValue::Text(t)),
             Value::Float(f) => Ok(FfiValue::Float(f)),
-            Value::List(_) => Err(FfiError::UnrepresentableValue {
-                reason: "list values are not yet supported across the FFI boundary".to_string(),
-            }),
-            Value::Map(_) => Err(FfiError::UnrepresentableValue {
-                reason: "map values are not yet supported across the FFI boundary".to_string(),
-            }),
+            Value::List(items) => items
+                .into_iter()
+                .map(FfiValue::try_from)
+                .collect::<Result<Vec<_>, _>>()
+                .map(FfiValue::Items),
+            Value::Map(pairs) => pairs
+                .into_iter()
+                .map(|(k, val)| {
+                    Ok(FfiMapEntry {
+                        key: FfiValue::try_from(k)?,
+                        value: FfiValue::try_from(val)?,
+                    })
+                })
+                .collect::<Result<Vec<_>, FfiError>>()
+                .map(FfiValue::Fields),
         }
     }
 }
@@ -913,5 +970,95 @@ impl FfiStream {
         if let Some(handle) = guard.take() {
             handle.abort(code, message, &identity.0).await;
         }
+    }
+}
+
+#[cfg(test)]
+mod ffi_value_tests {
+    use super::{FfiError, FfiMapEntry, FfiValue};
+    use macula_rust_sdk::cbor::Value;
+
+    fn round_trip(v: FfiValue) -> Result<FfiValue, FfiError> {
+        let core: Value = v.into();
+        FfiValue::try_from(core)
+    }
+
+    #[test]
+    fn scalars_still_round_trip() {
+        for v in [
+            FfiValue::Null,
+            FfiValue::Int(-7),
+            FfiValue::Bytes(vec![1, 2, 3]),
+            FfiValue::Text("station".to_string()),
+            FfiValue::Float(1.5),
+        ] {
+            assert_eq!(round_trip(v.clone()).unwrap(), v);
+        }
+    }
+
+    #[test]
+    fn empty_list_and_map_round_trip() {
+        assert_eq!(round_trip(FfiValue::Items(vec![])).unwrap(), FfiValue::Items(vec![]));
+        assert_eq!(round_trip(FfiValue::Fields(vec![])).unwrap(), FfiValue::Fields(vec![]));
+    }
+
+    #[test]
+    fn flat_list_round_trips() {
+        let v = FfiValue::Items(vec![
+            FfiValue::Int(1),
+            FfiValue::Text("two".to_string()),
+            FfiValue::Null,
+        ]);
+        assert_eq!(round_trip(v.clone()).unwrap(), v);
+    }
+
+    #[test]
+    fn flat_map_round_trips() {
+        let v = FfiValue::Fields(vec![
+            FfiMapEntry { key: FfiValue::Text("city".to_string()), value: FfiValue::Text("Milan".to_string()) },
+            FfiMapEntry { key: FfiValue::Text("lat".to_string()), value: FfiValue::Float(45.4642) },
+        ]);
+        assert_eq!(round_trip(v.clone()).unwrap(), v);
+    }
+
+    /// The actual shape `hecate_stations.list_stations` returns:
+    /// `#{stations => [#{city => ..., lat => ..., ...}, ...]}` — a map
+    /// containing a list of maps. This is the case that motivated the
+    /// fix; a shallow test alone wouldn't have caught a bug in either
+    /// recursive call.
+    #[test]
+    fn map_containing_list_of_maps_round_trips() {
+        let station = |city: &str| {
+            FfiValue::Fields(vec![
+                FfiMapEntry { key: FfiValue::Text("city".to_string()), value: FfiValue::Text(city.to_string()) },
+                FfiMapEntry { key: FfiValue::Text("capabilities".to_string()), value: FfiValue::Int(0) },
+            ])
+        };
+        let v = FfiValue::Fields(vec![FfiMapEntry {
+            key: FfiValue::Text("stations".to_string()),
+            value: FfiValue::Items(vec![station("Milan"), station("Paris")]),
+        }]);
+        assert_eq!(round_trip(v.clone()).unwrap(), v);
+    }
+
+    /// A non-text map key must survive too — `Value::Map`'s keys are
+    /// arbitrary values, not just text (see `FfiValue::Fields`'s own doc).
+    #[test]
+    fn integer_keyed_map_round_trips() {
+        let v = FfiValue::Fields(vec![
+            FfiMapEntry { key: FfiValue::Int(0), value: FfiValue::Text("a".to_string()) },
+            FfiMapEntry { key: FfiValue::Int(1), value: FfiValue::Text("b".to_string()) },
+        ]);
+        assert_eq!(round_trip(v.clone()).unwrap(), v);
+    }
+
+    /// `i128` values outside `i64` range must still fail cleanly even
+    /// nested inside a list -- the recursive `?`/`map_err` chain must
+    /// propagate the error rather than swallowing or panicking.
+    #[test]
+    fn out_of_range_int_inside_list_errors_not_panics() {
+        let too_big = Value::List(vec![Value::Int(i128::MAX)]);
+        let err = FfiValue::try_from(too_big).unwrap_err();
+        assert!(matches!(err, FfiError::UnrepresentableValue { .. }));
     }
 }

@@ -1008,11 +1008,19 @@ on it") is enforced structurally by this separation, not just stated.
   same object serves either role, since a stream's wire vocabulary is
   symmetric regardless of which side opened it (mirrors `StreamHandle`
   exactly).
-- `FfiValue` — a **restricted** mirror of `cbor::Value`: `Null`/`Int`/
-  `Bytes`/`Text`/`Float`. Missing `List`/`Map` (need recursive UniFFI
-  enums — deferred, not a wire limitation) and `Int` is narrowed from
-  `i128` to `i64` (UniFFI has no 128-bit integer type; an out-of-range
-  value returns an explicit `FfiError::UnrepresentableValue` rather than
+- `FfiValue` (0.2.0) — a mirror of `cbor::Value`: `Null`/`Int`/`Bytes`/
+  `Text`/`Float`/`Items`/`Fields`, the last two recursing through `Vec`
+  for `cbor::Value`'s own `List`/`Map`. Named `Items`/`Fields` rather
+  than `List`/`Map`: UniFFI's Kotlin codegen emits an unqualified
+  `List<T>`/`Map<T>` field type for a `Vec`/dictionary-shaped variant,
+  which resolves to the sibling variant class of the same name inside
+  `FfiValue`'s own sealed class body, not `kotlin.collections.List` —
+  confirmed by compiling the generated bindings before the rename.
+  `Fields` uses a dedicated `FfiMapEntry{key, value}` record rather than
+  `HashMap<String, FfiValue>`, since `cbor::Value::Map`'s own keys are
+  arbitrary values, not just text. `Int` is narrowed from `i128` to
+  `i64` (UniFFI has no 128-bit integer type; an out-of-range value
+  returns an explicit `FfiError::UnrepresentableValue` rather than
   silently truncating).
 - `FfiCallResponse`, `FfiEvent`, `FfiStreamItem`, `FfiStreamReply`,
   `FfiStreamOpenInfo`, `FfiAcceptedStream` — mirror
