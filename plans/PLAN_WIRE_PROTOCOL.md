@@ -690,6 +690,30 @@ streaming RPC (§7), not the control stream.
 | `_content.put_manifest` | `#{manifest}` — the full manifest map (§4's crate-reuse table, chunking algorithm) | `ok` |
 | `_content.get_manifest` | `#{mcid}` | the manifest map \| `not_found` |
 
+**Implemented + live-verified 2026-08-28** (`src/manifest.rs`, `src/content.rs`,
+Rust crate `macula-rust-sdk`). Two things worth recording that weren't obvious
+from reading the Erlang alone:
+
+- **`name`'s wire representation depends on which computation you're in.**
+  `macula_manifest`'s canonical MCID hash input wraps `name` as CBOR *text*
+  (`compute_mcid`'s own narrow special case), but the manifest map as actually
+  sent in a `_content.put_manifest` call payload (`to_wire`) encodes `name` as
+  a raw *byte string* — its real `binary()` type. Confirmed by encoding a real
+  manifest through the general deterministic-CBOR codec and inspecting the
+  bytes, not inferred from the type spec (the CALL `procedure`/PUBLISH `topic`
+  lesson elsewhere in this doc was exactly this kind of inference trap).
+- **v1 client implementation is deliberately sequential, not multi-lane.** The
+  Rust crate opens exactly one dedicated stream per `put`/`get` call and runs
+  every `_content.*` call on it in order — no round-robin lanes. This is a
+  documented simplification, not a wire deviation: every call, the MCID
+  scheme, and the manifest format are identical either way, so a sequential
+  client interoperates fully with a station built to serve a parallel-lane
+  peer. Multi-lane parallelism is purely a throughput optimization, addable
+  later with zero wire change. Confirmed live: both a 4096-byte single-block
+  round trip and a ~536KB (3-chunk) round trip succeeded first try against
+  `station-de-frankfurt.macula.io`, including a `not_found` probe against a
+  made-up MCID.
+
 **MCID for a single block** is computed client-side before the call:
 `<<1, 0x55, blake3(bytes)>>` (`macula_content_transfer.erl:put_single_block/3`).
 **Always re-verify a fetched block's hash client-side against its MCID**,
