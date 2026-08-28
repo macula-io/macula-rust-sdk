@@ -18,13 +18,19 @@ why every section below is traced to specific files and line ranges in
 
 Source files read in full for this spec: `native/macula_quic/{Cargo.toml,
 src/cert.rs, src/config.rs}`, `native/macula_cbor_nif/src/deterministic.rs`,
-`src/peering/{macula_protocol_types.erl, macula_frame.erl,
-macula_peering_conn.erl, macula_bolt4.erl, macula_source_route.erl}`.
-Skimmed for scope only (not needed for a client, station/config-side):
-`macula_tls.erl`, `macula_peering.erl`, `macula_quic.erl`. Not yet read:
-`macula_record_cbor.erl` (the Erlang reference `deterministic.rs` is
-differentially tested against — corroborating source, not primary, since
-a Rust port transcribes the Rust file directly). Confirmed dead:
+`src/identity/macula_identity.erl`, `src/peering/{macula_protocol_types.erl,
+macula_frame.erl, macula_peering_conn.erl, macula_bolt4.erl,
+macula_source_route.erl}`, plus lines 890-964 of `src/client/macula_client.erl`
+(identity-resolution/puzzle-lifecycle context). Skimmed for scope only
+(not needed for a client, station/config-side): `macula_tls.erl`,
+`macula_peering.erl`, `macula_quic.erl`. Not yet read: the rest of
+`macula_client.erl` (1376 lines total — only the identity-resolution
+section was needed so far), `macula_record_cbor.erl` (the Erlang
+reference `deterministic.rs` is differentially tested against —
+corroborating source, not primary, since a Rust port transcribes the
+Rust file directly), `macula_crypto_nif`'s `grind_puzzle` implementation
+(not needed — the algorithm is fully specified from the Erlang side).
+Confirmed dead:
 `macula_protocol_types.erl`, `macula_protocol_encoder.erl`,
 `macula_protocol_decoder.erl` — an unreferenced legacy (V1, msgpack/byte-tag)
 scheme, superseded entirely by `macula_frame.erl` ("Macula V2"). Ignore all
@@ -260,10 +266,55 @@ another.
 | `station_id` | 32 bytes | for a plain peer/daemon dial, `send_connect/2` sets this equal to `node_id` |
 | `realms` | list of 32-byte pubkeys | realms this identity claims membership in |
 | `capabilities` | non-neg integer | bitmask, negotiated in HELLO |
-| `puzzle_evidence` | 32 bytes | anti-Sybil admission proof, from `macula_identity:puzzle_evidence/1` — **not yet traced further**; a Rust port needs to read `macula_identity.erl`'s puzzle implementation before this handshake can be reproduced end-to-end |
+| `puzzle_evidence` | 32 bytes | `SHA-256(node_id)` — see the dedicated callout below. Applies to **every** CONNECT, edge clients included, not just station-to-station peering. |
 | `addresses` | optional list of maps | |
 | `site` | optional map | |
 | `endorsements` | optional list | realm-membership endorsement records (ties into HyParView admission, §6.3) |
+
+**⚠ The puzzle is an identity property, not a per-connection cost — and
+skipping it fails silently.** From `macula_identity.erl` (177 lines) and
+`macula_client.erl` (lines 928-952):
+
+- `puzzle_evidence(Pub)` is just `crypto:hash(sha256, Pub)` — a plain,
+  deterministic hash of the node's own 32-byte pubkey. No nonce, no
+  per-connection computation.
+- The actual proof-of-work happens **once, at identity creation**:
+  `macula_identity:generate(#{puzzle => true})` grinds fresh Ed25519
+  keypairs (via the `macula_crypto_nif:grind_puzzle/1` NIF) until one's
+  pubkey hash has at least `N` leading zero bits (S/Kademlia Sybil
+  defense — mints an identity expensively, not a connection). Default
+  `N = 8` (`?DEFAULT_PUZZLE_DIFFICULTY`), configurable via
+  `application:get_env(macula_identity, puzzle_difficulty, 8)`. The code
+  comment states grinding at the default is sub-millisecond.
+- `puzzle_valid(Pub, N)` — the check any station runs — is just
+  "hash + leading-zero-bit check," equally trivial.
+- **Every station checks this on every CONNECT/HELLO, for every kind of
+  dialer, not only station-to-station peering.** Confirmed directly:
+  `macula_client.erl` — the ordinary leaf SDK any daemon uses — defaults
+  to a puzzle-hardened identity specifically because, quoting the source
+  comment, "this identity is exactly what every station's
+  `puzzle_enforcement_mode/0` checks on CONNECT/HELLO."
+- **Real incident, cited in the source (2026-08-21):** a client connected
+  with an *unhardened* identity. The QUIC/TLS connection reported
+  healthy, `subscribe/5` returned `{ok, _}` — and the station silently
+  rejected the HELLO at the application layer. Result: a link that looked
+  fully healthy delivered zero events for over an hour before the missing
+  puzzle was identified as the cause. **A mobile client that skips this
+  will exhibit exactly that failure mode**, and will be far harder to
+  diagnose without Erlang-side introspection. Do not skip it, and don't
+  bury the identity-generation step where a future implementer might
+  reach for the cheap `generate()` instead of `generate(#{puzzle=>true})`.
+
+**Lifecycle for the mobile port:** grind once — at first run/onboarding,
+not per connection — persist the resulting keypair in secure device
+storage (Keychain on iOS, Keystore on Android; the Erlang side's analog
+is an atomic, 0600-permission local file write via `macula_identity:save/2`),
+and reuse that same identity for every subsequent CONNECT. Never re-grind
+per connection; `resolve_identity/1` in `macula_client.erl` is written
+specifically to avoid that (`maps:get/3`'s default argument evaluates
+unconditionally, so a naive lookup-with-default would grind on every
+call even when an identity already exists — the source works around this
+with an explicit `maps:find/2` check first).
 
 `hello_spec()` mirrors `connect_spec()` plus `accepted` (bool),
 `negotiated_capabilities`, optional `refusal_code`.
@@ -458,6 +509,7 @@ Confirmed from the NIF `Cargo.toml`s in `native/*`:
 | Self-signed cert generation | `rcgen` 0.13 | Yes |
 | Pubkey-pin verifier | (hand-written, ~150 lines in `cert.rs`) | Port near-verbatim |
 | Ed25519 sign/verify | `ed25519-dalek` 2.1 | Yes |
+| Puzzle grind/verify | (hand-written, `macula_crypto_nif::grind_puzzle`) | Trivial to reimplement: generate Ed25519 keypairs, SHA-256 the pubkey, check leading zero bits, repeat. No need to read the NIF source — the algorithm is fully specified from the Erlang side (§5). |
 | Hashing | `blake3` 1.5 (where BLAKE3 is used; source-route hop-hash uses SHA-256 via Erlang's `crypto:hash/2`, a separate primitive — confirm which Rust crate covers that path, likely `sha2`) | Yes for BLAKE3 uses |
 | CBOR (deterministic wire codec) | none — hand-rolled in `native/macula_cbor_nif/src/deterministic.rs` (410 lines) | Transcribe directly, algorithm fully known (§4). `ciborium` is a *different*, non-deterministic code path in the same NIF crate and is irrelevant to the wire format. |
 | MRI parsing | (custom, `macula_mri_nif`) | Study before porting |
@@ -474,9 +526,11 @@ fixed layout above), and the puzzle-evidence handshake field (unresolved,
 1. ~~Canonical CBOR verification.~~ **RESOLVED, 2026-08-28** — see §4.
    `ciborium` was never the actual wire codec; the real algorithm is
    hand-rolled, fully traced, and directly portable.
-2. **`puzzle_evidence`.** Read `macula_identity.erl`'s puzzle
-   implementation — not yet traced. The CONNECT handshake cannot complete
-   without producing a valid one.
+2. ~~`puzzle_evidence`.~~ **RESOLVED, 2026-08-28** — see §5's callout.
+   One-time keypair grinding at identity creation (sub-millisecond at
+   default difficulty), a trivial deterministic hash on every CONNECT
+   after that, and confirmed to apply to every dialer, edge clients
+   included — not a station-to-station-only concern.
 3. **`macula_record:encode/1`.** Needed for DHT `store`/`replicate`/
    `value` frames (record payloads are encoded by a separate codec, not
    `macula_frame`'s own `to_wire/1`). Not needed for CALL/PUBLISH-only v1.
