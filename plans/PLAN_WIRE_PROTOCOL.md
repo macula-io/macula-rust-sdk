@@ -578,8 +578,7 @@ fixed layout above), and the puzzle-evidence handshake field (unresolved,
    addressing/discovery/gossip stack to get it. The one genuinely useful
    thing Iroh demonstrated — shipping a Rust core to iOS/Android via
    UniFFI — doesn't require Iroh either: UniFFI is a separate,
-   general-purpose Mozilla tool that `macula-mobile` can depend on
-   directly.
+   general-purpose Mozilla tool this crate can depend on directly.
 5. **v1 scope decision — superseded, 2026-08-28.** The original cut
    deferred streaming RPC and content transfer wholesale. Both have now
    been fully traced (§12-§13) and turn out to be cheap additions, not
@@ -760,11 +759,11 @@ Pattern, from `macula_stream_sink.erl`:
    Worth replicating exactly: the distinction is the only signal the
    peer gets.
 
-### 13.2 Provider (server) role — lower priority for a first mobile port
+### 13.2 Provider (server) role — lower priority for a first port
 
-Pattern, from `macula_streamer.erl`, only worth building once a mobile
-app wants to *expose* a streaming procedure to the mesh (e.g. a live
-sensor feed), not just call one: `advertise_stream/5` registers a
+Pattern, from `macula_streamer.erl`, only worth building once a consumer
+of this crate wants to *expose* a streaming procedure to the mesh (e.g. a
+live sensor feed), not just call one: `advertise_stream/5` registers a
 handler invoked per inbound `stream_open`; the module drives `recv/2` on
 the provider's own stream for `client_stream`-mode procedures (mirroring
 §13.1's loop, just on the other end) and exposes `send/2,3`/`close/1` for
@@ -790,3 +789,38 @@ explicit abort rule as §13.1, symmetric.
   equivalent; the wire-relevant rule is just "stream owner gone ⇒ close
   or abort the stream," which any reasonable async-Rust structured-
   concurrency approach gets for free.
+
+### 13.4 Forward-compatibility note: live/unbounded streaming (2026-08-28)
+
+**Confirmed gap, out of scope here, but worth designing around.** A
+concrete real-world case (`hecate-tube` / macula-realm's "Macula TV") was
+checked directly: its ingest path is plain HTTP upload to a conventional
+web server (mesh not involved at all — confirmed in
+`maybe_upload_video_clip.erl`), and its *playback* path is `server_stream`
+streaming RPC reading an **already-complete file** off local disk
+(`stream_video_clip_by_id.erl`, whose own comment states "the mesh
+Content primitive is never the video-bytes path"). Neither is "capture
+device pushes a live, unbounded feed into the mesh as it happens." Nothing
+in the ecosystem does that today, on either the client or the receiving
+side.
+
+The wire primitive is not the gap: `client_stream`-mode `stream_open` with
+no manifest, followed by `stream_data` frames pushed continuously with no
+predetermined end, is already valid against everything in §13.1 — a
+producer just never knows total length upfront and that's fine, nothing
+in the frame format requires it. The gap is entirely a missing *receiving
+service* (something implementing §13.2's provider role in `client_stream`
+mode, doing something useful with each chunk as it arrives — re-publish
+live, buffer into a rolling window, hand off to a segmenter) — that's SDK/
+station-side application design, explicitly out of scope for this repo and
+not something to build now.
+
+**What this means for this crate's design, without building the receiving
+side:** don't route a live/unbounded producer through the same API shape
+as §12.3's bounded push-upload (which computes a manifest from the full
+byte count upfront — structurally wrong for "still recording, unknown
+duration"). Expose live `client_stream` publishing as its own API surface
+— open, push chunks as captured, close when done — separate from the
+manifest-based upload path, so the day a receiving procedure exists on the
+SDK/station side, this crate points at a new procedure name with no
+protocol-level rework. A seam, not a feature.
