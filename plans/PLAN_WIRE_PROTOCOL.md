@@ -1,14 +1,23 @@
-# Macula Wire Protocol — Spec Extracted for a Mobile (Rust) Client Port
+# Macula Wire Protocol — Spec Extracted for a Rust SDK Port
 
 **Status:** Reference spec, extracted from source. Not a build plan yet.
 **Created:** 2026-08-28
+**Repo renamed 2026-08-28:** `macula-mobile` → `macula-rust-sdk`. This is a
+Rust port of macula's *SDK* half (the client/leaf side — see
+`macula/CLAUDE.md`'s own SDK-vs-Relay split), not the relay/station. Mobile
+(iOS/Android via UniFFI) is the flagship, driving consumer and the reason
+this work started, not the ceiling on it — the same core is equally usable
+from a future WASM build, CLI tool, or any other non-BEAM Rust consumer,
+with no code shaped specifically around "mobile" below the UniFFI binding
+layer itself.
 **Scope constraint:** macula-station cannot change. Everything below describes
 the wire contract as it exists today so a client can be built against it
 unmodified.
 
-**Why this exists:** so a phone can hold a QUIC session with an unmodified
-macula-station and speak its real application primitives (pubsub, RPC,
-capability advertise), without macula's own Erlang code changing at all.
+**Why this exists:** so a non-BEAM Rust consumer — a phone first — can hold
+a QUIC session with an unmodified macula-station and speak its real
+application primitives (pubsub, RPC, capability advertise), without
+macula's own Erlang code changing at all.
 
 This is a BUILD artifact (a wire-format spec extracted from existing,
 shipped, tested source), not a CLAIM about the world — nothing here needs
