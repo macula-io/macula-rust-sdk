@@ -9,12 +9,13 @@
 //! or WASM as it was before this crate existed.
 //!
 //! Every application primitive the core crate has is wrapped: identity,
-//! CONNECT/HELLO, CALL/RESULT/ERROR as both caller AND provider
-//! (`call`/[`FfiSession::serve_one_call`]), PUBLISH/SUBSCRIBE/EVENT,
-//! content transfer, and streaming RPC — both the caller/consumer role
-//! (§13.1) and the provider role (§13.2/§6.9,
-//! `advertise`/`accept_stream`). Not exposed: pubkey-pinned trust
-//! (`connect` always uses WebPki).
+//! CONNECT/HELLO (either [`FfiTrust::Pinned`] or [`FfiTrust::WebPki`] —
+//! see that type's own doc for when each applies), CALL/RESULT/ERROR as
+//! both caller AND provider (`call`/[`FfiSession::serve_one_call`]),
+//! PUBLISH/SUBSCRIBE/EVENT, content transfer, and streaming RPC — both
+//! the caller/consumer role (§13.1) and the provider role (§13.2/§6.9,
+//! `advertise`/`accept_stream`). Not exposed: `Trust::Insecure` —
+//! deliberately, see [`FfiTrust`]'s own doc.
 //!
 //! [`FfiValue`] covers `Null`/`Int`/`Bytes`/`Text`/`Float` — the
 //! variants [`macula_rust_sdk::cbor::Value`] itself has, MINUS
@@ -360,6 +361,44 @@ pub struct FfiAcceptedStream {
     pub info: FfiStreamOpenInfo,
 }
 
+/// How to trust whatever certificate the station presents — mirrors
+/// [`macula_rust_sdk::transport::Trust`], minus `Insecure`.
+///
+/// `Insecure` (skip TLS verification entirely) is deliberately NOT
+/// exposed here: it's a development/diagnostic escape hatch in the core
+/// crate, never something a shipped mobile app should be able to
+/// select — a stray debug flag left on in production would silently
+/// disable all transport security. Reach into the core crate directly
+/// (outside this FFI boundary) for that one, if a test harness genuinely
+/// needs it.
+#[derive(uniffi::Enum, Debug, Clone)]
+pub enum FfiTrust {
+    /// Pin the station's known Ed25519 pubkey (its macula node_id, 32
+    /// bytes) — the right mode once a station's identity is known
+    /// (DHT-resolved, or configured directly), and the ONLY mode that
+    /// works at all for a station without a CA-issued cert, e.g. a
+    /// self-hosted/home station outside the public demo fleet — WebPki
+    /// has no chain to validate there.
+    Pinned { node_id: Vec<u8> },
+    /// Standard CA-bundle + hostname validation, for a station whose
+    /// TLS is terminated by real PKI (e.g. Let's Encrypt) — what the
+    /// public `station-de-frankfurt.macula.io` demo fleet presents.
+    WebPki,
+}
+
+impl TryFrom<FfiTrust> for macula_rust_sdk::transport::Trust {
+    type Error = FfiError;
+
+    fn try_from(t: FfiTrust) -> Result<Self, FfiError> {
+        match t {
+            FfiTrust::Pinned { node_id } => {
+                Ok(macula_rust_sdk::transport::Trust::Pinned(to_32(node_id)?))
+            }
+            FfiTrust::WebPki => Ok(macula_rust_sdk::transport::Trust::WebPki),
+        }
+    }
+}
+
 /// An Ed25519 identity, puzzle-hardened by construction — see
 /// [`macula_rust_sdk::identity::KeyPair::generate_with_default_puzzle`]'s
 /// own doc for why this is always the right default despite its (small,
@@ -391,21 +430,21 @@ pub struct FfiSession(tokio::sync::Mutex<Option<macula_rust_sdk::connection::Ses
 #[uniffi::export(async_runtime = "tokio")]
 impl FfiSession {
     /// Dial `host:port` and complete the CONNECT/HELLO handshake, using
-    /// WebPki (CA-chain) trust — the mode the live macula.io fleet
-    /// actually presents (`plans/PLAN_WIRE_PROTOCOL.md`'s §2 empirical
-    /// note). Pubkey pinning isn't exposed at the FFI boundary yet.
+    /// `trust` to validate the station's TLS certificate — see
+    /// [`FfiTrust`]'s own doc for which mode fits which station.
     #[uniffi::constructor]
-    pub async fn connect(host: String, port: u16, identity: &FfiKeyPair) -> Result<Self, FfiError> {
-        let session = macula_rust_sdk::connection::connect(
-            &host,
-            port,
-            macula_rust_sdk::transport::Trust::WebPki,
-            &identity.0,
-        )
-        .await
-        .map_err(|e| FfiError::Connect {
-            reason: e.to_string(),
-        })?;
+    pub async fn connect(
+        host: String,
+        port: u16,
+        trust: FfiTrust,
+        identity: &FfiKeyPair,
+    ) -> Result<Self, FfiError> {
+        let session =
+            macula_rust_sdk::connection::connect(&host, port, trust.try_into()?, &identity.0)
+                .await
+                .map_err(|e| FfiError::Connect {
+                    reason: e.to_string(),
+                })?;
         Ok(Self(tokio::sync::Mutex::new(Some(session))))
     }
 

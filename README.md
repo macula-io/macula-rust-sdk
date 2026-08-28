@@ -19,13 +19,15 @@
 
 ---
 
-> **Status, 2026-08-28:** the client/leaf side of the wire protocol is
-> built and **live-verified against the production station fleet**
-> (`station-de-frankfurt.macula.io`) — handshake, unary RPC, PubSub,
-> content transfer, and streaming RPC, every primitive in both caller
-> and provider roles. Mobile bindings (Kotlin + Swift, via UniFFI) wrap
-> the entire surface, generated and CI-checked on every push. See
-> [Status](#status) for what's not there yet.
+> **Status, 2026-08-28:** feature-complete for a leaf/edge client —
+> the client/leaf side of the wire protocol is built and
+> **live-verified against the production station fleet**
+> (`station-de-frankfurt.macula.io`) — handshake (pinned or WebPki
+> trust), unary RPC, PubSub, content transfer, and streaming RPC, every
+> primitive in both caller and provider roles. Mobile bindings (Kotlin +
+> Swift, via UniFFI) wrap the entire surface, generated and CI-checked
+> on every push. See [Status](#status) for what's deliberately out of
+> scope vs. genuinely separate future work.
 
 ## What is this?
 
@@ -54,7 +56,7 @@ CLI, or WASM as any other Rust SDK.
 | Streaming RPC (STREAM_OPEN/DATA/END/REPLY) | ✅ | ✅ | Both roles live-verified against the real fleet |
 | RPC advertise/unadvertise | ✅ | — | |
 | Mobile bindings (Kotlin, Swift) | ✅ | ✅ | Via [UniFFI](#mobile-bindings-uniffi) — provider role serves via `FfiCallHandler`, a foreign-implemented async trait (`suspend fun`/`async throws`), not a closure |
-| Pubkey-pinned trust | 🏗️ | — | `Trust::Pinned` exists in the core crate, not yet surfaced through FFI |
+| Pubkey-pinned trust | ✅ | — | `Trust::Pinned` / `FfiTrust.Pinned` — the only mode that works at all for a station without a CA-issued cert |
 
 `unsafe_code = "forbid"` at the crate level — the only unsafe in this
 workspace lives inside its pinned dependencies (`quinn`, `ring`), not
@@ -193,9 +195,30 @@ in Kotlin and `func handle(...) async throws -> FfiValue` in Swift,
 `FfiSession.serveOneCall`/`serveOneCall` takes it as a parameter in
 both, not just as an exit-code smoke test.
 
-**Not yet built:**
-- Pubkey-pinned trust surfaced through the FFI layer (`Trust::Pinned`
-  exists in the core crate)
+Pubkey-pinned trust reached the FFI layer the same day too: `connect`
+now takes an `FfiTrust` (`Pinned { node_id }` or `WebPki`) instead of
+hardcoding WebPki. Not a nice-to-have — WebPki has no chain to validate
+against a self-hosted station outside the public demo fleet, so a real
+deployment off `station-de-frankfurt.macula.io` needs pinning to
+connect at all. `Trust::Insecure` stays deliberately unexposed at the
+FFI boundary (dev/diagnostic only in the core crate; a shipped mobile
+app should never be able to select "skip TLS verification").
+
+**This crate is feature-complete for its stated purpose — a leaf
+client dialing a known macula-station — in both the core crate and the
+FFI layer.** What's genuinely still outstanding is a different kind of
+thing entirely, not an SDK gap:
+- DHT/HyParView/Plumtree gossip primitives — deliberately **not**
+  leaf-client scope; they're how *stations* gossip membership and
+  broadcast to each other (§6.5-§6.7 say so explicitly). A leaf never
+  needs them, so this was never a completeness gap to begin with.
+- The actual Android demo app — real Kotlin/Android work outside this
+  crate, needing a device/emulator and toolchain this repo's own CI
+  doesn't have. The SDK surface it needs (`advertise`/`acceptStream`/
+  `FfiStream`/`serveOneCall`, both pull and push streaming modes) is
+  already complete and live-verified; nothing here is blocking it.
+- Additional language ports (C#, Python) — a separate initiative, not
+  a gap in this crate.
 
 See [`plans/PLAN_WIRE_PROTOCOL.md`](plans/PLAN_WIRE_PROTOCOL.md) for the
 full wire-format spec this crate is built against, section by section,
