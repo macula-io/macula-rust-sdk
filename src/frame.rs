@@ -940,6 +940,90 @@ pub fn decode(buf: &[u8]) -> Result<Decoded, DecodeFrameError> {
 }
 
 // ---------------------------------------------------------------------
+// RPC advertise (§6.9 of `plans/PLAN_WIRE_PROTOCOL.md`): ADVERTISE,
+// UNADVERTISE. The provider-role building block — registers this
+// connection as the handler for `procedure` under `realm`; the station
+// then routes inbound CALLs (control stream) and STREAM_OPENs (a fresh
+// dedicated stream it opens toward us) for that procedure back to us.
+// See `src/provider.rs` for the dispatch side of that, once built.
+// ---------------------------------------------------------------------
+
+/// Fields for an ADVERTISE frame.
+#[derive(Debug, Clone)]
+pub struct AdvertiseSpec {
+    pub realm: [u8; 32],
+    pub procedure: String,
+    pub advertiser: [u8; 32],
+}
+
+impl AdvertiseSpec {
+    pub fn new(realm: [u8; 32], procedure: impl Into<String>, advertiser: [u8; 32]) -> Self {
+        Self {
+            realm,
+            procedure: procedure.into(),
+            advertiser,
+        }
+    }
+}
+
+fn advertise_value(spec: &AdvertiseSpec, frame_id: [u8; 16], sent_at_ms: u64) -> Value {
+    // NOTE: `source_route` stays untouched (`Null`) — confirmed directly
+    // against the reference, not assumed from CALL/STREAM_OPEN's pattern
+    // (which DO override it). `realm` IS overridden here, unlike RESULT/
+    // STREAM_DATA/etc.
+    Value::Map(base("advertise", 0, frame_id, sent_at_ms))
+        .with_field("realm", Value::Bytes(spec.realm.to_vec()))
+        // `procedure := binary()` -- bytes, not text. Same fix as CALL's
+        // `procedure`.
+        .with_field(
+            "procedure",
+            Value::Bytes(spec.procedure.as_bytes().to_vec()),
+        )
+        .with_field("advertiser", Value::Bytes(spec.advertiser.to_vec()))
+        // `options` has no known use case yet -- always the reference's
+        // own default, an empty map.
+        .with_field("options", Value::Map(vec![]))
+}
+
+/// Build an ADVERTISE frame with a fresh `frame_id`/`sent_at_ms`.
+pub fn advertise(spec: &AdvertiseSpec) -> Value {
+    advertise_value(spec, fresh_frame_id(), current_millis())
+}
+
+/// Fields for an UNADVERTISE frame.
+#[derive(Debug, Clone)]
+pub struct UnadvertiseSpec {
+    pub realm: [u8; 32],
+    pub procedure: String,
+    pub advertiser: [u8; 32],
+}
+
+impl UnadvertiseSpec {
+    pub fn new(realm: [u8; 32], procedure: impl Into<String>, advertiser: [u8; 32]) -> Self {
+        Self {
+            realm,
+            procedure: procedure.into(),
+            advertiser,
+        }
+    }
+}
+
+fn unadvertise_value(spec: &UnadvertiseSpec, frame_id: [u8; 16], sent_at_ms: u64) -> Value {
+    Value::Map(base("unadvertise", 0, frame_id, sent_at_ms))
+        .with_field("realm", Value::Bytes(spec.realm.to_vec()))
+        .with_field(
+            "procedure",
+            Value::Bytes(spec.procedure.as_bytes().to_vec()),
+        )
+        .with_field("advertiser", Value::Bytes(spec.advertiser.to_vec()))
+}
+
+/// Build an UNADVERTISE frame with a fresh `frame_id`/`sent_at_ms`.
+pub fn unadvertise(spec: &UnadvertiseSpec) -> Value {
+    unadvertise_value(spec, fresh_frame_id(), current_millis())
+}
+
+// ---------------------------------------------------------------------
 // Streaming RPC (§13 of `plans/PLAN_WIRE_PROTOCOL.md`): STREAM_OPEN,
 // STREAM_DATA, STREAM_END, STREAM_ERROR, STREAM_REPLY. Ported from
 // `macula_frame.erl`'s streaming constructors, verified against real
@@ -2074,5 +2158,55 @@ mod tests {
             parse_stream_event(&frame).unwrap_err(),
             ParseStreamEventError::NotAStreamFrame
         );
+    }
+
+    // -------------------------------------------------------------
+    // RPC advertise (§6.9) — same differential method, vectors
+    // captured from a real `macula_frame:advertise/1` +
+    // `unadvertise/1` + `sign/2` in a live `rebar3 shell`.
+    // -------------------------------------------------------------
+
+    #[test]
+    fn advertise_frame_matches_the_reference_byte_for_byte() {
+        let pub_bytes = fixed_array(VECTOR_PUB);
+        let identity = vector_identity();
+        let spec = AdvertiseSpec::new(
+            VECTOR_ZERO_REALM,
+            "macula_rust_sdk.test_procedure",
+            pub_bytes,
+        );
+        let signed = sign(
+            advertise_value(&spec, vector_frame_id(), VECTOR_SENT_AT_MS),
+            &identity,
+        );
+        let sig = match signed.get("signature") {
+            Some(Value::Bytes(b)) => b.clone(),
+            other => panic!("expected a signature field, got {other:?}"),
+        };
+        assert_eq!(hex::encode_upper(&sig), "22AE051A542289279A56FB9C8587341232EF48208F9A8641C77F37E1B5D3D26A4B7C30CDCA4AE6E851FEB4E2FBF9C5B2469AFCC7317D59F5D775A05C99E99C0A");
+        let encoded = encode(&signed).expect("encodable frame");
+        assert_eq!(encoded.len(), 330);
+    }
+
+    #[test]
+    fn unadvertise_frame_matches_the_reference_byte_for_byte() {
+        let pub_bytes = fixed_array(VECTOR_PUB);
+        let identity = vector_identity();
+        let spec = UnadvertiseSpec::new(
+            VECTOR_ZERO_REALM,
+            "macula_rust_sdk.test_procedure",
+            pub_bytes,
+        );
+        let signed = sign(
+            unadvertise_value(&spec, vector_frame_id(), VECTOR_SENT_AT_MS),
+            &identity,
+        );
+        let sig = match signed.get("signature") {
+            Some(Value::Bytes(b)) => b.clone(),
+            other => panic!("expected a signature field, got {other:?}"),
+        };
+        assert_eq!(hex::encode_upper(&sig), "C4111E5C2685DCDDB035B9DA29AD2A30D90BC7CAC09620A675D9A3DB480508FDAD7DCDD145B77607395DBF6195643BBA60C2C6D29E2DCFE5F70F20CF15DA2600");
+        let encoded = encode(&signed).expect("encodable frame");
+        assert_eq!(encoded.len(), 323);
     }
 }
