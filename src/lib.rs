@@ -7,4 +7,6 @@
 //! layer is mobile-specific.
 
 pub mod cbor;
+pub mod cert;
 pub mod identity;
+pub mod transport;

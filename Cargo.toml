@@ -18,7 +18,18 @@ all = { level = "deny", priority = -1 }
 ed25519-dalek = { version = "2.1", features = ["rand_core"] }
 rand = "0.8"
 sha2 = "0.10"
+quinn = "0.11"
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
+webpki-roots = "0.26"
+x509-parser = "0.16"
+tokio = { version = "1", features = ["full"] }
 
 [dev-dependencies]
 hex = "0.4"
 tempfile = "3"
+# Test-only: generates synthetic Ed25519 certs to unit-test
+# PubkeyPinVerifier's matching logic without needing a live station that
+# happens to present that cert type — see src/cert.rs's tests. Not a
+# runtime dependency of the crate itself (see src/cert.rs's module doc:
+# a dialing client never generates or presents a cert of its own).
+rcgen = { version = "0.13", default-features = false, features = ["pem", "ring"] }

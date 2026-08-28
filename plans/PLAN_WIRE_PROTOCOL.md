@@ -111,6 +111,33 @@ account system at the transport layer.
 DHT-resolved or pre-configured station records already give you, rather
 than `webpki`.
 
+**Empirical finding, 2026-08-28 — confirmed against a live production
+station, not assumed:** `macula-station-frankfurt` (`macula.io`, part of
+the 7-box demo fleet) presents a **3-certificate RSA chain** (SPKI OID
+`1.2.840.113549.1.1.1`), not a self-signed Ed25519 identity cert. That's
+macula's *other* documented trust mode (`verify => webpki`, "public-IP
+path with Let's Encrypt-anchored certs"), confirmed working end-to-end
+from `macula-rust-sdk` (`tests/live_station.rs`): full QUIC/TLS handshake
+completes, ALPN negotiates as `"macula"` exactly per spec, CA-chain
+validation against `webpki-roots` succeeds. Pubkey-pinned trust is fully
+implemented and unit-tested (`src/cert.rs`, against a synthetic cert —
+see its test module), but **no box in the currently-reachable demo fleet
+happens to be configured that way**, so it hasn't been exercised live.
+Whoever configures the *target* station for a real deployment decides
+which trust mode applies — this crate needs to support both regardless,
+which it does.
+
+**Operational note for reaching this fleet specifically:** the bare
+`macula.io` hostname has an A record but genuinely no AAAA record, while
+the station's actual QUIC listener is bound to a specific IPv6 address
+with no relationship to that A record — dialing `macula.io:4433` directly
+resolves to a real, reachable IPv4 address with nothing listening, and
+every packet vanishes silently (indistinguishable from a firewalled port
+from the client side alone; confirmed via `ss -ulnp` on the box itself,
+not guessed). `station-de-frankfurt.macula.io` is the name that actually
+resolves to the listener. Matches the DNS-repoint gotcha already on file
+in project memory (`reference_demo_fleet_boxes`) — confirmed still true.
+
 ## 3. Connection lifecycle (state machine)
 
 From `macula_peering_conn.erl` (`gen_statem`), module doc lines 1-11:
