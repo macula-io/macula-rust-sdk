@@ -10,6 +10,8 @@ pub mod bolt4;
 pub mod cbor;
 pub mod cert;
 pub mod connection;
+pub mod content;
 pub mod frame;
 pub mod identity;
+pub mod manifest;
 pub mod transport;

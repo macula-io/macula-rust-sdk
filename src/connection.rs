@@ -1,15 +1,18 @@
-//! The CONNECT/HELLO handshake, ported from the client-side path of
-//! `src/peering/macula_peering_conn.erl`'s `gen_statem`
+//! The CONNECT/HELLO handshake and the application-frame stream
+//! abstraction, ported from `src/peering/macula_peering_conn.erl`
 //! (`macula-io/macula`) — see `plans/PLAN_WIRE_PROTOCOL.md` §3.
 //!
 //! Only the client role's `connecting -> handshaking -> connected` path
-//! is implemented here. Everything after a successful handshake
-//! (application frames on the control stream, dedicated streams,
-//! draining/close) is future work — see the crate's own README/plan for
-//! what's next.
+//! is implemented. [`FrameStream`] is the reusable "send/receive signed
+//! application frames on one QUIC stream" primitive — [`Session`] wraps
+//! one for the control stream, and [`Session::open_dedicated_stream`]
+//! hands out fresh ones for content transfer (§12) and streaming RPC
+//! (§13), which both run on dedicated streams rather than the control
+//! stream.
 
 use std::time::Duration;
 
+use crate::cbor::Value;
 use crate::frame::{self, Decoded, HelloInfo};
 use crate::identity::KeyPair;
 use crate::transport::{self, ConnectError, Trust};
@@ -21,22 +24,206 @@ use crate::transport::{self, ConnectError, Trust};
 /// station-side symptom and this crate's symptom are the same shape.
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Bound on a single read from the QUIC stream while accumulating a
-/// frame. Not a protocol limit — just how much to ask the stream for at
-/// once; `frame::decode`'s own `MAX_FRAME_BYTES` is the real cap.
+/// Default timeout for a single CALL awaiting its RESULT/ERROR. Not from
+/// the reference source (macula's own CALL timeout is caller-supplied
+/// per-call via `deadline_ms` inside the frame itself, not a transport-
+/// level default) — a reasonable local default for this crate's API.
+pub const DEFAULT_CALL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Bound on a single read from a QUIC stream while accumulating a frame.
+/// Not a protocol limit — just how much to ask the stream for at once;
+/// `frame::decode`'s own `MAX_FRAME_BYTES` is the real cap.
 const READ_CHUNK: usize = 64 * 1024;
+
+// ---------------------------------------------------------------------
+// FrameStream — send/receive signed application frames on one QUIC
+// stream. The control stream (inside Session) and every dedicated
+// stream (content transfer, streaming RPC) are each one of these.
+// ---------------------------------------------------------------------
+
+pub struct FrameStream {
+    send: quinn::SendStream,
+    recv: quinn::RecvStream,
+    /// Bytes read but not yet consumed by a decoded frame — carried
+    /// over between reads so nothing is ever dropped.
+    buf: Vec<u8>,
+}
+
+#[derive(Debug)]
+pub enum SendFrameError {
+    Encode(frame::EncodeFrameError),
+    Write(quinn::WriteError),
+}
+
+impl std::fmt::Display for SendFrameError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SendFrameError::Encode(e) => write!(f, "encoding frame: {e}"),
+            SendFrameError::Write(e) => write!(f, "writing to stream: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for SendFrameError {}
+
+#[derive(Debug)]
+pub enum RecvFrameError {
+    Read(quinn::ReadError),
+    StreamClosed,
+    Decode(frame::DecodeFrameError),
+    Timeout,
+}
+
+impl std::fmt::Display for RecvFrameError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RecvFrameError::Read(e) => write!(f, "reading from stream: {e}"),
+            RecvFrameError::StreamClosed => write!(f, "peer closed the stream"),
+            RecvFrameError::Decode(e) => write!(f, "decoding a frame: {e}"),
+            RecvFrameError::Timeout => write!(f, "timed out waiting for a frame"),
+        }
+    }
+}
+
+impl std::error::Error for RecvFrameError {}
+
+#[derive(Debug)]
+pub enum CallError {
+    Send(SendFrameError),
+    Recv(RecvFrameError),
+}
+
+impl std::fmt::Display for CallError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CallError::Send(e) => write!(f, "sending CALL: {e}"),
+            CallError::Recv(e) => write!(f, "awaiting RESULT/ERROR: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for CallError {}
+
+impl FrameStream {
+    fn new(send: quinn::SendStream, recv: quinn::RecvStream) -> Self {
+        Self::with_buf(send, recv, Vec::new())
+    }
+
+    fn with_buf(send: quinn::SendStream, recv: quinn::RecvStream, buf: Vec<u8>) -> Self {
+        Self { send, recv, buf }
+    }
+
+    /// Any bytes already read past the last decoded frame — for the
+    /// control stream specifically, this starts with whatever was left
+    /// over from the handshake itself.
+    pub fn leftover_bytes(&self) -> &[u8] {
+        &self.buf
+    }
+
+    pub async fn send_frame(&mut self, frame: Value) -> Result<(), SendFrameError> {
+        let encoded = frame::encode(&frame).map_err(SendFrameError::Encode)?;
+        self.send
+            .write_all(&encoded)
+            .await
+            .map_err(SendFrameError::Write)
+    }
+
+    /// Read the next complete application frame, using (and updating)
+    /// any bytes already buffered.
+    pub async fn recv_frame(&mut self) -> Result<Value, RecvFrameError> {
+        let mut chunk = vec![0u8; READ_CHUNK];
+        loop {
+            match frame::decode(&self.buf) {
+                Ok(Decoded::Frame(value, consumed)) => {
+                    self.buf.drain(..consumed);
+                    return Ok(value);
+                }
+                Ok(Decoded::More(_)) => {}
+                Err(e) => return Err(RecvFrameError::Decode(e)),
+            }
+            let n = self
+                .recv
+                .read(&mut chunk)
+                .await
+                .map_err(RecvFrameError::Read)?
+                .ok_or(RecvFrameError::StreamClosed)?;
+            self.buf.extend_from_slice(&chunk[..n]);
+        }
+    }
+
+    /// As [`recv_frame`](Self::recv_frame), bounded by `timeout`.
+    pub async fn recv_frame_timeout(&mut self, timeout: Duration) -> Result<Value, RecvFrameError> {
+        tokio::time::timeout(timeout, self.recv_frame())
+            .await
+            .unwrap_or(Err(RecvFrameError::Timeout))
+    }
+
+    /// Send a signed CALL for `procedure` and wait for the matching
+    /// RESULT or ERROR, correlated by `call_id`.
+    ///
+    /// **Known v1 limitation (control stream only):** any frame that
+    /// arrives before the match (e.g. an EVENT from an active
+    /// SUBSCRIBE) is discarded, not queued or dispatched elsewhere —
+    /// correct for a client doing one thing at a time on the control
+    /// stream, not yet correct for CALL and PUBLISH/SUBSCRIBE used
+    /// concurrently on it. Harmless on a **dedicated** stream (content
+    /// transfer, streaming RPC), since nothing else ever arrives there
+    /// to discard.
+    pub async fn call(
+        &mut self,
+        procedure: &str,
+        realm: [u8; 32],
+        payload: Value,
+        deadline_ms: i128,
+        identity: &KeyPair,
+        timeout: Duration,
+    ) -> Result<frame::CallResponse, CallError> {
+        let call_id: [u8; 16] = rand::random();
+        let spec = frame::CallSpec::new(
+            call_id,
+            procedure,
+            realm,
+            payload,
+            deadline_ms,
+            identity.node_id(),
+        );
+        let signed = frame::sign(frame::call(&spec), identity);
+        self.send_frame(signed).await.map_err(CallError::Send)?;
+
+        tokio::time::timeout(timeout, self.await_call_response(call_id))
+            .await
+            .unwrap_or(Err(CallError::Recv(RecvFrameError::Timeout)))
+    }
+
+    async fn await_call_response(
+        &mut self,
+        call_id: [u8; 16],
+    ) -> Result<frame::CallResponse, CallError> {
+        loop {
+            let value = self.recv_frame().await.map_err(CallError::Recv)?;
+            if frame::frame_call_id(&value) != Some(call_id) {
+                continue; // not ours — see call()'s doc on this limitation
+            }
+            if let Ok(response) = frame::parse_call_response(&value) {
+                return Ok(response);
+            }
+            // Matching call_id but not a result/error shape: keep
+            // waiting rather than erroring, since nothing else in the
+            // protocol is expected to carry this call's id.
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
+// Session — the handshaked connection, wrapping the control stream.
+// ---------------------------------------------------------------------
 
 /// A completed, handshaked connection to a macula-station. Holds the
 /// open control stream (CONNECT/HELLO already exchanged) and the
 /// station's identity as verified by the HELLO frame's own signature.
 pub struct Session {
     connection: quinn::Connection,
-    send: quinn::SendStream,
-    recv: quinn::RecvStream,
-    /// Bytes read from the stream but not yet consumed by a decoded
-    /// frame — carried over between reads (starting with whatever was
-    /// left over from the handshake) so nothing is ever dropped.
-    buf: Vec<u8>,
+    control: FrameStream,
     pub station: HelloInfo,
 }
 
@@ -155,9 +342,7 @@ async fn connect_inner(
 
     Ok(Session {
         connection,
-        send,
-        recv,
-        buf,
+        control: FrameStream::with_buf(send, recv, buf),
         station,
     })
 }
@@ -165,10 +350,9 @@ async fn connect_inner(
 /// Read from `recv` until one complete frame has been decoded, returning
 /// it along with any leftover bytes already read that belong to the
 /// *next* frame (so a caller can carry them forward instead of losing
-/// them).
-async fn read_one_frame(
-    recv: &mut quinn::RecvStream,
-) -> Result<(crate::cbor::Value, Vec<u8>), HandshakeError> {
+/// them). Handshake-only — [`FrameStream::recv_frame`] is the
+/// post-handshake equivalent.
+async fn read_one_frame(recv: &mut quinn::RecvStream) -> Result<(Value, Vec<u8>), HandshakeError> {
     let mut buf = Vec::new();
     let mut chunk = vec![0u8; READ_CHUNK];
     loop {
@@ -189,71 +373,18 @@ async fn read_one_frame(
     }
 }
 
-/// Default timeout for a single CALL awaiting its RESULT/ERROR. Not from
-/// the reference source (macula's own CALL timeout is caller-supplied
-/// per-call via `deadline_ms` inside the frame itself, not a transport-
-/// level default) — a reasonable local default for this crate's API.
-pub const DEFAULT_CALL_TIMEOUT: Duration = Duration::from_secs(30);
-
-#[derive(Debug)]
-pub enum SendFrameError {
-    Encode(frame::EncodeFrameError),
-    Write(quinn::WriteError),
-}
-
-impl std::fmt::Display for SendFrameError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            SendFrameError::Encode(e) => write!(f, "encoding frame: {e}"),
-            SendFrameError::Write(e) => write!(f, "writing to control stream: {e}"),
-        }
-    }
-}
-
-impl std::error::Error for SendFrameError {}
-
-#[derive(Debug)]
-pub enum RecvFrameError {
-    Read(quinn::ReadError),
-    StreamClosed,
-    Decode(frame::DecodeFrameError),
-    Timeout,
-}
-
-impl std::fmt::Display for RecvFrameError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            RecvFrameError::Read(e) => write!(f, "reading from control stream: {e}"),
-            RecvFrameError::StreamClosed => write!(f, "station closed the control stream"),
-            RecvFrameError::Decode(e) => write!(f, "decoding a frame: {e}"),
-            RecvFrameError::Timeout => write!(f, "timed out waiting for a frame"),
-        }
-    }
-}
-
-impl std::error::Error for RecvFrameError {}
-
-#[derive(Debug)]
-pub enum CallError {
-    Send(SendFrameError),
-    Recv(RecvFrameError),
-}
-
-impl std::fmt::Display for CallError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            CallError::Send(e) => write!(f, "sending CALL: {e}"),
-            CallError::Recv(e) => write!(f, "awaiting RESULT/ERROR: {e}"),
-        }
-    }
-}
-
-impl std::error::Error for CallError {}
-
 impl Session {
     /// The remote address this session's connection is with.
     pub fn remote_address(&self) -> std::net::SocketAddr {
         self.connection.remote_address()
+    }
+
+    /// Open a new dedicated QUIC stream on this same connection, separate
+    /// from the control stream — the mechanism content transfer (§12)
+    /// and streaming RPC (§13) both use instead of the control stream.
+    pub async fn open_dedicated_stream(&mut self) -> Result<FrameStream, quinn::ConnectionError> {
+        let (send, recv) = self.connection.open_bi().await?;
+        Ok(FrameStream::new(send, recv))
     }
 
     /// Any bytes already read past the HELLO frame during the handshake
@@ -261,103 +392,33 @@ impl Session {
     /// building further protocol handling on top of this `Session`
     /// should treat as already-received.
     pub fn leftover_bytes(&self) -> &[u8] {
-        &self.buf
+        self.control.leftover_bytes()
     }
 
-    async fn send_frame(&mut self, frame: crate::cbor::Value) -> Result<(), SendFrameError> {
-        let encoded = frame::encode(&frame).map_err(SendFrameError::Encode)?;
-        self.send
-            .write_all(&encoded)
-            .await
-            .map_err(SendFrameError::Write)
-    }
-
-    /// Read the next complete application frame from the control stream,
-    /// using (and updating) any bytes already buffered — including
-    /// whatever was left over from the handshake itself.
-    pub async fn recv_frame(&mut self) -> Result<crate::cbor::Value, RecvFrameError> {
-        let mut chunk = vec![0u8; READ_CHUNK];
-        loop {
-            match frame::decode(&self.buf) {
-                Ok(Decoded::Frame(value, consumed)) => {
-                    self.buf.drain(..consumed);
-                    return Ok(value);
-                }
-                Ok(Decoded::More(_)) => {}
-                Err(e) => return Err(RecvFrameError::Decode(e)),
-            }
-            let n = self
-                .recv
-                .read(&mut chunk)
-                .await
-                .map_err(RecvFrameError::Read)?
-                .ok_or(RecvFrameError::StreamClosed)?;
-            self.buf.extend_from_slice(&chunk[..n]);
-        }
+    /// Read the next complete application frame from the control stream.
+    pub async fn recv_frame(&mut self) -> Result<Value, RecvFrameError> {
+        self.control.recv_frame().await
     }
 
     /// As [`recv_frame`](Self::recv_frame), bounded by `timeout`.
-    pub async fn recv_frame_timeout(
-        &mut self,
-        timeout: Duration,
-    ) -> Result<crate::cbor::Value, RecvFrameError> {
-        tokio::time::timeout(timeout, self.recv_frame())
-            .await
-            .unwrap_or(Err(RecvFrameError::Timeout))
+    pub async fn recv_frame_timeout(&mut self, timeout: Duration) -> Result<Value, RecvFrameError> {
+        self.control.recv_frame_timeout(timeout).await
     }
 
-    /// Send a signed CALL for `procedure` and wait for the matching
-    /// RESULT or ERROR, correlated by `call_id`.
-    ///
-    /// **Known v1 limitation:** any frame that arrives before the match
-    /// (e.g. an EVENT from an active SUBSCRIBE) is currently discarded,
-    /// not queued or dispatched elsewhere — correct for a client doing
-    /// one thing at a time on this control stream, not yet correct for
-    /// CALL and PUBLISH/SUBSCRIBE used concurrently. No demultiplexing
-    /// layer exists yet; this is exactly the kind of thing a future
-    /// `event_tx`/dispatcher would fix, not implemented in this pass.
+    /// Send a signed CALL on the control stream and wait for the
+    /// matching RESULT or ERROR — see [`FrameStream::call`].
     pub async fn call(
         &mut self,
         procedure: &str,
         realm: [u8; 32],
-        payload: crate::cbor::Value,
+        payload: Value,
         deadline_ms: i128,
         identity: &KeyPair,
         timeout: Duration,
     ) -> Result<frame::CallResponse, CallError> {
-        let call_id: [u8; 16] = rand::random();
-        let spec = frame::CallSpec::new(
-            call_id,
-            procedure,
-            realm,
-            payload,
-            deadline_ms,
-            identity.node_id(),
-        );
-        let signed = frame::sign(frame::call(&spec), identity);
-        self.send_frame(signed).await.map_err(CallError::Send)?;
-
-        tokio::time::timeout(timeout, self.await_call_response(call_id))
+        self.control
+            .call(procedure, realm, payload, deadline_ms, identity, timeout)
             .await
-            .unwrap_or(Err(CallError::Recv(RecvFrameError::Timeout)))
-    }
-
-    async fn await_call_response(
-        &mut self,
-        call_id: [u8; 16],
-    ) -> Result<frame::CallResponse, CallError> {
-        loop {
-            let value = self.recv_frame().await.map_err(CallError::Recv)?;
-            if frame::frame_call_id(&value) != Some(call_id) {
-                continue; // not ours — see call()'s doc on this limitation
-            }
-            if let Ok(response) = frame::parse_call_response(&value) {
-                return Ok(response);
-            }
-            // Matching call_id but not a result/error shape: keep
-            // waiting rather than erroring, since nothing else in the
-            // protocol is expected to carry this call's id.
-        }
     }
 
     /// Send a signed PUBLISH. Fire-and-forget — no reply is expected on
@@ -370,7 +431,7 @@ impl Session {
         identity: &KeyPair,
     ) -> Result<(), SendFrameError> {
         let signed = frame::sign(frame::publish(spec), identity);
-        self.send_frame(signed).await
+        self.control.send_frame(signed).await
     }
 
     /// Send a signed SUBSCRIBE. Fire-and-forget.
@@ -380,7 +441,7 @@ impl Session {
         identity: &KeyPair,
     ) -> Result<(), SendFrameError> {
         let signed = frame::sign(frame::subscribe(spec), identity);
-        self.send_frame(signed).await
+        self.control.send_frame(signed).await
     }
 
     /// Send a signed UNSUBSCRIBE. Fire-and-forget.
@@ -390,7 +451,7 @@ impl Session {
         identity: &KeyPair,
     ) -> Result<(), SendFrameError> {
         let signed = frame::sign(frame::unsubscribe(spec), identity);
-        self.send_frame(signed).await
+        self.control.send_frame(signed).await
     }
 
     /// Read the next frame and parse it as an EVENT, bounded by
@@ -403,6 +464,7 @@ impl Session {
         timeout: Duration,
     ) -> Result<frame::EventInfo, RecvEventError> {
         let value = self
+            .control
             .recv_frame_timeout(timeout)
             .await
             .map_err(RecvEventError::Recv)?;
@@ -416,9 +478,9 @@ impl Session {
     pub async fn close(mut self, reason: &str, detail: Option<&str>, identity: &KeyPair) {
         let goodbye = frame::sign(frame::goodbye(reason, detail), identity);
         if let Ok(encoded) = frame::encode(&goodbye) {
-            let _ = self.send.write_all(&encoded).await;
+            let _ = self.control.send.write_all(&encoded).await;
         }
-        let _ = self.send.finish();
+        let _ = self.control.send.finish();
         self.connection.close(0u32.into(), reason.as_bytes());
     }
 }
