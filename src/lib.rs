@@ -6,6 +6,7 @@
 //! work, not the ceiling on it — nothing below the eventual FFI binding
 //! layer is mobile-specific.
 
+pub mod bolt4;
 pub mod cbor;
 pub mod cert;
 pub mod connection;

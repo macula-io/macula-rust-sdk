@@ -161,3 +161,125 @@ async fn unhardened_identity_against_the_real_fleet_is_observed_not_assumed() {
         }
     }
 }
+
+/// A real end-to-end CALL/RESULT-or-ERROR round trip. Calls a procedure
+/// name that certainly doesn't exist (`macula_rust_sdk.test_probe`,
+/// under the content sentinel realm) — the point isn't to exercise any
+/// particular procedure, only to prove the wire round trip itself: a
+/// signed CALL sent, and a signed RESULT or ERROR received back,
+/// correlated by call_id, with a real BOLT#4 code if it's an error.
+#[tokio::test]
+#[ignore = "requires network access to a live macula-station"]
+async fn call_round_trip_against_the_real_fleet() {
+    let identity = KeyPair::generate_with_default_puzzle();
+    let mut session = connection::connect(STATION_HOST, STATION_PORT, Trust::WebPki, &identity)
+        .await
+        .expect("handshake should succeed");
+
+    let response = session
+        .call(
+            "macula_rust_sdk.test_probe",
+            [0u8; 32], // the content-sentinel realm, reused here as a harmless default
+            macula_rust_sdk::cbor::Value::Null,
+            (now_ms() + 10_000) as i128,
+            &identity,
+            std::time::Duration::from_secs(10),
+        )
+        .await
+        .expect("should get SOME response (result or a well-formed error), not a timeout");
+
+    match response {
+        macula_rust_sdk::frame::CallResponse::Result {
+            payload,
+            responded_by,
+        } => {
+            println!("OBSERVED: got a RESULT (unexpected for a made-up procedure, but valid): payload={payload:?} responded_by={}", hex::encode(responded_by));
+        }
+        macula_rust_sdk::frame::CallResponse::Error {
+            code,
+            name,
+            reported_by,
+            detail,
+        } => {
+            println!(
+                "OBSERVED: got an ERROR (expected for a nonexistent procedure): code={code} name={name} reported_by={} detail={detail:?}",
+                hex::encode(reported_by)
+            );
+        }
+    }
+
+    session
+        .close("normal", Some("call test done"), &identity)
+        .await;
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock after epoch")
+        .as_millis() as u64
+}
+
+/// A real end-to-end SUBSCRIBE -> PUBLISH -> (maybe) EVENT round trip.
+/// Whether a subscriber receives its own publish is genuinely unknown
+/// going in — this test observes and reports rather than assuming an
+/// answer, same discipline as the unhardened-identity test above.
+#[tokio::test]
+#[ignore = "requires network access to a live macula-station"]
+async fn pubsub_round_trip_against_the_real_fleet() {
+    let identity = KeyPair::generate_with_default_puzzle();
+    let mut session = connection::connect(STATION_HOST, STATION_PORT, Trust::WebPki, &identity)
+        .await
+        .expect("handshake should succeed");
+
+    // A realm+topic scratch value nobody else would collide with.
+    let realm: [u8; 32] = rand::random();
+    let topic = format!(
+        "macula-rust-sdk.test.{}",
+        hex::encode(rand::random::<[u8; 8]>())
+    );
+
+    session
+        .subscribe(
+            &macula_rust_sdk::frame::SubscribeSpec::new(topic.clone(), realm, identity.node_id()),
+            &identity,
+        )
+        .await
+        .expect("SUBSCRIBE should send without error");
+
+    session
+        .publish(
+            &macula_rust_sdk::frame::PublishSpec::new(
+                topic.clone(),
+                realm,
+                identity.node_id(),
+                1,
+                macula_rust_sdk::cbor::Value::text("hello from macula-rust-sdk"),
+                now_ms(),
+            ),
+            &identity,
+        )
+        .await
+        .expect("PUBLISH should send without error");
+
+    match session.recv_event(std::time::Duration::from_secs(5)).await {
+        Ok(event) => {
+            println!(
+                "OBSERVED: received our own EVENT back — topic={} seq={} delivered_via={} payload={:?}",
+                event.topic, event.seq, event.delivered_via, event.payload
+            );
+            assert_eq!(event.topic, topic);
+        }
+        Err(e) => {
+            println!(
+                "OBSERVED: no EVENT arrived within 5s ({e}) — a subscriber may not receive its \
+                 own publish, or delivery may simply be slower than this test waits. Not \
+                 asserted as a failure either way; see this test's doc comment."
+            );
+        }
+    }
+
+    session
+        .close("normal", Some("pubsub test done"), &identity)
+        .await;
+}

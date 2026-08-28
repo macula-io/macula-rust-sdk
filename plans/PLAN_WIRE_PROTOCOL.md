@@ -423,6 +423,22 @@ term), `deadline_ms`, `caller` (32-byte pubkey), optional
 `call_id`, `code` (0-255), `reported_by`, optional `detail`,
 `offending_hop`, `source_route_partial`.
 
+**⚠ `procedure` (and `topic` in §6.8, and `detail` on ERROR/GOODBYE) are
+`binary()` on the wire — a raw byte string (CBOR major 2), NOT text
+(major 3).** Easy to get backwards, since most other string-ish fields
+(`frame_type`, `reason`, `delivered_via`) really are atoms and do encode
+as text. Caught by `macula-rust-sdk`'s own differential-vector tests: a
+hand-built CALL frame using text encoding for `procedure` produced a
+completely different (still validly-formed, silently wrong) signature
+from the reference — see that crate's `src/frame.rs` for the fix and the
+byte-level trace that found it.
+
+**Live-verified, 2026-08-28** (`macula-rust-sdk`'s
+`tests/live_station.rs`): a full CALL/RESULT-or-ERROR round trip against
+`macula-station-frankfurt` — signed CALL out, signed ERROR back
+(`unknown_next_peer`, correctly correlated by `call_id`) for a
+deliberately-nonexistent procedure name.
+
 ### 6.5 HyParView membership overlay (`hyparview_join`,
 `hyparview_forward_join`, `hyparview_neighbor`, `hyparview_disconnect`,
 `hyparview_shuffle`, `hyparview_shuffle_reply`)
@@ -455,6 +471,14 @@ plus `delivered_via` ∈ `plumtree|dht|direct`. A relay station copies
 `publisher_sig` verbatim from PUBLISH onto the EVENT(s) it fans out, so a
 receiving mobile client can verify authenticity against the *original
 publisher*, independent of which station relayed it.
+
+**Live-verified, 2026-08-28** (`macula-rust-sdk`'s
+`tests/live_station.rs`): SUBSCRIBE → PUBLISH → EVENT against
+`macula-station-frankfurt`, answering a question the spec had left open
+— **yes, a subscriber receives its own publish** (`delivered_via =
+"direct"`), essentially instantly on this fleet. Not guaranteed to
+generalize to every delivery path (`plumtree`/`dht` weren't exercised),
+but confirms the direct case works end-to-end, wire format included.
 
 ### 6.9 RPC advertise (`advertise`, `unadvertise`)
 A peer registers itself as the handler for `procedure` under `realm` on

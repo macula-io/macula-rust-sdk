@@ -156,10 +156,18 @@ pub fn connect(spec: &ConnectSpec) -> Value {
 
 fn goodbye_value(reason: &str, detail: Option<&str>, frame_id: [u8; 16], sent_at_ms: u64) -> Value {
     let mut fields = base("goodbye", 0, frame_id, sent_at_ms);
+    // `reason` is an Erlang atom() -> text (major 3). `detail` is
+    // `binary() | undefined` -> a raw byte string (major 2), NOT text —
+    // caught by the CALL/PUBLISH/etc. differential vectors failing on
+    // this exact mistake for their own binary()-typed fields (procedure,
+    // topic). Fixed here too even though no direct GOODBYE vector was
+    // captured, since it's the identical type.
     fields.push((Value::text("reason"), Value::text(reason)));
     fields.push((
         Value::text("detail"),
-        detail.map(Value::text).unwrap_or(Value::Null),
+        detail
+            .map(|d| Value::Bytes(d.as_bytes().to_vec()))
+            .unwrap_or(Value::Null),
     ));
     Value::Map(fields)
 }
@@ -168,6 +176,514 @@ fn goodbye_value(reason: &str, detail: Option<&str>, frame_id: [u8; 16], sent_at
 /// (e.g. `"normal"`); `detail` is an optional human-readable string.
 pub fn goodbye(reason: &str, detail: Option<&str>) -> Value {
     goodbye_value(reason, detail, fresh_frame_id(), current_millis())
+}
+
+// ---------------------------------------------------------------------
+// CALL / RESULT / ERROR
+//
+// ⚠ Overriding a base-envelope sentinel field (`realm`, `call_id`,
+// `source_route` — all `Null` by default from `base()`) MUST use
+// `Value::with_field`, never a raw push onto the field vec. `Value::Map`
+// is a plain `Vec<(Value, Value)>`, not a real map — it has none of
+// Erlang's automatic key-uniqueness, so appending a second `call_id`
+// entry on top of `base()`'s `call_id => Null` would silently produce a
+// wire-invalid map with two `call_id` keys instead of overriding it.
+// Caught during differential-vector generation against the real
+// reference (a hand-built CONNECT test frame subtly differed from
+// `macula_frame:call/1`'s own output the same way, before this was
+// fixed) — see this crate's own commit history, not hypothetical.
+// ---------------------------------------------------------------------
+
+/// Fields for a CALL frame — see `plans/PLAN_WIRE_PROTOCOL.md` §6.4.
+#[derive(Debug, Clone)]
+pub struct CallSpec {
+    pub call_id: [u8; 16],
+    pub procedure: String,
+    pub realm: [u8; 32],
+    pub payload: Value,
+    pub deadline_ms: i128,
+    pub caller: [u8; 32],
+    /// Opaque source-route header bytes (`plans/PLAN_WIRE_PROTOCOL.md`
+    /// §8) — empty for a direct call to one known station, which is the
+    /// only shape this crate builds so far.
+    pub source_route: Vec<u8>,
+    pub retry_budget: u64,
+    pub ucan_token: Vec<u8>,
+}
+
+impl CallSpec {
+    pub fn new(
+        call_id: [u8; 16],
+        procedure: impl Into<String>,
+        realm: [u8; 32],
+        payload: Value,
+        deadline_ms: i128,
+        caller: [u8; 32],
+    ) -> Self {
+        Self {
+            call_id,
+            procedure: procedure.into(),
+            realm,
+            payload,
+            deadline_ms,
+            caller,
+            source_route: Vec::new(),
+            retry_budget: 0,
+            ucan_token: Vec::new(),
+        }
+    }
+}
+
+fn call_value(spec: &CallSpec, frame_id: [u8; 16], sent_at_ms: u64) -> Value {
+    Value::Map(base("call", 0, frame_id, sent_at_ms))
+        .with_field("realm", Value::Bytes(spec.realm.to_vec()))
+        .with_field("call_id", Value::Bytes(spec.call_id.to_vec()))
+        // `procedure := binary()` in the Erlang spec — a raw byte
+        // string (major 2), not text (major 3). Confirmed the hard way:
+        // this was `Value::text(...)` originally and the differential
+        // vector test caught the resulting signature mismatch.
+        .with_field(
+            "procedure",
+            Value::Bytes(spec.procedure.as_bytes().to_vec()),
+        )
+        .with_field("payload", spec.payload.clone())
+        .with_field("deadline_ms", Value::Int(spec.deadline_ms))
+        .with_field("caller", Value::Bytes(spec.caller.to_vec()))
+        .with_field("source_route", Value::Bytes(spec.source_route.clone()))
+        .with_field("retry_budget", Value::Int(spec.retry_budget as i128))
+        .with_field("ucan_token", Value::Bytes(spec.ucan_token.clone()))
+}
+
+/// Build a CALL frame with a fresh `frame_id`/`sent_at_ms`. Unsigned —
+/// pass the result to [`sign`] before sending.
+pub fn call(spec: &CallSpec) -> Value {
+    call_value(spec, fresh_frame_id(), current_millis())
+}
+
+/// Fields for a RESULT frame.
+#[derive(Debug, Clone)]
+pub struct ResultSpec {
+    pub call_id: [u8; 16],
+    pub payload: Value,
+    pub responded_by: [u8; 32],
+    pub source_route_reverse: Vec<u8>,
+}
+
+impl ResultSpec {
+    pub fn new(call_id: [u8; 16], payload: Value, responded_by: [u8; 32]) -> Self {
+        Self {
+            call_id,
+            payload,
+            responded_by,
+            source_route_reverse: Vec::new(),
+        }
+    }
+}
+
+fn result_value(spec: &ResultSpec, frame_id: [u8; 16], sent_at_ms: u64) -> Value {
+    // NOTE: RESULT does not touch the base envelope's `realm` or
+    // `source_route` fields at all — they stay `Null`, matching the
+    // reference exactly (confirmed by inspecting `macula_frame:result/1`'s
+    // own output directly, not assumed from the CALL pattern above).
+    // `source_route_reverse` is a distinct field, not a rename.
+    Value::Map(base("result", 0, frame_id, sent_at_ms))
+        .with_field("call_id", Value::Bytes(spec.call_id.to_vec()))
+        .with_field("payload", spec.payload.clone())
+        .with_field("responded_by", Value::Bytes(spec.responded_by.to_vec()))
+        .with_field(
+            "source_route_reverse",
+            Value::Bytes(spec.source_route_reverse.clone()),
+        )
+}
+
+/// Build a RESULT frame with a fresh `frame_id`/`sent_at_ms`.
+pub fn result(spec: &ResultSpec) -> Value {
+    result_value(spec, fresh_frame_id(), current_millis())
+}
+
+/// Fields for an ERROR frame. `name` is derived from `code` automatically
+/// (matching `macula_frame:call_error/1`'s own `macula_bolt4:name/1`
+/// lookup), not a caller-supplied field.
+#[derive(Debug, Clone)]
+pub struct CallErrorSpec {
+    pub call_id: [u8; 16],
+    pub code: crate::bolt4::Code,
+    pub reported_by: [u8; 32],
+    pub detail: Option<String>,
+    pub offending_hop: Option<[u8; 32]>,
+    pub source_route_partial: Vec<u8>,
+}
+
+impl CallErrorSpec {
+    pub fn new(call_id: [u8; 16], code: crate::bolt4::Code, reported_by: [u8; 32]) -> Self {
+        Self {
+            call_id,
+            code,
+            reported_by,
+            detail: None,
+            offending_hop: None,
+            source_route_partial: Vec::new(),
+        }
+    }
+}
+
+fn call_error_value(spec: &CallErrorSpec, frame_id: [u8; 16], sent_at_ms: u64) -> Value {
+    Value::Map(base("error", 0, frame_id, sent_at_ms))
+        .with_field("call_id", Value::Bytes(spec.call_id.to_vec()))
+        .with_field("code", Value::Int(spec.code.as_u8() as i128))
+        .with_field("name", Value::text(spec.code.name()))
+        .with_field("reported_by", Value::Bytes(spec.reported_by.to_vec()))
+        .with_field(
+            // `detail => binary() | undefined` — bytes, not text. Same
+            // fix as CALL's `procedure` and GOODBYE's `detail`.
+            "detail",
+            spec.detail
+                .as_ref()
+                .map(|d| Value::Bytes(d.as_bytes().to_vec()))
+                .unwrap_or(Value::Null),
+        )
+        .with_field(
+            "offending_hop",
+            spec.offending_hop
+                .map(|h| Value::Bytes(h.to_vec()))
+                .unwrap_or(Value::Null),
+        )
+        .with_field(
+            "source_route_partial",
+            Value::Bytes(spec.source_route_partial.clone()),
+        )
+}
+
+/// Build an ERROR frame with a fresh `frame_id`/`sent_at_ms`.
+pub fn call_error(spec: &CallErrorSpec) -> Value {
+    call_error_value(spec, fresh_frame_id(), current_millis())
+}
+
+/// Parsed fields of a RESULT or ERROR response to a CALL, correlated by
+/// `call_id`. Returned by [`crate::connection::Session::call`].
+#[derive(Debug, Clone)]
+pub enum CallResponse {
+    Result {
+        payload: Value,
+        responded_by: [u8; 32],
+    },
+    Error {
+        code: u8,
+        name: String,
+        reported_by: [u8; 32],
+        detail: Option<String>,
+    },
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum ParseCallResponseError {
+    NotAResultOrError,
+    MissingField(&'static str),
+    WrongFieldType(&'static str),
+}
+
+impl std::fmt::Display for ParseCallResponseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ParseCallResponseError::NotAResultOrError => {
+                write!(f, "frame_type is neither \"result\" nor \"error\"")
+            }
+            ParseCallResponseError::MissingField(name) => {
+                write!(f, "missing required field {name:?}")
+            }
+            ParseCallResponseError::WrongFieldType(name) => {
+                write!(f, "field {name:?} has the wrong type")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ParseCallResponseError {}
+
+/// Extract this frame's `call_id`, regardless of frame type — used to
+/// correlate a RESULT/ERROR back to the CALL that requested it. 16
+/// bytes, matching `call_id() :: <<_:128>>` — NOT 32; caught only by
+/// re-checking against the spec, since the original test for this
+/// function made the identical size mistake and so didn't catch it.
+pub fn frame_call_id(frame: &Value) -> Option<[u8; 16]> {
+    match frame.get("call_id") {
+        Some(Value::Bytes(b)) => b.as_slice().try_into().ok(),
+        _ => None,
+    }
+}
+
+/// Parse a decoded frame as a RESULT or ERROR response to a CALL.
+pub fn parse_call_response(frame: &Value) -> Result<CallResponse, ParseCallResponseError> {
+    match frame.get("frame_type") {
+        Some(Value::Text(t)) if t == "result" => {
+            let payload = frame
+                .get("payload")
+                .cloned()
+                .ok_or(ParseCallResponseError::MissingField("payload"))?;
+            let responded_by = get_bytes32_generic(frame, "responded_by")?;
+            Ok(CallResponse::Result {
+                payload,
+                responded_by,
+            })
+        }
+        Some(Value::Text(t)) if t == "error" => {
+            let code = match frame.get("code") {
+                Some(Value::Int(n)) if (0..=255).contains(n) => *n as u8,
+                Some(_) => return Err(ParseCallResponseError::WrongFieldType("code")),
+                None => return Err(ParseCallResponseError::MissingField("code")),
+            };
+            let name = match frame.get("name") {
+                Some(Value::Text(t)) => t.clone(),
+                Some(_) => return Err(ParseCallResponseError::WrongFieldType("name")),
+                None => return Err(ParseCallResponseError::MissingField("name")),
+            };
+            let reported_by = get_bytes32_generic(frame, "reported_by")?;
+            // `detail` is `binary() | undefined` on the wire (bytes),
+            // not text -- see call_error_value's own comment.
+            let detail = match frame.get("detail") {
+                None | Some(Value::Null) => None,
+                Some(Value::Bytes(b)) => Some(
+                    String::from_utf8(b.clone())
+                        .map_err(|_| ParseCallResponseError::WrongFieldType("detail"))?,
+                ),
+                Some(_) => return Err(ParseCallResponseError::WrongFieldType("detail")),
+            };
+            Ok(CallResponse::Error {
+                code,
+                name,
+                reported_by,
+                detail,
+            })
+        }
+        _ => Err(ParseCallResponseError::NotAResultOrError),
+    }
+}
+
+fn get_bytes32_generic(
+    frame: &Value,
+    field: &'static str,
+) -> Result<[u8; 32], ParseCallResponseError> {
+    match frame.get(field) {
+        None => Err(ParseCallResponseError::MissingField(field)),
+        Some(Value::Bytes(b)) => b
+            .as_slice()
+            .try_into()
+            .map_err(|_| ParseCallResponseError::WrongFieldType(field)),
+        Some(_) => Err(ParseCallResponseError::WrongFieldType(field)),
+    }
+}
+
+// ---------------------------------------------------------------------
+// PUBLISH / SUBSCRIBE / UNSUBSCRIBE / EVENT
+// ---------------------------------------------------------------------
+
+/// Fields for a PUBLISH frame.
+#[derive(Debug, Clone)]
+pub struct PublishSpec {
+    pub topic: String,
+    pub realm: [u8; 32],
+    pub publisher: [u8; 32],
+    pub seq: u64,
+    pub payload: Value,
+    pub published_at_ms: u64,
+    pub ttl_ms: Option<u64>,
+}
+
+impl PublishSpec {
+    pub fn new(
+        topic: impl Into<String>,
+        realm: [u8; 32],
+        publisher: [u8; 32],
+        seq: u64,
+        payload: Value,
+        published_at_ms: u64,
+    ) -> Self {
+        Self {
+            topic: topic.into(),
+            realm,
+            publisher,
+            seq,
+            payload,
+            published_at_ms,
+            ttl_ms: None,
+        }
+    }
+}
+
+fn publish_value(spec: &PublishSpec, frame_id: [u8; 16], sent_at_ms: u64) -> Value {
+    Value::Map(base("publish", 0, frame_id, sent_at_ms))
+        .with_field("realm", Value::Bytes(spec.realm.to_vec()))
+        // `topic := binary()` -- bytes, not text. Same fix as CALL's
+        // `procedure`.
+        .with_field("topic", Value::Bytes(spec.topic.as_bytes().to_vec()))
+        .with_field("publisher", Value::Bytes(spec.publisher.to_vec()))
+        .with_field("seq", Value::Int(spec.seq as i128))
+        .with_field("payload", spec.payload.clone())
+        .with_field("published_at_ms", Value::Int(spec.published_at_ms as i128))
+        .with_field(
+            "ttl_ms",
+            spec.ttl_ms
+                .map(|t| Value::Int(t as i128))
+                .unwrap_or(Value::Null),
+        )
+}
+
+/// Build a PUBLISH frame with a fresh `frame_id`/`sent_at_ms`. Does not
+/// set `publisher_sig` (the separate end-to-end publisher signature,
+/// §4/§6.8 of the spec) — not implemented by this crate yet.
+pub fn publish(spec: &PublishSpec) -> Value {
+    publish_value(spec, fresh_frame_id(), current_millis())
+}
+
+/// Fields for a SUBSCRIBE frame.
+#[derive(Debug, Clone)]
+pub struct SubscribeSpec {
+    pub topic: String,
+    pub realm: [u8; 32],
+    pub subscriber: [u8; 32],
+}
+
+impl SubscribeSpec {
+    pub fn new(topic: impl Into<String>, realm: [u8; 32], subscriber: [u8; 32]) -> Self {
+        Self {
+            topic: topic.into(),
+            realm,
+            subscriber,
+        }
+    }
+}
+
+fn subscribe_value(spec: &SubscribeSpec, frame_id: [u8; 16], sent_at_ms: u64) -> Value {
+    Value::Map(base("subscribe", 0, frame_id, sent_at_ms))
+        .with_field("realm", Value::Bytes(spec.realm.to_vec()))
+        // `topic := binary()` -- bytes, not text. Same fix as CALL's
+        // `procedure`.
+        .with_field("topic", Value::Bytes(spec.topic.as_bytes().to_vec()))
+        .with_field("subscriber", Value::Bytes(spec.subscriber.to_vec()))
+        .with_field("filter", Value::Null)
+        .with_field("options", Value::Map(vec![]))
+}
+
+/// Build a SUBSCRIBE frame with a fresh `frame_id`/`sent_at_ms`. No
+/// filter, no options — the plainest possible subscription.
+pub fn subscribe(spec: &SubscribeSpec) -> Value {
+    subscribe_value(spec, fresh_frame_id(), current_millis())
+}
+
+/// Fields for an UNSUBSCRIBE frame.
+#[derive(Debug, Clone)]
+pub struct UnsubscribeSpec {
+    pub topic: String,
+    pub realm: [u8; 32],
+    pub subscriber: [u8; 32],
+}
+
+impl UnsubscribeSpec {
+    pub fn new(topic: impl Into<String>, realm: [u8; 32], subscriber: [u8; 32]) -> Self {
+        Self {
+            topic: topic.into(),
+            realm,
+            subscriber,
+        }
+    }
+}
+
+fn unsubscribe_value(spec: &UnsubscribeSpec, frame_id: [u8; 16], sent_at_ms: u64) -> Value {
+    Value::Map(base("unsubscribe", 0, frame_id, sent_at_ms))
+        .with_field("realm", Value::Bytes(spec.realm.to_vec()))
+        // `topic := binary()` -- bytes, not text. Same fix as CALL's
+        // `procedure`.
+        .with_field("topic", Value::Bytes(spec.topic.as_bytes().to_vec()))
+        .with_field("subscriber", Value::Bytes(spec.subscriber.to_vec()))
+}
+
+/// Build an UNSUBSCRIBE frame with a fresh `frame_id`/`sent_at_ms`.
+pub fn unsubscribe(spec: &UnsubscribeSpec) -> Value {
+    unsubscribe_value(spec, fresh_frame_id(), current_millis())
+}
+
+/// What a subscriber actually receives — parsed fields of an EVENT frame.
+#[derive(Debug, Clone)]
+pub struct EventInfo {
+    pub topic: String,
+    pub realm: [u8; 32],
+    pub publisher: [u8; 32],
+    pub seq: u64,
+    pub payload: Value,
+    pub delivered_via: String,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum ParseEventError {
+    NotAnEventFrame,
+    MissingField(&'static str),
+    WrongFieldType(&'static str),
+}
+
+impl std::fmt::Display for ParseEventError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ParseEventError::NotAnEventFrame => write!(f, "frame_type is not \"event\""),
+            ParseEventError::MissingField(name) => write!(f, "missing required field {name:?}"),
+            ParseEventError::WrongFieldType(name) => write!(f, "field {name:?} has the wrong type"),
+        }
+    }
+}
+
+impl std::error::Error for ParseEventError {}
+
+/// Parse a decoded frame as an EVENT.
+pub fn parse_event(frame: &Value) -> Result<EventInfo, ParseEventError> {
+    match frame.get("frame_type") {
+        Some(Value::Text(t)) if t == "event" => {}
+        _ => return Err(ParseEventError::NotAnEventFrame),
+    }
+    // `topic := binary()` on the wire -- bytes, not text.
+    let topic = match frame.get("topic") {
+        Some(Value::Bytes(b)) => {
+            String::from_utf8(b.clone()).map_err(|_| ParseEventError::WrongFieldType("topic"))?
+        }
+        Some(_) => return Err(ParseEventError::WrongFieldType("topic")),
+        None => return Err(ParseEventError::MissingField("topic")),
+    };
+    let realm = match frame.get("realm") {
+        Some(Value::Bytes(b)) => b
+            .as_slice()
+            .try_into()
+            .map_err(|_| ParseEventError::WrongFieldType("realm"))?,
+        Some(_) => return Err(ParseEventError::WrongFieldType("realm")),
+        None => return Err(ParseEventError::MissingField("realm")),
+    };
+    let publisher = match frame.get("publisher") {
+        Some(Value::Bytes(b)) => b
+            .as_slice()
+            .try_into()
+            .map_err(|_| ParseEventError::WrongFieldType("publisher"))?,
+        Some(_) => return Err(ParseEventError::WrongFieldType("publisher")),
+        None => return Err(ParseEventError::MissingField("publisher")),
+    };
+    let seq = match frame.get("seq") {
+        Some(Value::Int(n)) if *n >= 0 => *n as u64,
+        Some(_) => return Err(ParseEventError::WrongFieldType("seq")),
+        None => return Err(ParseEventError::MissingField("seq")),
+    };
+    let payload = frame
+        .get("payload")
+        .cloned()
+        .ok_or(ParseEventError::MissingField("payload"))?;
+    let delivered_via = match frame.get("delivered_via") {
+        Some(Value::Text(t)) => t.clone(),
+        Some(_) => return Err(ParseEventError::WrongFieldType("delivered_via")),
+        None => return Err(ParseEventError::MissingField("delivered_via")),
+    };
+    Ok(EventInfo {
+        topic,
+        realm,
+        publisher,
+        seq,
+        payload,
+        delivered_via,
+    })
 }
 
 // ---------------------------------------------------------------------
@@ -536,7 +1052,7 @@ mod tests {
         let frame = goodbye("normal", Some("bye"));
         assert_eq!(frame.get("frame_type"), Some(&Value::text("goodbye")));
         assert_eq!(frame.get("reason"), Some(&Value::text("normal")));
-        assert_eq!(frame.get("detail"), Some(&Value::text("bye")));
+        assert_eq!(frame.get("detail"), Some(&Value::Bytes(b"bye".to_vec())));
     }
 
     #[test]
@@ -584,5 +1100,262 @@ mod tests {
             parse_hello(&frame),
             Err(ParseHelloError::MissingField("node_id"))
         );
+    }
+
+    // -------------------------------------------------------------
+    // Differential vectors for CALL/RESULT/ERROR/PUBLISH/SUBSCRIBE/
+    // UNSUBSCRIBE/EVENT — same method and same identity as the CONNECT
+    // vector above: built with fixed frame_id/sent_at_ms in a real
+    // `rebar3 shell`, exact encoded bytes (including the Ed25519
+    // signature) asserted to match. The CALL vector specifically caught
+    // a real discrepancy on the first attempt — a hand-built test frame
+    // that assumed `source_route` stayed `null` like other optional
+    // fields, when the real constructor always sets it to an empty
+    // binary — fixed before this test was written, not after.
+    // -------------------------------------------------------------
+
+    const VECTOR_CALL_ID: &str = "AABBCCDDEEFF00112233445566778899";
+    const VECTOR_ZERO_REALM: [u8; 32] = [0u8; 32];
+
+    fn vector_identity() -> KeyPair {
+        KeyPair::from_seed_bytes(fixed_array(VECTOR_PRIV))
+    }
+
+    fn vector_call_id() -> [u8; 16] {
+        hex_bytes(VECTOR_CALL_ID).try_into().expect("16 bytes")
+    }
+
+    fn vector_frame_id() -> [u8; 16] {
+        hex_bytes(VECTOR_FRAME_ID).try_into().expect("16 bytes")
+    }
+
+    #[test]
+    fn call_frame_matches_the_reference_byte_for_byte() {
+        let pub_bytes = fixed_array(VECTOR_PUB);
+        let identity = vector_identity();
+        let spec = CallSpec::new(
+            vector_call_id(),
+            "_content.get_manifest",
+            VECTOR_ZERO_REALM,
+            Value::Map(vec![(Value::text("hello"), Value::text("world"))]),
+            1_700_000_030_000,
+            pub_bytes,
+        );
+        let signed = sign(
+            call_value(&spec, vector_frame_id(), VECTOR_SENT_AT_MS),
+            &identity,
+        );
+        let sig = match signed.get("signature") {
+            Some(Value::Bytes(b)) => b.clone(),
+            other => panic!("expected a signature field, got {other:?}"),
+        };
+        assert_eq!(
+            hex::encode_upper(&sig),
+            "A6BC174F0241E644F634702C08781C8FC8BD3CDE3CA9650DE8A731A01203D9B9403A2CAD75800F7B8C9AAE16FA146B1195FF03F0E6DC4595A652D7F29BFE350A"
+        );
+        let encoded = encode(&signed).expect("encodable frame");
+        assert_eq!(encoded.len(), 386);
+    }
+
+    #[test]
+    fn result_frame_matches_the_reference_byte_for_byte() {
+        let pub_bytes = fixed_array(VECTOR_PUB);
+        let identity = vector_identity();
+        let spec = ResultSpec::new(vector_call_id(), Value::text("ok-result"), pub_bytes);
+        let signed = sign(
+            result_value(&spec, vector_frame_id(), VECTOR_SENT_AT_MS),
+            &identity,
+        );
+        let sig = match signed.get("signature") {
+            Some(Value::Bytes(b)) => b.clone(),
+            other => panic!("expected a signature field, got {other:?}"),
+        };
+        assert_eq!(
+            hex::encode_upper(&sig),
+            "03E8F72D51D958C318B7F1C25D78408408317DEAB23434D6EA32F211CADEA1C62900DA15AFF603E795B19A388D382BDB10E65AEFC6F0CE551270AB172A88E50B"
+        );
+        assert_eq!(encode(&signed).expect("encodable").len(), 301);
+    }
+
+    #[test]
+    fn error_frame_matches_the_reference_byte_for_byte() {
+        let pub_bytes = fixed_array(VECTOR_PUB);
+        let identity = vector_identity();
+        let spec = CallErrorSpec::new(
+            vector_call_id(),
+            crate::bolt4::Code::UnknownNextPeer,
+            pub_bytes,
+        );
+        let signed = sign(
+            call_error_value(&spec, vector_frame_id(), VECTOR_SENT_AT_MS),
+            &identity,
+        );
+        let sig = match signed.get("signature") {
+            Some(Value::Bytes(b)) => b.clone(),
+            other => panic!("expected a signature field, got {other:?}"),
+        };
+        assert_eq!(
+            hex::encode_upper(&sig),
+            "182ECD5217CE378F576635B23CC8C9F265555142845D6CBA033A282BAED97966C23FBE91D08507FB8E840375AA17665763804F40F89102F8D3EDAD4DA98FC20D"
+        );
+        assert_eq!(encode(&signed).expect("encodable").len(), 333);
+    }
+
+    #[test]
+    fn publish_frame_matches_the_reference_byte_for_byte() {
+        let pub_bytes = fixed_array(VECTOR_PUB);
+        let identity = vector_identity();
+        let spec = PublishSpec::new(
+            "test.topic",
+            VECTOR_ZERO_REALM,
+            pub_bytes,
+            42,
+            Value::text("published-data"),
+            VECTOR_SENT_AT_MS,
+        );
+        let signed = sign(
+            publish_value(&spec, vector_frame_id(), VECTOR_SENT_AT_MS),
+            &identity,
+        );
+        let sig = match signed.get("signature") {
+            Some(Value::Bytes(b)) => b.clone(),
+            other => panic!("expected a signature field, got {other:?}"),
+        };
+        assert_eq!(
+            hex::encode_upper(&sig),
+            "DD49D10EFA9F2EED0A393DC02DC5BBAC25D6731562EA39F5AB2E5337824527AFFBC7D917AF4DE5EFDBE5BC41E58659E05EC6FDE4E91FB1A32CC9C211456DF10C"
+        );
+        assert_eq!(encode(&signed).expect("encodable").len(), 355);
+    }
+
+    #[test]
+    fn subscribe_frame_matches_the_reference_byte_for_byte() {
+        let pub_bytes = fixed_array(VECTOR_PUB);
+        let identity = vector_identity();
+        let spec = SubscribeSpec::new("test.topic", VECTOR_ZERO_REALM, pub_bytes);
+        let signed = sign(
+            subscribe_value(&spec, vector_frame_id(), VECTOR_SENT_AT_MS),
+            &identity,
+        );
+        let sig = match signed.get("signature") {
+            Some(Value::Bytes(b)) => b.clone(),
+            other => panic!("expected a signature field, got {other:?}"),
+        };
+        assert_eq!(
+            hex::encode_upper(&sig),
+            "ABDD7304B887A53B149CE4D4C62F1AFD20AE07D8612B76F22006FA6676B8DDB37C1D5106358D32080246BA4355A9E04BF49F73600E752F5F9037D7A93A47020A"
+        );
+        assert_eq!(encode(&signed).expect("encodable").len(), 313);
+    }
+
+    #[test]
+    fn unsubscribe_frame_matches_the_reference_byte_for_byte() {
+        let pub_bytes = fixed_array(VECTOR_PUB);
+        let identity = vector_identity();
+        let spec = UnsubscribeSpec::new("test.topic", VECTOR_ZERO_REALM, pub_bytes);
+        let signed = sign(
+            unsubscribe_value(&spec, vector_frame_id(), VECTOR_SENT_AT_MS),
+            &identity,
+        );
+        let sig = match signed.get("signature") {
+            Some(Value::Bytes(b)) => b.clone(),
+            other => panic!("expected a signature field, got {other:?}"),
+        };
+        assert_eq!(
+            hex::encode_upper(&sig),
+            "C917068BE4E1C5A3C753F249037DD8F44293D888BB252BF1E828671969547969982160C91A0E3CA1C31DE29ED39E3677E7F20F4BDE61539D4618B3703018E403"
+        );
+        assert_eq!(encode(&signed).expect("encodable").len(), 298);
+    }
+
+    #[test]
+    fn event_frame_matches_the_reference_byte_for_byte() {
+        let pub_bytes = fixed_array(VECTOR_PUB);
+        let identity = vector_identity();
+        let fields = base("event", 0, vector_frame_id(), VECTOR_SENT_AT_MS);
+        let unsigned = Value::Map(fields)
+            .with_field("realm", Value::Bytes(VECTOR_ZERO_REALM.to_vec()))
+            .with_field("topic", Value::Bytes(b"test.topic".to_vec()))
+            .with_field("publisher", Value::Bytes(pub_bytes.to_vec()))
+            .with_field("seq", Value::Int(42))
+            .with_field("payload", Value::text("published-data"))
+            .with_field("delivered_via", Value::text("direct"));
+        let signed = sign(unsigned, &identity);
+        let sig = match signed.get("signature") {
+            Some(Value::Bytes(b)) => b.clone(),
+            other => panic!("expected a signature field, got {other:?}"),
+        };
+        assert_eq!(
+            hex::encode_upper(&sig),
+            "9B9EE4EAC375FBD0C9B5A5BC6D82E35739F8ECBF594979891BF35E5BDB53A148B3936AF99217C3D8C12E2EEA0686F68D5FE63284BE6B142F87BFF319DDDB780F"
+        );
+        assert_eq!(encode(&signed).expect("encodable").len(), 341);
+
+        // Round-trip through parse_event too, since EVENT (unlike the
+        // others above) has a real parser a receiving client uses.
+        let decoded = decode(&encode(&signed).unwrap()).unwrap();
+        let Decoded::Frame(value, _) = decoded else {
+            panic!("expected a complete frame")
+        };
+        let info = parse_event(&value).expect("well-formed event");
+        assert_eq!(info.topic, "test.topic");
+        assert_eq!(info.seq, 42);
+        assert_eq!(info.delivered_via, "direct");
+    }
+
+    #[test]
+    fn parse_call_response_reads_a_result() {
+        let frame = Value::Map(vec![
+            (Value::text("frame_type"), Value::text("result")),
+            (Value::text("call_id"), Value::Bytes(vec![1; 16])),
+            (Value::text("payload"), Value::text("ok")),
+            (Value::text("responded_by"), Value::Bytes(vec![2; 32])),
+        ]);
+        match parse_call_response(&frame).expect("well-formed result") {
+            CallResponse::Result {
+                payload,
+                responded_by,
+            } => {
+                assert_eq!(payload, Value::text("ok"));
+                assert_eq!(responded_by, [2u8; 32]);
+            }
+            other => panic!("expected Result, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_call_response_reads_an_error() {
+        let frame = Value::Map(vec![
+            (Value::text("frame_type"), Value::text("error")),
+            (Value::text("call_id"), Value::Bytes(vec![1; 16])),
+            (Value::text("code"), Value::Int(1)),
+            (Value::text("name"), Value::text("unknown_next_peer")),
+            (Value::text("reported_by"), Value::Bytes(vec![2; 32])),
+            (Value::text("detail"), Value::Null),
+        ]);
+        match parse_call_response(&frame).expect("well-formed error") {
+            CallResponse::Error {
+                code,
+                name,
+                reported_by,
+                detail,
+            } => {
+                assert_eq!(code, 1);
+                assert_eq!(name, "unknown_next_peer");
+                assert_eq!(reported_by, [2u8; 32]);
+                assert_eq!(detail, None);
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn frame_call_id_reads_from_any_frame_type() {
+        let frame = Value::Map(vec![(Value::text("call_id"), Value::Bytes(vec![9; 16]))]);
+        assert_eq!(frame_call_id(&frame), Some([9u8; 16]));
+        // A 32-byte value (e.g. a pubkey accidentally in this field) must
+        // NOT be accepted as a 16-byte call_id.
+        let wrong_size = Value::Map(vec![(Value::text("call_id"), Value::Bytes(vec![9; 32]))]);
+        assert_eq!(frame_call_id(&wrong_size), None);
     }
 }
