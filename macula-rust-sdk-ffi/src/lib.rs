@@ -8,11 +8,11 @@
 //! keeps `macula-rust-sdk` itself just as usable from plain Rust, a CLI,
 //! or WASM as it was before this crate existed.
 //!
-//! **First slice only — proves the pipeline, not full coverage.**
-//! Identity generation, CONNECT/HELLO, and CALL/RESULT/ERROR. Not yet
-//! exposed: PUBLISH/SUBSCRIBE/EVENT, content transfer, streaming RPC —
-//! all already built and live-verified in the core crate
-//! (`plans/PLAN_WIRE_PROTOCOL.md`), just not wrapped here yet.
+//! **Growing, not complete.** Identity generation, CONNECT/HELLO,
+//! CALL/RESULT/ERROR, and PUBLISH/SUBSCRIBE/EVENT are wrapped. Not yet
+//! exposed: content transfer, streaming RPC — both already built and
+//! live-verified in the core crate (`plans/PLAN_WIRE_PROTOCOL.md`), just
+//! not wrapped here yet.
 //!
 //! [`FfiValue`] covers `Null`/`Int`/`Bytes`/`Text`/`Float` — the
 //! variants [`macula_rust_sdk::cbor::Value`] itself has, MINUS
@@ -45,12 +45,27 @@ pub enum FfiError {
     Connect { reason: String },
     #[error("the call failed: {reason}")]
     Call { reason: String },
+    #[error("sending a frame failed: {reason}")]
+    Send { reason: String },
+    #[error("receiving failed: {reason}")]
+    Recv { reason: String },
     #[error("a value could not cross the FFI boundary: {reason}")]
     UnrepresentableValue { reason: String },
     #[error("expected exactly 32 bytes, got {len}")]
     WrongByteLength { len: u32 },
     #[error("this session is already closed")]
     Closed,
+}
+
+/// `Vec<u8>` -> `[u8; 32]`, with the length actually reported on
+/// mismatch — UniFFI has no fixed-size byte array type, so every 32-byte
+/// field (`realm`, node ids) crosses the boundary as `Vec<u8>` and gets
+/// validated here.
+fn to_32(bytes: Vec<u8>) -> Result<[u8; 32], FfiError> {
+    let len = bytes.len() as u32;
+    bytes
+        .try_into()
+        .map_err(|_| FfiError::WrongByteLength { len })
 }
 
 /// A restricted mirror of [`macula_rust_sdk::cbor::Value`] — see this
@@ -148,6 +163,33 @@ impl TryFrom<macula_rust_sdk::frame::CallResponse> for FfiCallResponse {
     }
 }
 
+/// What a subscriber receives: a mirror of
+/// [`macula_rust_sdk::frame::EventInfo`].
+#[derive(uniffi::Record, Debug, Clone)]
+pub struct FfiEvent {
+    pub topic: String,
+    pub realm: Vec<u8>,
+    pub publisher: Vec<u8>,
+    pub seq: u64,
+    pub payload: FfiValue,
+    pub delivered_via: String,
+}
+
+impl TryFrom<macula_rust_sdk::frame::EventInfo> for FfiEvent {
+    type Error = FfiError;
+
+    fn try_from(e: macula_rust_sdk::frame::EventInfo) -> Result<Self, FfiError> {
+        Ok(FfiEvent {
+            topic: e.topic,
+            realm: e.realm.to_vec(),
+            publisher: e.publisher.to_vec(),
+            seq: e.seq,
+            payload: FfiValue::try_from(e.payload)?,
+            delivered_via: e.delivered_via,
+        })
+    }
+}
+
 /// An Ed25519 identity, puzzle-hardened by construction — see
 /// [`macula_rust_sdk::identity::KeyPair::generate_with_default_puzzle`]'s
 /// own doc for why this is always the right default despite its (small,
@@ -209,10 +251,7 @@ impl FfiSession {
         timeout_ms: u64,
         identity: &FfiKeyPair,
     ) -> Result<FfiCallResponse, FfiError> {
-        let realm_len = realm.len() as u32;
-        let realm: [u8; 32] = realm
-            .try_into()
-            .map_err(|_| FfiError::WrongByteLength { len: realm_len })?;
+        let realm = to_32(realm)?;
         let deadline_ms = (now_ms() + timeout_ms) as i128;
 
         let mut guard = self.0.lock().await;
@@ -231,6 +270,100 @@ impl FfiSession {
                 reason: e.to_string(),
             })?;
         FfiCallResponse::try_from(response)
+    }
+
+    /// Send a signed PUBLISH. Fire-and-forget — no reply is expected on
+    /// the wire; a subscriber (this session included, if subscribed to
+    /// the same topic/realm) receives it asynchronously via
+    /// [`recv_event`](Self::recv_event).
+    ///
+    /// `seq` and `published_at_ms` are caller-supplied rather than
+    /// tracked internally — unlike streaming RPC's per-stream counter,
+    /// PUBLISH's `seq` is a per-publisher, per-topic sequence the mesh
+    /// uses for gap detection, and a client publishing to several topics
+    /// has to own that bookkeeping itself; this crate doesn't
+    /// second-guess it.
+    pub async fn publish(
+        &self,
+        topic: String,
+        realm: Vec<u8>,
+        seq: u64,
+        payload: FfiValue,
+        published_at_ms: u64,
+        identity: &FfiKeyPair,
+    ) -> Result<(), FfiError> {
+        let realm = to_32(realm)?;
+        let spec = macula_rust_sdk::frame::PublishSpec::new(
+            topic,
+            realm,
+            identity.0.node_id(),
+            seq,
+            payload.into(),
+            published_at_ms,
+        );
+        let mut guard = self.0.lock().await;
+        let session = guard.as_mut().ok_or(FfiError::Closed)?;
+        session
+            .publish(&spec, &identity.0)
+            .await
+            .map_err(|e| FfiError::Send {
+                reason: e.to_string(),
+            })
+    }
+
+    /// Send a signed SUBSCRIBE. Fire-and-forget — deliveries arrive via
+    /// [`recv_event`](Self::recv_event).
+    pub async fn subscribe(
+        &self,
+        topic: String,
+        realm: Vec<u8>,
+        identity: &FfiKeyPair,
+    ) -> Result<(), FfiError> {
+        let realm = to_32(realm)?;
+        let spec = macula_rust_sdk::frame::SubscribeSpec::new(topic, realm, identity.0.node_id());
+        let mut guard = self.0.lock().await;
+        let session = guard.as_mut().ok_or(FfiError::Closed)?;
+        session
+            .subscribe(&spec, &identity.0)
+            .await
+            .map_err(|e| FfiError::Send {
+                reason: e.to_string(),
+            })
+    }
+
+    /// Send a signed UNSUBSCRIBE. Fire-and-forget.
+    pub async fn unsubscribe(
+        &self,
+        topic: String,
+        realm: Vec<u8>,
+        identity: &FfiKeyPair,
+    ) -> Result<(), FfiError> {
+        let realm = to_32(realm)?;
+        let spec = macula_rust_sdk::frame::UnsubscribeSpec::new(topic, realm, identity.0.node_id());
+        let mut guard = self.0.lock().await;
+        let session = guard.as_mut().ok_or(FfiError::Closed)?;
+        session
+            .unsubscribe(&spec, &identity.0)
+            .await
+            .map_err(|e| FfiError::Send {
+                reason: e.to_string(),
+            })
+    }
+
+    /// Block for the next EVENT delivery, bounded by `timeout_ms`. Any
+    /// non-EVENT frame received first is an error, not silently skipped
+    /// — matches [`macula_rust_sdk::connection::Session::recv_event`]'s
+    /// own contract.
+    pub async fn recv_event(&self, timeout_ms: u64) -> Result<FfiEvent, FfiError> {
+        let mut guard = self.0.lock().await;
+        let session = guard.as_mut().ok_or(FfiError::Closed)?;
+        let event = session
+            .recv_event(std::time::Duration::from_millis(timeout_ms))
+            .await
+            .map_err(|e| FfiError::Recv {
+                reason: e.to_string(),
+            })?;
+        FfiEvent::try_from(event)
     }
 
     /// Close the session with a GOODBYE frame. A no-op if already closed.
