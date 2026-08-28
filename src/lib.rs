@@ -14,4 +14,5 @@ pub mod content;
 pub mod frame;
 pub mod identity;
 pub mod manifest;
+pub mod stream;
 pub mod transport;

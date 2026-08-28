@@ -390,3 +390,74 @@ async fn get_of_an_unknown_block_reports_not_found_against_the_real_fleet() {
         .close("normal", Some("content not-found test done"), &identity)
         .await;
 }
+
+/// A real STREAM_OPEN round trip against a deliberately nonexistent
+/// procedure — same spirit as `call_round_trip_against_the_real_fleet`:
+/// there's no known streaming procedure registered anywhere on this
+/// fleet to exercise a genuine data exchange against (streaming
+/// consumers like hecate-tube are separate app-level services, not part
+/// of macula-station itself — see `plans/PLAN_WIRE_PROTOCOL.md` §13.4),
+/// so this proves the wire mechanics — opening a dedicated stream,
+/// sending a signed STREAM_OPEN, a chunk, a half-close, and awaiting
+/// whatever the station does with an unknown procedure — rather than a
+/// specific procedure's behavior.
+///
+/// **Empirical finding, 2026-08-28:** the station DOES actively validate
+/// streaming procedures, symmetric to CALL. It replied with a real
+/// STREAM_ERROR — `unknown_next_peer` / "procedure not advertised" —
+/// which `StreamHandle::await_reply` correctly surfaced as
+/// `RecvStreamError::PeerAborted`, round-tripping through
+/// `frame::parse_stream_event`'s STREAM_ERROR branch on the very first
+/// live run. Still printed as OBSERVED rather than asserted: this test
+/// exists to prove the wire mechanics work at all, not to pin the
+/// station's procedure-validation behavior as a contract this crate
+/// depends on.
+#[tokio::test]
+#[ignore = "requires network access to a live macula-station"]
+async fn stream_open_round_trip_against_the_real_fleet() {
+    let identity = KeyPair::generate_with_default_puzzle();
+    let mut session = connection::connect(STATION_HOST, STATION_PORT, Trust::WebPki, &identity)
+        .await
+        .expect("handshake should succeed");
+
+    let mut handle = macula_rust_sdk::stream::StreamHandle::open(
+        &mut session,
+        "macula_rust_sdk.test_stream",
+        [0u8; 32],
+        macula_rust_sdk::frame::StreamMode::ClientStream,
+        macula_rust_sdk::cbor::Value::Null,
+        (now_ms() + 10_000) as i128,
+        &identity,
+    )
+    .await
+    .expect("opening a dedicated stream and sending STREAM_OPEN should succeed");
+
+    handle
+        .send_data(
+            macula_rust_sdk::frame::StreamEncoding::Raw,
+            macula_rust_sdk::cbor::Value::Bytes(b"hello from macula-rust-sdk".to_vec()),
+            &identity,
+        )
+        .await
+        .expect("sending a chunk should succeed");
+    handle
+        .close_send(&identity)
+        .await
+        .expect("half-closing should succeed");
+
+    match handle.await_reply(std::time::Duration::from_secs(5)).await {
+        Ok((payload, responded_by)) => {
+            println!(
+                "OBSERVED: got a STREAM_REPLY (unexpected for a made-up procedure, but valid): payload={payload:?} responded_by={}",
+                hex::encode(responded_by)
+            );
+        }
+        Err(e) => {
+            println!("OBSERVED: no reply within 5s, as: {e}");
+        }
+    }
+
+    session
+        .close("normal", Some("stream test done"), &identity)
+        .await;
+}
