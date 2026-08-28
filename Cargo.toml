@@ -1,0 +1,24 @@
+[package]
+name = "macula-rust-sdk"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+authors = ["Macula <raf.lefever@erlef.org>"]
+description = "Rust port of macula's SDK (client/leaf) wire protocol — mobile first, not mobile-only. See plans/PLAN_WIRE_PROTOCOL.md."
+license = "Apache-2.0 OR MIT"
+repository = "https://github.com/macula-io/macula-rust-sdk"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+
+[dependencies]
+ed25519-dalek = { version = "2.1", features = ["rand_core"] }
+rand = "0.8"
+sha2 = "0.10"
+
+[dev-dependencies]
+hex = "0.4"
+tempfile = "3"
