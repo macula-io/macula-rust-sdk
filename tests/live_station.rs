@@ -31,6 +31,15 @@ use macula_rust_sdk::transport::{connect, Trust};
 const STATION_HOST: &str = "station-de-frankfurt.macula.io";
 const STATION_PORT: u16 = 4433;
 
+/// `stations-linode-toronto`, provisioned 2026-08-29 specifically to have a
+/// fleet member with no DNS entry and no CA-issued cert -- see
+/// `macula-demo/infrastructure/stations-linode-toronto/`. Dialed by its bare
+/// `host_advertised` IPv6 literal, never a hostname.
+const TORONTO_HOST: &str = "2600:3c04::2000:f0ff:feb9:e155";
+const TORONTO_PORT: u16 = 4433;
+const TORONTO_NODE_ID_HEX: &str =
+    "5748e81d89a6ea4b619fecda394ffac9f8f58a05d7a7234034783b6e1fd043d5";
+
 /// Probe: dial with verification skipped, and report exactly what the
 /// station presents (cert count, and its Ed25519 pubkey if the leaf is
 /// Ed25519) — informational, not asserting a specific pubkey, since
@@ -809,5 +818,51 @@ async fn unary_call_provider_reports_unknown_next_peer_on_lookup_miss_against_th
             Some("unary caller miss test done"),
             &caller_identity,
         )
+        .await;
+}
+
+/// **First-ever live test of `Trust::Pinned` against a real station.**
+/// Every other test in this file dials `station-de-frankfurt.macula.io`
+/// under `Trust::WebPki`, because that's the only trust mode Frankfurt's
+/// CA-issued cert can satisfy -- `Trust::Pinned` had unit coverage only
+/// (`src/cert.rs`, a synthetic cert), never a real handshake. Toronto
+/// exists specifically to close that gap: no DNS entry, no CA cert, dialed
+/// by its bare `host_advertised` IPv6 literal and validated by pinning its
+/// known Ed25519 NodeId instead of a certificate chain -- exactly the
+/// "station without public DNS/CA-issued TLS" mode `Trust::Pinned`'s own
+/// doc comment describes as the normal case for a mobile client dialing a
+/// known station.
+#[tokio::test]
+#[ignore = "requires network access to a live macula-station"]
+async fn pinned_trust_full_handshake_succeeds_against_toronto() {
+    let node_id: [u8; 32] = hex::decode(TORONTO_NODE_ID_HEX)
+        .expect("valid hex")
+        .try_into()
+        .expect("32 bytes");
+    let identity = KeyPair::generate_with_default_puzzle();
+
+    let session = connection::connect(
+        TORONTO_HOST,
+        TORONTO_PORT,
+        Trust::Pinned(node_id),
+        &identity,
+    )
+    .await
+    .expect("Pinned-trust CONNECT/HELLO handshake should succeed against a live no-DNS station");
+
+    println!(
+        "handshake accepted: remote={} station_node_id={} negotiated_capabilities={}",
+        session.remote_address(),
+        hex::encode(session.station.node_id),
+        session.station.negotiated_capabilities,
+    );
+    assert!(session.station.accepted);
+    assert_eq!(
+        session.station.node_id, node_id,
+        "the station's own reported node_id should match the one we pinned"
+    );
+
+    session
+        .close("normal", Some("pinned trust test done"), &identity)
         .await;
 }
