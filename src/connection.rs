@@ -461,16 +461,26 @@ impl Session {
             .await
     }
 
-    /// Send a signed PUBLISH. Fire-and-forget — no reply is expected on
-    /// the wire; a subscriber (this session included, if subscribed to
-    /// the same topic/realm) receives an EVENT asynchronously, read via
-    /// [`recv_frame`](Self::recv_frame) / [`recv_event`](Self::recv_event).
+    /// Send a signed PUBLISH, carrying the end-to-end `publisher_sig`
+    /// (over topic/realm/publisher/seq/payload, independent of frame
+    /// type) so the resulting EVENT survives being relayed beyond one
+    /// hop — a station verifies an EVENT's per-hop `signature` against
+    /// whichever station forwarded it, which only matches on hop 1;
+    /// every hop after that needs `publisher_sig` instead. Matches the
+    /// Erlang reference SDK's own default (`pubsub_emit_publisher_sig`,
+    /// true since macula 4.6.0). Fire-and-forget — no reply is expected
+    /// on the wire; a subscriber (this session included, if subscribed
+    /// to the same topic/realm) receives an EVENT asynchronously, read
+    /// via [`recv_frame`](Self::recv_frame) /
+    /// [`recv_event`](Self::recv_event).
     pub async fn publish(
         &mut self,
         spec: &frame::PublishSpec,
         identity: &KeyPair,
     ) -> Result<(), SendFrameError> {
-        let signed = frame::sign(frame::publish(spec), identity);
+        let unsigned = frame::publish(spec);
+        let with_publisher_sig = frame::sign_publisher(unsigned, identity);
+        let signed = frame::sign(with_publisher_sig, identity);
         self.control.send_frame(signed).await
     }
 
@@ -608,16 +618,42 @@ impl Session {
         }
     }
 
+    /// Bounds how long [`close`](Self::close) waits after its last write
+    /// before hard-closing the connection -- see that method's own doc
+    /// for why this exists at all. Short relative to the Erlang
+    /// reference's own 5s draining-state upper bound
+    /// (`macula_peering.erl`, `?DRAIN_TIMEOUT_MS`): this side only needs
+    /// to cover quinn's own internal send-scheduling latency, not a full
+    /// round trip's worth of protocol drain.
+    const CLOSE_DRAIN: Duration = Duration::from_millis(250);
+
     /// Close the control stream and connection gracefully with a GOODBYE
     /// frame, matching `macula_peering_conn.erl`'s `connected -> draining`
-    /// transition (minus the drain-timeout bookkeeping, since this crate
-    /// isn't holding a supervisor to clean up).
+    /// transition (minus the full drain-timeout bookkeeping, since this
+    /// crate isn't holding a supervisor to clean up).
+    ///
+    /// `write_all(...).await` and `finish()` both only guarantee the data
+    /// was handed to quinn's own send-scheduling machinery, not that it
+    /// reached the peer -- `Connection::close` is abrupt and does not
+    /// wait for outstanding stream data to be delivered. Found live
+    /// 2026-08-29 in the Go port of this exact pattern
+    /// (macula-go-sdk's connection.Session.Close): a PUBLISH sent
+    /// immediately before Close intermittently never reached the peer,
+    /// root-caused to this race. Fixed proactively here before it was
+    /// independently rediscovered against this crate -- same doc
+    /// comment ("minus the drain-timeout bookkeeping"), same
+    /// write-then-immediately-abort-connection shape, so the same race
+    /// applies. Closing the stream via `finish()` first, then giving the
+    /// background sender a bounded window before hard-closing the
+    /// connection, mirrors the Erlang reference's own bounded-drain
+    /// approach.
     pub async fn close(mut self, reason: &str, detail: Option<&str>, identity: &KeyPair) {
         let goodbye = frame::sign(frame::goodbye(reason, detail), identity);
         if let Ok(encoded) = frame::encode(&goodbye) {
             let _ = self.control.send.write_all(&encoded).await;
         }
         let _ = self.control.send.finish();
+        tokio::time::sleep(Self::CLOSE_DRAIN).await;
         self.connection.close(0u32.into(), reason.as_bytes());
     }
 }

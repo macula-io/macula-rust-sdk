@@ -941,6 +941,111 @@ pub fn verify(frame: &Value, pubkey: &[u8; 32]) -> Result<(), VerifyError> {
 }
 
 // ---------------------------------------------------------------------
+// publisher_sig: the separate end-to-end signature on PUBLISH/EVENT
+// frames (§4/§6.6, §6.8). `sign`/`verify` above cover a frame's own
+// per-hop `signature`, which is checked against whichever connection
+// the frame arrived on -- correct for the frame's origin (hop 1), but
+// wrong for any further relay hop, since a relayed frame's signature
+// still belongs to the ORIGINAL sender, not whichever station forwarded
+// it. `publisher_sig` covers just (topic, realm, publisher, seq,
+// payload), independent of frame type, so it survives PUBLISH -> EVENT
+// conversion and every relay hop -- a receiving station or client can
+// verify authenticity against the ORIGINAL publisher no matter how many
+// stations forwarded it. Ported from the Erlang reference
+// (macula_frame.erl:sign_publisher/2, ?EVENT_PUBLISHER_DOMAIN) and
+// checked byte-for-byte against a signature generated live from that
+// same code (frame::tests::publisher_sig_matches_the_erlang_reference).
+// ---------------------------------------------------------------------
+
+pub const EVENT_PUBLISHER_DOMAIN: &[u8] = b"macula-v2-event-pub\0";
+
+/// Add `publisher_sig` to a PUBLISH or EVENT frame: `identity`'s Ed25519
+/// signature over `(topic, realm, publisher, seq, payload)`. `identity`
+/// must be the key pair for the pubkey already in the frame's
+/// `publisher` field -- this is not checked here (callers build frames
+/// with their own identity's pubkey as `publisher` by construction).
+pub fn sign_publisher(frame: Value, identity: &KeyPair) -> Value {
+    let signable = publisher_signing_bytes(&frame);
+    let sig = identity.sign(&signable);
+    frame.with_field("publisher_sig", Value::Bytes(sig.to_vec()))
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum VerifyPublisherError {
+    MissingPublisherSig,
+    BadPublisherSig,
+    PublisherSigInvalid,
+}
+
+impl std::fmt::Display for VerifyPublisherError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            VerifyPublisherError::MissingPublisherSig => {
+                write!(f, "frame has no publisher_sig field")
+            }
+            VerifyPublisherError::BadPublisherSig => {
+                write!(f, "publisher_sig field is not 64 bytes")
+            }
+            VerifyPublisherError::PublisherSigInvalid => write!(
+                f,
+                "publisher_sig does not verify against the frame's publisher field"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for VerifyPublisherError {}
+
+/// Verify `frame`'s `publisher_sig` against its OWN `publisher` field --
+/// unlike [`verify`] (the per-hop signature), there is no separate
+/// pubkey parameter: `publisher_sig`'s whole point is proving "the
+/// pubkey named in this frame produced it", independent of which
+/// connection it arrived on.
+pub fn verify_publisher(frame: &Value) -> Result<(), VerifyPublisherError> {
+    let sig: [u8; 64] = match frame.get("publisher_sig") {
+        Some(Value::Bytes(b)) => b
+            .as_slice()
+            .try_into()
+            .map_err(|_| VerifyPublisherError::BadPublisherSig)?,
+        _ => return Err(VerifyPublisherError::MissingPublisherSig),
+    };
+    let pubkey: [u8; 32] = match frame.get("publisher") {
+        Some(Value::Bytes(b)) => b
+            .as_slice()
+            .try_into()
+            .map_err(|_| VerifyPublisherError::BadPublisherSig)?,
+        _ => return Err(VerifyPublisherError::BadPublisherSig),
+    };
+    let signable = publisher_signing_bytes(frame);
+    if crate::identity::verify(&signable, &sig, &pubkey) {
+        Ok(())
+    } else {
+        Err(VerifyPublisherError::PublisherSigInvalid)
+    }
+}
+
+/// The canonical bytes a publisher signs: a fixed 5-field tuple,
+/// independent of frame type, header fields, `delivered_via`, or
+/// `ttl_ms`, so the same signature is valid on the PUBLISH the
+/// publisher sent and on every EVENT a relay derives from it.
+fn publisher_signing_bytes(frame: &Value) -> Vec<u8> {
+    let fields = ["topic", "realm", "publisher", "seq", "payload"];
+    let pairs: Vec<(Value, Value)> = fields
+        .iter()
+        .map(|f| {
+            let v = frame.get(f).cloned().unwrap_or(Value::Null);
+            (Value::text(*f), v)
+        })
+        .collect();
+    let canonical = cbor::encode(&Value::Map(pairs))
+        .expect("a frame built by this module is always encodable");
+    let mut out = Vec::with_capacity(EVENT_PUBLISHER_DOMAIN.len() + canonical.len());
+    out.extend_from_slice(EVENT_PUBLISHER_DOMAIN);
+    out.extend_from_slice(&canonical);
+    out
+}
+
+// ---------------------------------------------------------------------
 // Wire codec: length-prefixed CBOR
 // ---------------------------------------------------------------------
 
@@ -2038,6 +2143,96 @@ mod tests {
             "DD49D10EFA9F2EED0A393DC02DC5BBAC25D6731562EA39F5AB2E5337824527AFFBC7D917AF4DE5EFDBE5BC41E58659E05EC6FDE4E91FB1A32CC9C211456DF10C"
         );
         assert_eq!(encode(&signed).expect("encodable").len(), 355);
+    }
+
+    // Reference vector generated directly from the Erlang implementation
+    // (macula-io/macula, src/peering/macula_frame.erl:sign_publisher/2),
+    // live in a rebar3 shell against the same fixed identity every other
+    // vector test in this file uses. First publisher_sig implementation
+    // in any repo as of 2026-08-29 (macula-go-sdk, macula-rust-sdk,
+    // macula-dotnet-sdk all lacked it) -- no prior port existed to
+    // cross-check against instead, so this is checked straight against
+    // the Erlang source of truth.
+    #[test]
+    fn publisher_sig_matches_the_erlang_reference() {
+        let pub_bytes = fixed_array(VECTOR_PUB);
+        let identity = vector_identity();
+        let spec = PublishSpec::new(
+            "acme/svc.do",
+            VECTOR_ZERO_REALM,
+            pub_bytes,
+            42,
+            Value::Bytes(b"hello".to_vec()),
+            VECTOR_SENT_AT_MS,
+        );
+        let unsigned = publish_value(&spec, vector_frame_id(), VECTOR_SENT_AT_MS);
+        let with_pub_sig = sign_publisher(unsigned, &identity);
+
+        let sig = match with_pub_sig.get("publisher_sig") {
+            Some(Value::Bytes(b)) => b.clone(),
+            other => panic!("expected a publisher_sig field, got {other:?}"),
+        };
+        assert_eq!(
+            hex::encode_upper(&sig),
+            "C11BEB676A590FD1BA86F0B77E377B4582AA461DB1283F64E57224E920A7BD0A2C7D36271B795FFC3CB4F2C7BB8925B034431AA6425E25B2AEEFAC026883BB0C"
+        );
+
+        verify_publisher(&with_pub_sig).expect("our own freshly-signed frame must verify");
+
+        // Tamper check: changing payload after signing must invalidate it.
+        let tampered = with_pub_sig
+            .clone()
+            .with_field("payload", Value::Bytes(b"world".to_vec()));
+        assert!(
+            verify_publisher(&tampered).is_err(),
+            "verify_publisher accepted a frame with a tampered payload"
+        );
+
+        // Absence must be a verification failure, not "trusted".
+        assert_eq!(
+            verify_publisher(&unsigned_publish_for_tamper_check(&spec)),
+            Err(VerifyPublisherError::MissingPublisherSig)
+        );
+    }
+
+    fn unsigned_publish_for_tamper_check(spec: &PublishSpec) -> Value {
+        publish_value(spec, vector_frame_id(), VECTOR_SENT_AT_MS)
+    }
+
+    // Full encode/decode round trip with BOTH publisher_sig and the
+    // per-hop signature present, mirroring exactly what a real caller
+    // (macula-go-sdk's connection.Session.Publish does this already;
+    // this crate's own connection layer should too) would build.
+    #[test]
+    fn publish_frame_with_both_signatures_round_trips() {
+        let identity = KeyPair::generate();
+        let pub_bytes = identity.node_id();
+        let spec = PublishSpec::new(
+            "acme/svc.do",
+            VECTOR_ZERO_REALM,
+            pub_bytes,
+            1,
+            Value::Bytes(b"hello".to_vec()),
+            VECTOR_SENT_AT_MS,
+        );
+        let unsigned = publish(&spec);
+        let with_pub_sig = sign_publisher(unsigned, &identity);
+        let fully_signed = sign(with_pub_sig, &identity);
+
+        let encoded = encode(&fully_signed).expect("encodable");
+        let decoded = match decode(&encoded).expect("decodable") {
+            Decoded::Frame(value, consumed) => {
+                assert_eq!(consumed, encoded.len());
+                value
+            }
+            Decoded::More(n) => panic!("unexpectedly needed {n} more bytes"),
+        };
+
+        verify(&decoded, &pub_bytes).expect("per-hop verify on decoded frame");
+        verify_publisher(&decoded).expect("verify_publisher on decoded frame");
+
+        assert!(decoded.get("publisher_sig").is_some(), "decoded frame lost publisher_sig");
+        assert!(decoded.get("signature").is_some(), "decoded frame lost signature");
     }
 
     #[test]

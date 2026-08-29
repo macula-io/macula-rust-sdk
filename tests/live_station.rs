@@ -297,6 +297,109 @@ async fn pubsub_round_trip_against_the_real_fleet() {
         .await;
 }
 
+/// Regression test for a real bug found live 2026-08-29 in the Go port
+/// of this exact `connect -> write -> Close` shape (macula-go-sdk's
+/// `connection.Session.Close`): a PUBLISH sent immediately before
+/// `close` -- exactly what every one-shot CLI/tool invocation does --
+/// could be silently dropped, because `Connection::close` is abrupt and
+/// does not wait for outstanding stream data to actually reach the
+/// peer. `pubsub_round_trip_against_the_real_fleet` above can't catch
+/// this: it keeps reading (blocking on `recv_event`) on the SAME
+/// session that published, so `close` doesn't run until well after the
+/// write already had time to flush. This uses two INDEPENDENT sessions
+/// specifically so the publisher's `close` isn't incidentally delayed
+/// by anything the subscriber does. Fixed proactively in
+/// `Session::close` (`CLOSE_DRAIN`) before this was independently
+/// rediscovered against this crate -- this test is what proves that
+/// held.
+#[tokio::test]
+#[ignore = "requires network access to a live macula-station"]
+async fn publish_survives_immediate_close_against_the_real_fleet() {
+    let sub_identity = KeyPair::generate_with_default_puzzle();
+    let mut sub_session = connection::connect(STATION_HOST, STATION_PORT, Trust::WebPki, &sub_identity)
+        .await
+        .expect("handshake should succeed (subscriber)");
+
+    let realm: [u8; 32] = rand::random();
+    let topic = format!(
+        "macula-rust-sdk.test.immediate-close.{}",
+        hex::encode(rand::random::<[u8; 8]>())
+    );
+
+    sub_session
+        .subscribe(
+            &macula_rust_sdk::frame::SubscribeSpec::new(
+                topic.clone(),
+                realm,
+                sub_identity.node_id(),
+            ),
+            &sub_identity,
+        )
+        .await
+        .expect("SUBSCRIBE should send without error");
+    // Give the SUBSCRIBE a moment to register before the publish races
+    // it -- this test is about the PUBLISH-then-close race, not about
+    // subscribe-propagation timing (a separate concern).
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    // Separate connection, separate identity: publish then close
+    // immediately, no read in between -- the exact shape a one-shot
+    // CLI/tool invocation uses.
+    {
+        let pub_identity = KeyPair::generate_with_default_puzzle();
+        let mut pub_session =
+            connection::connect(STATION_HOST, STATION_PORT, Trust::WebPki, &pub_identity)
+                .await
+                .expect("handshake should succeed (publisher)");
+        pub_session
+            .publish(
+                &macula_rust_sdk::frame::PublishSpec::new(
+                    topic.clone(),
+                    realm,
+                    pub_identity.node_id(),
+                    1,
+                    macula_rust_sdk::cbor::Value::text(
+                        "hello from the immediate-close regression test",
+                    ),
+                    now_ms(),
+                ),
+                &pub_identity,
+            )
+            .await
+            .expect("PUBLISH should send without error");
+        pub_session.close("normal", None, &pub_identity).await;
+    }
+
+    // Loop, not a single recv_event call: this is a real, shared, busy
+    // station, and unrelated live traffic interleaving on the control
+    // stream is expected, not a sign the race this test guards against
+    // has resurfaced.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "EVENT for our topic never arrived after a publish immediately followed by close \
+             (this is the exact race this test exists to catch)"
+        );
+        match sub_session.recv_event(remaining).await {
+            Ok(event) if event.topic == topic => break,
+            Ok(event) => println!("skipping unrelated live EVENT: topic={}", event.topic),
+            Err(connection::RecvEventError::Recv(connection::RecvFrameError::Timeout)) => {
+                panic!(
+                    "EVENT for our topic never arrived after a publish immediately followed by \
+                     close (this is the exact race this test exists to catch)"
+                );
+            }
+            Err(e) => println!("skipping a non-EVENT frame on this shared, busy station: {e}"),
+        }
+    }
+
+    sub_session
+        .close("normal", Some("immediate-close test done"), &sub_identity)
+        .await;
+}
+
 /// A real single-block put/get round trip: content small enough
 /// (`<= manifest::DEFAULT_CHUNK_SIZE`) to be addressed purely by content
 /// hash, no manifest involved. Every byte is randomized per run so
