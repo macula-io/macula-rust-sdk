@@ -40,6 +40,9 @@ const TORONTO_PORT: u16 = 4433;
 const TORONTO_NODE_ID_HEX: &str =
     "5748e81d89a6ea4b619fecda394ffac9f8f58a05d7a7234034783b6e1fd043d5";
 
+const MILAN_HOST: &str = "station-it-milan.macula.io";
+const MILAN_PORT: u16 = 4433;
+
 /// Probe: dial with verification skipped, and report exactly what the
 /// station presents (cert count, and its Ed25519 pubkey if the leaf is
 /// Ed25519) — informational, not asserting a specific pubkey, since
@@ -864,5 +867,194 @@ async fn pinned_trust_full_handshake_succeeds_against_toronto() {
 
     session
         .close("normal", Some("pinned trust test done"), &identity)
+        .await;
+}
+
+/// The primitive a real cam2me call would ride on -- two independent
+/// identities each dialed into a DIFFERENT station (Frankfurt, Milan,
+/// mirroring an actual two-emulator cam2me session run 2026-08-29: one
+/// phone left on its default station, the other switched to Milan via
+/// Settings), one advertising and accepting a bidirectional stream, the
+/// other opening it and both sides exchanging data -- unlike
+/// `streaming_provider_round_trip_against_the_real_fleet` above, which is
+/// deliberately same-station because "cross-station routing depends on
+/// gossip propagation between stations, which isn't instant and isn't this
+/// crate's concern to wait out". This test IS concerned with exactly that:
+/// it's the one open question a real call feature can't avoid, since two
+/// contacts are never guaranteed to share a station. `StreamMode::Bidi`
+/// rather than the one-directional `ServerStream` used above, since a call
+/// needs both directions, not one.
+///
+/// **Empirical finding, 2026-08-29, observed not asserted (same discipline
+/// as the puzzle-enforcement test above):** STREAM_OPEN itself routes
+/// cross-station correctly -- Milan resolves the procedure to Frankfurt's
+/// advertisement and the provider's `accept` sees it. But a DATA frame sent
+/// afterward on that established stream never arrives at the other side,
+/// confirmed at both a 5s and a 25s timeout (not a slow-propagation
+/// artifact -- reproducibly absent, not reproducibly late). So stream
+/// *establishment* crosses stations; stream *data* does not, at least not
+/// within any window this test waited out. That is a real fact about
+/// `macula-station`'s own cross-station relay (a separate Erlang repo) this
+/// crate doesn't own or attempt to fix here -- a call feature built on this
+/// SDK cannot assume two contacts on different stations can actually
+/// exchange call data yet, only that they can open a stream toward each
+/// other.
+#[tokio::test]
+#[ignore = "requires network access to a live macula-station"]
+async fn cross_station_streaming_round_trip_frankfurt_provider_milan_caller() {
+    let provider_identity = KeyPair::generate_with_default_puzzle();
+    let caller_identity = KeyPair::generate_with_default_puzzle();
+
+    let mut provider_session = connection::connect(
+        STATION_HOST,
+        STATION_PORT,
+        Trust::WebPki,
+        &provider_identity,
+    )
+    .await
+    .expect("provider handshake against Frankfurt should succeed");
+    let mut caller_session =
+        connection::connect(MILAN_HOST, MILAN_PORT, Trust::WebPki, &caller_identity)
+            .await
+            .expect("caller handshake against Milan should succeed");
+
+    let realm: [u8; 32] = rand::random();
+    let procedure = format!(
+        "macula_rust_sdk.test_call.{}",
+        hex::encode(rand::random::<[u8; 8]>())
+    );
+
+    let advertise_spec = macula_rust_sdk::frame::AdvertiseSpec::new(
+        realm,
+        procedure.clone(),
+        provider_identity.node_id(),
+    );
+    provider_session
+        .advertise(&advertise_spec, &provider_identity)
+        .await
+        .expect("advertise on Frankfurt should send");
+
+    // Same-station tests above give this 500ms; a cross-station lookup has
+    // to actually reach the other station first, so this waits longer
+    // before concluding it never will.
+    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+
+    let accept_task = tokio::spawn(async move {
+        let result = macula_rust_sdk::stream::StreamHandle::accept(
+            &mut provider_session,
+            std::time::Duration::from_secs(15),
+        )
+        .await;
+        (result, provider_session)
+    });
+
+    let open_result = macula_rust_sdk::stream::StreamHandle::open(
+        &mut caller_session,
+        &procedure,
+        realm,
+        macula_rust_sdk::frame::StreamMode::Bidi,
+        macula_rust_sdk::cbor::Value::Null,
+        (now_ms() + 10_000) as i128,
+        &caller_identity,
+    )
+    .await;
+
+    let mut caller_handle = match open_result {
+        Ok(h) => h,
+        Err(e) => {
+            println!(
+                "OBSERVED: cross-station STREAM_OPEN failed as: {e} -- Milan could not \
+                 route to a procedure only advertised on Frankfurt within 5s. This is the \
+                 real, useful answer to whether a call feature can rely on cross-station \
+                 routing working promptly; see this test's doc comment."
+            );
+            let _ = accept_task.await;
+            return;
+        }
+    };
+    println!("OBSERVED: cross-station STREAM_OPEN succeeded -- Milan routed it to Frankfurt");
+
+    let (accept_result, provider_session) =
+        accept_task.await.expect("accept task should not panic");
+    let (mut provider_handle, open_info) =
+        accept_result.expect("provider should accept the inbound STREAM_OPEN");
+    assert_eq!(open_info.procedure, procedure);
+    assert_eq!(open_info.mode, macula_rust_sdk::frame::StreamMode::Bidi);
+
+    // Send both frames, then DRAIN both (recv the Data) before either side
+    // closes its send half -- closing before the peer has drained the data
+    // that preceded the close is exactly the ordering the first run of
+    // this test got wrong (a real bug in this test, not in the SDK):
+    // provider_handle.recv() failed with StreamClosed because both sides
+    // half-closed before either had received the other's frame.
+    caller_handle
+        .send_data(
+            macula_rust_sdk::frame::StreamEncoding::Raw,
+            macula_rust_sdk::cbor::Value::Bytes(b"audio frame from phone2 (milan)".to_vec()),
+            &caller_identity,
+        )
+        .await
+        .expect("caller should push a frame");
+    provider_handle
+        .send_data(
+            macula_rust_sdk::frame::StreamEncoding::Raw,
+            macula_rust_sdk::cbor::Value::Bytes(b"audio frame from phone1 (frankfurt)".to_vec()),
+            &provider_identity,
+        )
+        .await
+        .expect("provider should push a frame");
+
+    match provider_handle
+        .recv(std::time::Duration::from_secs(25))
+        .await
+    {
+        Ok(macula_rust_sdk::stream::StreamItem::Data { body, .. }) => {
+            let matches = body
+                == macula_rust_sdk::cbor::Value::Bytes(b"audio frame from phone2 (milan)".to_vec());
+            println!(
+                "OBSERVED: provider (Frankfurt) received a frame from Milan, \
+                 content matches = {matches}"
+            );
+        }
+        Ok(other) => println!("OBSERVED: provider got {other:?} instead of Data"),
+        Err(e) => println!(
+            "OBSERVED: provider never received the caller's frame -- {e}. See this test's \
+             doc comment: STREAM_OPEN crosses stations, DATA does not."
+        ),
+    }
+    match caller_handle.recv(std::time::Duration::from_secs(25)).await {
+        Ok(macula_rust_sdk::stream::StreamItem::Data { body, .. }) => {
+            let matches = body
+                == macula_rust_sdk::cbor::Value::Bytes(
+                    b"audio frame from phone1 (frankfurt)".to_vec(),
+                );
+            println!(
+                "OBSERVED: caller (Milan) received a frame from Frankfurt, \
+                 content matches = {matches}"
+            );
+        }
+        Ok(other) => println!("OBSERVED: caller got {other:?} instead of Data"),
+        Err(e) => println!(
+            "OBSERVED: caller never received the provider's frame -- {e}. See this test's \
+             doc comment: STREAM_OPEN crosses stations, DATA does not."
+        ),
+    }
+
+    let _ = caller_handle.close_send(&caller_identity).await;
+    let _ = provider_handle.close_send(&provider_identity).await;
+
+    provider_session
+        .close(
+            "normal",
+            Some("cross-station call test done"),
+            &provider_identity,
+        )
+        .await;
+    caller_session
+        .close(
+            "normal",
+            Some("cross-station call test done"),
+            &caller_identity,
+        )
         .await;
 }
