@@ -885,20 +885,29 @@ async fn pinned_trust_full_handshake_succeeds_against_toronto() {
 /// rather than the one-directional `ServerStream` used above, since a call
 /// needs both directions, not one.
 ///
-/// **Empirical finding, 2026-08-29, observed not asserted (same discipline
-/// as the puzzle-enforcement test above):** STREAM_OPEN itself routes
-/// cross-station correctly -- Milan resolves the procedure to Frankfurt's
-/// advertisement and the provider's `accept` sees it. But a DATA frame sent
-/// afterward on that established stream never arrives at the other side,
-/// confirmed at both a 5s and a 25s timeout (not a slow-propagation
-/// artifact -- reproducibly absent, not reproducibly late). So stream
-/// *establishment* crosses stations; stream *data* does not, at least not
-/// within any window this test waited out. That is a real fact about
-/// `macula-station`'s own cross-station relay (a separate Erlang repo) this
-/// crate doesn't own or attempt to fix here -- a call feature built on this
-/// SDK cannot assume two contacts on different stations can actually
-/// exchange call data yet, only that they can open a stream toward each
-/// other.
+/// **Root cause found and fixed, 2026-08-29 -- this crate's bug, not
+/// `macula-station`'s.** First run of this test found STREAM_OPEN routing
+/// cross-station correctly but a DATA frame sent afterward never arriving,
+/// reproducible at both 5s and 25s timeouts. Traced into
+/// `macula_station_peer_observer.erl`'s dedicated-stream relay
+/// (`verify_dedicated/4`): non-OPEN stream frames (DATA/END/ERROR) verify
+/// against an optional `signer` field when present, falling back to "the
+/// connection this frame arrived on" when absent -- and the reference's own
+/// comment on that fallback says outright it's "single-hop only", because
+/// at a second relay hop the connection belongs to the RELAYING STATION,
+/// not the original sender. This crate's STREAM_DATA/END/ERROR
+/// constructors never stamped `signer` at all (`frame.rs`'s own prior doc
+/// comment reasoned "a direct-dial client... has no relay hop to
+/// authenticate across" -- true of the client's OWN single hop, false of
+/// what the STATION does with it afterward). Fixed: `StreamDataSpec`/
+/// `StreamEndSpec`/`StreamErrorSpec` all gained `signer: Option<[u8; 32]>`,
+/// and every real call site (`StreamHandle::send_data`/`close_send`/
+/// `abort`) now always supplies `Some(identity.public_bytes())`. New
+/// differential vectors added in `frame.rs` for the `Some` case, generated
+/// live against `macula_frame:stream_data/1` etc with `signer` in the spec
+/// map -- the two pre-existing vectors testing `None` are untouched and
+/// still pass, since that's a real, still-valid branch of the reference's
+/// own optional field.
 #[tokio::test]
 #[ignore = "requires network access to a live macula-station"]
 async fn cross_station_streaming_round_trip_frankfurt_provider_milan_caller() {
@@ -1005,43 +1014,46 @@ async fn cross_station_streaming_round_trip_frankfurt_provider_milan_caller() {
         .expect("provider should push a frame");
 
     match provider_handle
-        .recv(std::time::Duration::from_secs(25))
+        .recv(std::time::Duration::from_secs(5))
         .await
-    {
-        Ok(macula_rust_sdk::stream::StreamItem::Data { body, .. }) => {
-            let matches = body
-                == macula_rust_sdk::cbor::Value::Bytes(b"audio frame from phone2 (milan)".to_vec());
-            println!(
-                "OBSERVED: provider (Frankfurt) received a frame from Milan, \
-                 content matches = {matches}"
+        .expect(
+            "provider should receive the caller's frame -- see this test's doc comment, \
+                 fixed 2026-08-29 by stamping `signer` on stream data frames",
+        ) {
+        macula_rust_sdk::stream::StreamItem::Data { body, .. } => {
+            assert_eq!(
+                body,
+                macula_rust_sdk::cbor::Value::Bytes(b"audio frame from phone2 (milan)".to_vec())
             );
+            println!("OBSERVED: provider (Frankfurt) received phone2's frame from Milan");
         }
-        Ok(other) => println!("OBSERVED: provider got {other:?} instead of Data"),
-        Err(e) => println!(
-            "OBSERVED: provider never received the caller's frame -- {e}. See this test's \
-             doc comment: STREAM_OPEN crosses stations, DATA does not."
-        ),
+        other => panic!("expected Data, got {other:?}"),
     }
-    match caller_handle.recv(std::time::Duration::from_secs(25)).await {
-        Ok(macula_rust_sdk::stream::StreamItem::Data { body, .. }) => {
-            let matches = body
-                == macula_rust_sdk::cbor::Value::Bytes(
-                    b"audio frame from phone1 (frankfurt)".to_vec(),
-                );
-            println!(
-                "OBSERVED: caller (Milan) received a frame from Frankfurt, \
-                 content matches = {matches}"
+    match caller_handle
+        .recv(std::time::Duration::from_secs(5))
+        .await
+        .expect("caller should receive the provider's frame")
+    {
+        macula_rust_sdk::stream::StreamItem::Data { body, .. } => {
+            assert_eq!(
+                body,
+                macula_rust_sdk::cbor::Value::Bytes(
+                    b"audio frame from phone1 (frankfurt)".to_vec()
+                )
             );
+            println!("OBSERVED: caller (Milan) received phone1's frame from Frankfurt");
         }
-        Ok(other) => println!("OBSERVED: caller got {other:?} instead of Data"),
-        Err(e) => println!(
-            "OBSERVED: caller never received the provider's frame -- {e}. See this test's \
-             doc comment: STREAM_OPEN crosses stations, DATA does not."
-        ),
+        other => panic!("expected Data, got {other:?}"),
     }
 
-    let _ = caller_handle.close_send(&caller_identity).await;
-    let _ = provider_handle.close_send(&provider_identity).await;
+    caller_handle
+        .close_send(&caller_identity)
+        .await
+        .expect("caller should half-close");
+    provider_handle
+        .close_send(&provider_identity)
+        .await
+        .expect("provider should half-close");
 
     provider_session
         .close(

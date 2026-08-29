@@ -245,7 +245,13 @@ impl StreamHandle {
         body: Value,
         identity: &KeyPair,
     ) -> Result<(), SendFrameError> {
-        let spec = frame::StreamDataSpec::new(self.stream_id, self.seq_out, encoding, body);
+        let spec = frame::StreamDataSpec::new(
+            self.stream_id,
+            self.seq_out,
+            encoding,
+            body,
+            Some(identity.public_bytes()),
+        );
         self.seq_out += 1;
         let signed = frame::sign(frame::stream_data(&spec), identity);
         self.stream.send_frame(signed).await
@@ -255,7 +261,11 @@ impl StreamHandle {
     /// `client_stream`/`bidi` modes, follow with
     /// [`await_reply`](Self::await_reply).
     pub async fn close_send(&mut self, identity: &KeyPair) -> Result<(), SendFrameError> {
-        let spec = frame::StreamEndSpec::new(self.stream_id, StreamRole::Send);
+        let spec = frame::StreamEndSpec::new(
+            self.stream_id,
+            StreamRole::Send,
+            Some(identity.public_bytes()),
+        );
         let signed = frame::sign(frame::stream_end(&spec), identity);
         self.stream.send_frame(signed).await
     }
@@ -351,7 +361,12 @@ impl StreamHandle {
         message: impl Into<String>,
         identity: &KeyPair,
     ) {
-        let spec = frame::StreamErrorSpec::new(self.stream_id, code, message);
+        let spec = frame::StreamErrorSpec::new(
+            self.stream_id,
+            code,
+            message,
+            Some(identity.public_bytes()),
+        );
         let signed = frame::sign(frame::stream_error(&spec), identity);
         let _ = self.stream.send_frame(signed).await;
     }

@@ -1144,14 +1144,31 @@ pub fn unadvertise(spec: &UnadvertiseSpec) -> Value {
 // role (§13.2, exposing a streaming procedure *to* the mesh) isn't
 // built — nothing in this crate needs to *serve* RPCs yet.
 //
-// **`signer` (an optional field on STREAM_DATA/STREAM_END/STREAM_ERROR,
-// confirmed present in the reference via `maybe_add_signer/2`) is not
-// exposed here.** Its stated purpose is multi-hop relay authentication —
-// letting a relaying station attribute a frame to the originating daemon
-// rather than to itself. A direct-dial client talking to one station
-// has no relay hop to authenticate across, matching every other frame
-// type this crate already builds (CALL, PUBLISH, etc. — none expose a
-// `signer` field either).
+// **Correction, 2026-08-29 — the assumption below was wrong, found live
+// against the real fleet.** `signer` (an optional field on
+// STREAM_DATA/STREAM_END/STREAM_ERROR, mirrors the reference's
+// `maybe_add_signer/2`) IS now stamped by every real call site in this
+// crate (`stream::StreamHandle::send_data`/`close_send`/`abort`, which
+// always pass `Some(identity.public_bytes())`). The original reasoning —
+// "a direct-dial client talking to one station has no relay hop to
+// authenticate across" — assumed the client's own single hop is the
+// only hop that matters. It isn't: the STATION side can still relay the
+// stream on to a SECOND station if the advertised provider lives
+// elsewhere (`macula_station_peer_observer.erl`'s dedicated-stream
+// dispatch is built to do exactly this). Without `signer`, the second
+// hop's verify falls back to the inbound connection's NodeId — which at
+// that hop is the relaying station's own identity, not the original
+// caller's — and the reference's own comment on `maybe_add_signer/2`
+// says as much: "fine for the direct edge... fails on every subsequent
+// station-to-station hop". Confirmed live: `tests/live_station.rs`'s
+// `cross_station_streaming_round_trip_frankfurt_provider_milan_caller`
+// found exactly this failure mode (STREAM_OPEN routes cross-station,
+// STREAM_DATA silently never arrives) before this field was wired up.
+// CALL/PUBLISH don't need this because they're signed end-to-end by a
+// REQUIRED field (`caller`/`responded_by`) present on every frame
+// regardless of hop count — `signer` gives STREAM_DATA/END/ERROR the
+// same property, just as an optional field instead of a required one,
+// matching the reference's own design exactly.
 
 /// `mode` on a STREAM_OPEN — who's expected to push data. Matches
 /// `macula_stream:mode()`.
@@ -1412,21 +1429,37 @@ pub fn parse_stream_open(frame: &Value) -> Result<StreamOpenInfo, ParseStreamOpe
 /// structured [`Value`] for [`StreamEncoding::Msgpack`] (see this
 /// section's module-level note on why that's still a plain CBOR value,
 /// not a second codec).
+///
+/// `signer`: see this section's module doc for why every real call site
+/// in this crate ([`crate::stream::StreamHandle`]) always supplies
+/// `Some(identity.public_bytes())` — `None` exists only because the
+/// reference's own `maybe_add_signer/2` treats it as optional, and two
+/// of this module's own differential vectors deliberately exercise that
+/// branch (signature bytes captured before this crate carried `signer`
+/// at all, still valid against the reference today).
 #[derive(Debug, Clone)]
 pub struct StreamDataSpec {
     pub stream_id: [u8; 16],
     pub seq: u64,
     pub encoding: StreamEncoding,
     pub body: Value,
+    pub signer: Option<[u8; 32]>,
 }
 
 impl StreamDataSpec {
-    pub fn new(stream_id: [u8; 16], seq: u64, encoding: StreamEncoding, body: Value) -> Self {
+    pub fn new(
+        stream_id: [u8; 16],
+        seq: u64,
+        encoding: StreamEncoding,
+        body: Value,
+        signer: Option<[u8; 32]>,
+    ) -> Self {
         Self {
             stream_id,
             seq,
             encoding,
             body,
+            signer,
         }
     }
 }
@@ -1436,11 +1469,12 @@ fn stream_data_value(spec: &StreamDataSpec, frame_id: [u8; 16], sent_at_ms: u64)
     // `realm`/`call_id`/`source_route` — they stay `Null`, confirmed
     // directly against the reference's own output, not assumed from
     // STREAM_OPEN's pattern.
-    Value::Map(base("stream_data", 0, frame_id, sent_at_ms))
+    let value = Value::Map(base("stream_data", 0, frame_id, sent_at_ms))
         .with_field("stream_id", Value::Bytes(spec.stream_id.to_vec()))
         .with_field("seq", Value::Int(spec.seq as i128))
         .with_field("encoding", Value::text(spec.encoding.name()))
-        .with_field("body", spec.body.clone())
+        .with_field("body", spec.body.clone());
+    with_optional_signer(value, spec.signer)
 }
 
 /// Build a STREAM_DATA frame with a fresh `frame_id`/`sent_at_ms`.
@@ -1448,24 +1482,41 @@ pub fn stream_data(spec: &StreamDataSpec) -> Value {
     stream_data_value(spec, fresh_frame_id(), current_millis())
 }
 
+/// Mirrors the reference's `maybe_add_signer/2` exactly: stamp `signer`
+/// onto the frame when present, leave the frame untouched otherwise —
+/// see [`StreamDataSpec::signer`]'s doc for why this exists at all.
+fn with_optional_signer(value: Value, signer: Option<[u8; 32]>) -> Value {
+    match signer {
+        Some(pub_key) => value.with_field("signer", Value::Bytes(pub_key.to_vec())),
+        None => value,
+    }
+}
+
 /// Fields for a STREAM_END frame — a half-close (`role: Send`) or full
-/// close (`role: Both`) of one direction.
+/// close (`role: Both`) of one direction. See [`StreamDataSpec::signer`]'s
+/// doc — same field, same reasoning.
 #[derive(Debug, Clone)]
 pub struct StreamEndSpec {
     pub stream_id: [u8; 16],
     pub role: StreamRole,
+    pub signer: Option<[u8; 32]>,
 }
 
 impl StreamEndSpec {
-    pub fn new(stream_id: [u8; 16], role: StreamRole) -> Self {
-        Self { stream_id, role }
+    pub fn new(stream_id: [u8; 16], role: StreamRole, signer: Option<[u8; 32]>) -> Self {
+        Self {
+            stream_id,
+            role,
+            signer,
+        }
     }
 }
 
 fn stream_end_value(spec: &StreamEndSpec, frame_id: [u8; 16], sent_at_ms: u64) -> Value {
-    Value::Map(base("stream_end", 0, frame_id, sent_at_ms))
+    let value = Value::Map(base("stream_end", 0, frame_id, sent_at_ms))
         .with_field("stream_id", Value::Bytes(spec.stream_id.to_vec()))
-        .with_field("role", Value::text(spec.role.name()))
+        .with_field("role", Value::text(spec.role.name()));
+    with_optional_signer(value, spec.signer)
 }
 
 /// Build a STREAM_END frame with a fresh `frame_id`/`sent_at_ms`.
@@ -1479,28 +1530,38 @@ pub fn stream_end(spec: &StreamEndSpec) -> Value {
 /// here is a free-form label (`is_binary(Code)` in the reference), NOT
 /// a BOLT#4 numeric code like an ERROR (§6.4) frame's `code` — streaming
 /// aborts and unary-call errors use unrelated error vocabularies.
+/// `signer`: see [`StreamDataSpec::signer`]'s doc — same field, same
+/// reasoning.
 #[derive(Debug, Clone)]
 pub struct StreamErrorSpec {
     pub stream_id: [u8; 16],
     pub code: String,
     pub message: String,
+    pub signer: Option<[u8; 32]>,
 }
 
 impl StreamErrorSpec {
-    pub fn new(stream_id: [u8; 16], code: impl Into<String>, message: impl Into<String>) -> Self {
+    pub fn new(
+        stream_id: [u8; 16],
+        code: impl Into<String>,
+        message: impl Into<String>,
+        signer: Option<[u8; 32]>,
+    ) -> Self {
         Self {
             stream_id,
             code: code.into(),
             message: message.into(),
+            signer,
         }
     }
 }
 
 fn stream_error_value(spec: &StreamErrorSpec, frame_id: [u8; 16], sent_at_ms: u64) -> Value {
-    Value::Map(base("stream_error", 0, frame_id, sent_at_ms))
+    let value = Value::Map(base("stream_error", 0, frame_id, sent_at_ms))
         .with_field("stream_id", Value::Bytes(spec.stream_id.to_vec()))
         .with_field("code", Value::Bytes(spec.code.as_bytes().to_vec()))
-        .with_field("message", Value::Bytes(spec.message.as_bytes().to_vec()))
+        .with_field("message", Value::Bytes(spec.message.as_bytes().to_vec()));
+    with_optional_signer(value, spec.signer)
 }
 
 /// Build a STREAM_ERROR frame with a fresh `frame_id`/`sent_at_ms`.
@@ -2203,6 +2264,7 @@ mod tests {
             0,
             StreamEncoding::Raw,
             Value::Bytes(b"raw chunk bytes".to_vec()),
+            None,
         );
         let signed = sign(
             stream_data_value(&spec, vector_frame_id(), VECTOR_SENT_AT_MS),
@@ -2215,6 +2277,35 @@ mod tests {
         assert_eq!(hex::encode_upper(&sig), "35770744FE5BD01B86DDA01AB4EF855E4E4FE0EDFEDC89FF690728C585C60A5CB035717E3EA9133C4AD833E226F4DB95E9A5AF9AC59E7BACBB8BDF72611F8003");
         let encoded = encode(&signed).expect("encodable frame");
         assert_eq!(encoded.len(), 269);
+    }
+
+    /// The vector this crate was missing until 2026-08-29: `signer`
+    /// present, matching what every real `StreamHandle` call site now
+    /// sends. Generated live against `macula_frame:stream_data/1` with
+    /// `signer => Pub` in the spec map (`rebar3 shell`, same identity/
+    /// frame_id/stream_id/sent_at_ms fixture as every other vector in
+    /// this module) — not guessed from the field's shape.
+    #[test]
+    fn stream_data_with_signer_matches_the_reference_byte_for_byte() {
+        let identity = vector_identity();
+        let spec = StreamDataSpec::new(
+            vector_stream_id(),
+            0,
+            StreamEncoding::Raw,
+            Value::Bytes(b"raw chunk bytes".to_vec()),
+            Some(fixed_array(VECTOR_PUB)),
+        );
+        let signed = sign(
+            stream_data_value(&spec, vector_frame_id(), VECTOR_SENT_AT_MS),
+            &identity,
+        );
+        let sig = match signed.get("signature") {
+            Some(Value::Bytes(b)) => b.clone(),
+            other => panic!("expected a signature field, got {other:?}"),
+        };
+        assert_eq!(hex::encode_upper(&sig), "3EA0B6B6DB1549D2EA42AF015A477FCD6D00B11F48F9CC07AF0914CAC18F22B5C12E5EE446811388F207D688960B67D9BEE7B4D998BE02F2B1426B6C4A06D307");
+        let encoded = encode(&signed).expect("encodable frame");
+        assert_eq!(encoded.len(), 310);
     }
 
     /// The real point of this vector: `encoding = msgpack` with a
@@ -2238,6 +2329,7 @@ mod tests {
                 // (atom) key.
                 (Value::text("greeting"), Value::Bytes(b"hi".to_vec())),
             ]),
+            None,
         );
         let signed = sign(
             stream_data_value(&spec, vector_frame_id(), VECTOR_SENT_AT_MS),
@@ -2255,7 +2347,7 @@ mod tests {
     #[test]
     fn stream_end_frame_matches_the_reference_byte_for_byte() {
         let identity = vector_identity();
-        let spec = StreamEndSpec::new(vector_stream_id(), StreamRole::Send);
+        let spec = StreamEndSpec::new(vector_stream_id(), StreamRole::Send, None);
         let signed = sign(
             stream_end_value(&spec, vector_frame_id(), VECTOR_SENT_AT_MS),
             &identity,
@@ -2269,10 +2361,33 @@ mod tests {
         assert_eq!(encoded.len(), 239);
     }
 
+    /// See `stream_data_with_signer_matches_the_reference_byte_for_byte`'s
+    /// doc — same fixture, same 2026-08-29 gap, this crate's STREAM_END.
+    #[test]
+    fn stream_end_with_signer_matches_the_reference_byte_for_byte() {
+        let identity = vector_identity();
+        let spec = StreamEndSpec::new(
+            vector_stream_id(),
+            StreamRole::Send,
+            Some(fixed_array(VECTOR_PUB)),
+        );
+        let signed = sign(
+            stream_end_value(&spec, vector_frame_id(), VECTOR_SENT_AT_MS),
+            &identity,
+        );
+        let sig = match signed.get("signature") {
+            Some(Value::Bytes(b)) => b.clone(),
+            other => panic!("expected a signature field, got {other:?}"),
+        };
+        assert_eq!(hex::encode_upper(&sig), "CC316B0A1C1AD4701AD16D8A140ED62D5DEEFD721C1CEB574CC8755C645CA27413EF9C6A6A9C4768564524C412515C14637A9D6BD4CCB8CD1ADD44F2A240C70C");
+        let encoded = encode(&signed).expect("encodable frame");
+        assert_eq!(encoded.len(), 280);
+    }
+
     #[test]
     fn stream_error_frame_matches_the_reference_byte_for_byte() {
         let identity = vector_identity();
-        let spec = StreamErrorSpec::new(vector_stream_id(), "cancelled", "boom");
+        let spec = StreamErrorSpec::new(vector_stream_id(), "cancelled", "boom", None);
         let signed = sign(
             stream_error_value(&spec, vector_frame_id(), VECTOR_SENT_AT_MS),
             &identity,
@@ -2284,6 +2399,30 @@ mod tests {
         assert_eq!(hex::encode_upper(&sig), "119F379518EC17C603ED5466A57D7AE53198A8AC4D5CA9849934A78994428CB3DAD40BC0EFECE1A0C8EEB0ACC28973C0F7E55DE6444827091814AF0715D9FF0B");
         let encoded = encode(&signed).expect("encodable frame");
         assert_eq!(encoded.len(), 259);
+    }
+
+    /// See `stream_data_with_signer_matches_the_reference_byte_for_byte`'s
+    /// doc — same fixture, same 2026-08-29 gap, this crate's STREAM_ERROR.
+    #[test]
+    fn stream_error_with_signer_matches_the_reference_byte_for_byte() {
+        let identity = vector_identity();
+        let spec = StreamErrorSpec::new(
+            vector_stream_id(),
+            "cancelled",
+            "boom",
+            Some(fixed_array(VECTOR_PUB)),
+        );
+        let signed = sign(
+            stream_error_value(&spec, vector_frame_id(), VECTOR_SENT_AT_MS),
+            &identity,
+        );
+        let sig = match signed.get("signature") {
+            Some(Value::Bytes(b)) => b.clone(),
+            other => panic!("expected a signature field, got {other:?}"),
+        };
+        assert_eq!(hex::encode_upper(&sig), "223062E2816C5E6DABCF08A0A4FD01F477F2D1D933F2F1FDC971CAB570003DDE8192CC2F8811CE4A2D180B6781AFA64EB4057947E25CF121F745A9654DC23D0A");
+        let encoded = encode(&signed).expect("encodable frame");
+        assert_eq!(encoded.len(), 300);
     }
 
     #[test]

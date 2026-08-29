@@ -508,6 +508,23 @@ originating daemon) can be authenticated per-hop. See §13 for the full
 client-side usage pattern (caller and provider roles) on top of these
 frames.
 
+**Correction, 2026-08-29 — this crate didn't actually stamp `signer`
+until today, despite this section documenting it correctly all along.**
+`src/frame.rs`'s `StreamDataSpec`/`StreamEndSpec`/`StreamErrorSpec`
+never carried the field, and every real call site
+(`StreamHandle::send_data`/`close_send`/`abort`) never supplied it —
+found live: a cross-station stream (provider on
+`station-de-frankfurt.macula.io`, caller on `station-it-milan.macula.io`)
+opened correctly but silently never delivered a single DATA frame,
+because `macula_station_peer_observer.erl`'s multi-hop verify falls back
+to "the connection this frame arrived on" when `signer` is absent — fine
+for the direct client→first-station edge, wrong at any station→station
+hop after that. Fixed: the three specs gained `signer: Option<[u8; 32]>`
+and every real call site now always supplies
+`Some(identity.public_bytes())`. Confirmed live, both directions, after
+the fix (`tests/live_station.rs`'s
+`cross_station_streaming_round_trip_frankfurt_provider_milan_caller`).
+
 **Correction, 2026-08-28 — the `msgpack` encoding is not a second wire
 codec.** An earlier draft of this section (quoted above in the original
 form for the record) read `encoding`'s `msgpack` value as meaning
