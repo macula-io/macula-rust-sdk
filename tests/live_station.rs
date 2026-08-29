@@ -1058,3 +1058,146 @@ async fn cross_station_streaming_round_trip_frankfurt_provider_milan_caller() {
         )
         .await;
 }
+
+/// Follow-up to `cross_station_streaming_round_trip_frankfurt_provider_milan_caller`
+/// above, asking a narrower question: that test found STREAM_OPEN routes
+/// cross-station but DATA on the resulting stream does not.
+/// `plans/PLAN_MACULA_STREAMING.md` (macula-architecture) says cross-relay
+/// STREAM_OPEN routing "will follow the CALL path's procedure-resolver
+/// pattern" -- so if plain CALL/RESULT (a single request/response, no
+/// persistent per-stream relay state to pin across the station boundary)
+/// also crosses stations cleanly, that's real signal that a signaling
+/// exchange (SDP offer/answer, ICE candidates) built on CALL rather than a
+/// long-lived STREAM_OPEN session would not hit the same gap.
+///
+/// **Empirical finding, 2026-08-29, confirmed:** it does not hit the gap.
+/// Milan's CALL reached Frankfurt's advertised provider, the RESULT came
+/// back with the exact expected payload, round trip in ~5s (almost all of
+/// it the propagation wait, not the call itself). Unlike the streaming
+/// case, there's no follow-up DATA frame to lose -- a CALL is one
+/// request, one response, both riding the same resolver lookup that
+/// already proved reliable for STREAM_OPEN. So a signaling exchange built
+/// on CALL/RESULT (or short-lived RPCs generally) rather than a
+/// persistent STREAM_OPEN+DATA session is on solid ground cross-station,
+/// independent of whether the streaming DATA-relay gap above ever gets
+/// fixed.
+#[tokio::test]
+#[ignore = "requires network access to a live macula-station"]
+async fn cross_station_unary_call_round_trip_frankfurt_provider_milan_caller() {
+    let provider_identity = KeyPair::generate_with_default_puzzle();
+    let caller_identity = KeyPair::generate_with_default_puzzle();
+
+    let mut provider_session = connection::connect(
+        STATION_HOST,
+        STATION_PORT,
+        Trust::WebPki,
+        &provider_identity,
+    )
+    .await
+    .expect("provider handshake against Frankfurt should succeed");
+    let mut caller_session =
+        connection::connect(MILAN_HOST, MILAN_PORT, Trust::WebPki, &caller_identity)
+            .await
+            .expect("caller handshake against Milan should succeed");
+
+    let realm: [u8; 32] = rand::random();
+    let procedure = format!(
+        "macula_rust_sdk.test_signal.{}",
+        hex::encode(rand::random::<[u8; 8]>())
+    );
+
+    let advertise_spec = macula_rust_sdk::frame::AdvertiseSpec::new(
+        realm,
+        procedure.clone(),
+        provider_identity.node_id(),
+    );
+    provider_session
+        .advertise(&advertise_spec, &provider_identity)
+        .await
+        .expect("advertise on Frankfurt should send");
+
+    // Same wait the streaming counterpart used for its own resolver lookup.
+    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+
+    let target_procedure = procedure.clone();
+    let lookup = move |_realm: &[u8; 32], proc: &str| -> Option<connection::CallHandler> {
+        if proc != target_procedure {
+            return None;
+        }
+        let handler: connection::CallHandler = std::sync::Arc::new(|payload: Value| {
+            Box::pin(async move {
+                match payload {
+                    Value::Text(s) if s == "offer from phone2 (milan)" => {
+                        Ok(Value::text("answer from phone1 (frankfurt)"))
+                    }
+                    other => Err(format!("unexpected payload: {other:?}")),
+                }
+            }) as connection::BoxFuture<'static, Result<Value, String>>
+        });
+        Some(handler)
+    };
+
+    let serve_task = tokio::spawn(async move {
+        let result = provider_session
+            .serve_one_call(
+                lookup,
+                &provider_identity,
+                std::time::Duration::from_secs(20),
+            )
+            .await;
+        (result, provider_session, provider_identity)
+    });
+
+    let response = caller_session
+        .call(
+            &procedure,
+            realm,
+            Value::text("offer from phone2 (milan)"),
+            (now_ms() + 15_000) as i128,
+            &caller_identity,
+            std::time::Duration::from_secs(15),
+        )
+        .await;
+
+    let (serve_result, provider_session, provider_identity) =
+        serve_task.await.expect("serve task should not panic");
+
+    match (response, serve_result) {
+        (Ok(macula_rust_sdk::frame::CallResponse::Result { payload, .. }), Ok(())) => {
+            let matches = payload == Value::text("answer from phone1 (frankfurt)");
+            println!(
+                "OBSERVED: cross-station CALL/RESULT succeeded -- Milan's CALL reached \
+                 Frankfurt's provider and the RESULT came back, content matches = {matches}"
+            );
+        }
+        (Ok(other), serve_result) => {
+            println!(
+                "OBSERVED: cross-station CALL got a response but not the expected RESULT: \
+                 {other:?} (serve_result={serve_result:?})"
+            );
+        }
+        (Err(e), serve_result) => {
+            println!(
+                "OBSERVED: cross-station CALL failed -- {e} (serve_result={serve_result:?}). \
+                 If this fails the same way the streaming test's DATA phase did, the CALL \
+                 path shares the same cross-station gap; if it succeeds, signaling built on \
+                 CALL rather than STREAM_OPEN+DATA is on solid ground."
+            );
+        }
+    }
+
+    provider_session
+        .close(
+            "normal",
+            Some("cross-station signaling test done"),
+            &provider_identity,
+        )
+        .await;
+    caller_session
+        .close(
+            "normal",
+            Some("cross-station signaling test done"),
+            &caller_identity,
+        )
+        .await;
+}
