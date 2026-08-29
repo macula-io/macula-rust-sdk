@@ -1037,8 +1037,8 @@ fn publisher_signing_bytes(frame: &Value) -> Vec<u8> {
             (Value::text(*f), v)
         })
         .collect();
-    let canonical = cbor::encode(&Value::Map(pairs))
-        .expect("a frame built by this module is always encodable");
+    let canonical =
+        cbor::encode(&Value::Map(pairs)).expect("a frame built by this module is always encodable");
     let mut out = Vec::with_capacity(EVENT_PUBLISHER_DOMAIN.len() + canonical.len());
     out.extend_from_slice(EVENT_PUBLISHER_DOMAIN);
     out.extend_from_slice(&canonical);
@@ -2231,8 +2231,14 @@ mod tests {
         verify(&decoded, &pub_bytes).expect("per-hop verify on decoded frame");
         verify_publisher(&decoded).expect("verify_publisher on decoded frame");
 
-        assert!(decoded.get("publisher_sig").is_some(), "decoded frame lost publisher_sig");
-        assert!(decoded.get("signature").is_some(), "decoded frame lost signature");
+        assert!(
+            decoded.get("publisher_sig").is_some(),
+            "decoded frame lost publisher_sig"
+        );
+        assert!(
+            decoded.get("signature").is_some(),
+            "decoded frame lost signature"
+        );
     }
 
     #[test]

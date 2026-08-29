@@ -316,9 +316,10 @@ async fn pubsub_round_trip_against_the_real_fleet() {
 #[ignore = "requires network access to a live macula-station"]
 async fn publish_survives_immediate_close_against_the_real_fleet() {
     let sub_identity = KeyPair::generate_with_default_puzzle();
-    let mut sub_session = connection::connect(STATION_HOST, STATION_PORT, Trust::WebPki, &sub_identity)
-        .await
-        .expect("handshake should succeed (subscriber)");
+    let mut sub_session =
+        connection::connect(STATION_HOST, STATION_PORT, Trust::WebPki, &sub_identity)
+            .await
+            .expect("handshake should succeed (subscriber)");
 
     let realm: [u8; 32] = rand::random();
     let topic = format!(
