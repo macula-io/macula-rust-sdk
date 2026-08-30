@@ -241,32 +241,48 @@ async fn cert_chain_direct_dial_round_trip_through_the_ffi_surface() {
             serve_task.abort();
             return;
         }
-        // GENUINE UNRESOLVED ISSUE, discovered live 2026-08-30, NOT root
-        // caused within this pass -- distinct from the station_endpoint
-        // staleness above (that fails fast at the RESOLVE stage; this
-        // fails only after a successful resolve+dial, at the full
-        // timeout, meaning the CALL frame was sent but the provider
-        // never answered it within budget). Two real bugs were found and
-        // fixed reaching this point (an identity collision between the
-        // resolver session and the internal direct-dial identity; and
-        // `serve_until_procedure` initially returning success on ANY
-        // served call rather than specifically this test's own) -- both
-        // confirmed real via reproducible before/after failure-mode
-        // changes. This third symptom persisted after both fixes,
-        // reproduced 4/4 on station-de-frankfurt specifically. The
-        // underlying cert-chain-authorized direct-dial mechanism itself
-        // is independently proven working by the core crate's own
-        // `tests/live_cert_chain.rs` (3 consecutive clean passes,
-        // verified earlier this session) using the SAME station-side
-        // behavior, so this looks specific to combining cert-chain
-        // direct-dial with THIS test's particular serve loop rather than
-        // the cert-chain mechanism itself -- flagged for follow-up
-        // investigation rather than chased further here.
+        // INVESTIGATED FURTHER 2026-08-30, still NOT root-caused, but
+        // narrowed a lot from the earlier (wrong) diagnosis below --
+        // corrections kept visible rather than silently rewritten, since
+        // each ruled-out theory is itself useful signal for whoever
+        // continues this:
+        //   1. NOT cert-chain-specific -- reproduced with a stripped
+        //      PLAIN (non-cert-chain) call_direct using this exact same
+        //      provider pattern.
+        //   2. NOT station-specific -- reproduced identically on both
+        //      station-de-frankfurt AND station-it-milan (an earlier
+        //      version of this comment claimed moving to Milan fixed it;
+        //      that was wrong, re-tested and disproven).
+        //   3. NOT about timeout-cancellation corrupting the read state
+        //      -- reproduced even with `serve_until_procedure`'s
+        //      per-attempt timeout raised to 60s / max_attempts=1, where
+        //      the internal timeout structurally cannot fire before the
+        //      call arrives.
+        //   4. The provider genuinely DOES answer the correct call:
+        //      confirmed by inspecting `serve_until_procedure`'s own
+        //      return value directly in an isolated repro -- it reports
+        //      `Ok(())` with the target procedure recorded as served.
+        //      Yet the caller's own `call_direct`/`call_with_cert_chain`
+        //      never receives ANY reply frame within the timeout. The
+        //      bug is specifically in reply DELIVERY back to a
+        //      direct-dialed caller, not in call routing to the
+        //      provider, and specifically reproduces through
+        //      `serve_until_procedure`'s helper-function/loop shape --
+        //      the plain single-`serve_one_call` tests elsewhere in this
+        //      session's test suite (which never go through this helper)
+        //      do not exhibit it. A prior version of this comment also
+        //      wrongly claimed the core crate's own `tests/live_cert_chain.rs`
+        //      proves the underlying mechanism works -- it doesn't; that
+        //      test only round-trips the DHT record, it never calls
+        //      `call_with_cert_chain`/`serve_one_call` at all. Next real
+        //      step for whoever picks this up: trace the actual RESULT
+        //      frame's call_id/routing on the wire between the provider's
+        //      reply and the direct-dialed target connection awaiting it.
         Err(FfiError::Call { reason }) if reason.contains("timed out waiting for a frame") => {
             eprintln!(
                 "SKIP: call_direct_with_cert_chain timed out waiting for a reply after a \
-                 successful resolve+dial -- genuine unresolved issue, see comment above, not \
-                 chased further in this pass: {reason}"
+                 successful resolve+dial -- genuine unresolved reply-delivery bug (see comment \
+                 above), not chased further in this pass: {reason}"
             );
             serve_task.abort();
             return;
