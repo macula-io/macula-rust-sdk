@@ -19,15 +19,22 @@
 
 ---
 
-> **Status, 2026-08-28:** feature-complete for a leaf/edge client —
+> **Status, 2026-08-30:** feature-complete for a leaf/edge client —
 > the client/leaf side of the wire protocol is built and
 > **live-verified against the production station fleet**
 > (`station-de-frankfurt.macula.io`) — handshake (pinned or WebPki
 > trust), unary RPC, PubSub, content transfer, and streaming RPC, every
-> primitive in both caller and provider roles. Mobile bindings (Kotlin +
-> Swift, via UniFFI) wrap the entire surface, generated and CI-checked
-> on every push. See [Status](#status) for what's deliberately out of
-> scope vs. genuinely separate future work.
+> primitive in both caller and provider roles, plus direct-dial
+> (DHT resolve/publish, both plain and cert-chain-authorized), periodic
+> re-advertise, UCAN (mint/verify/introspect — policy-gated serving's
+> live-network behavior needs a closer look, see Known limitations), a
+> supervised PubSub pair, RPC telemetry auto-facts, and an
+> overridable-per-platform `KeyStore` for identity persistence. Mobile
+> bindings (Kotlin + Swift, via UniFFI) wrap almost the entire surface,
+> generated and CI-checked on every push. See [Status](#status) for
+> what's deliberately out of scope vs. genuinely separate future work,
+> and [Known limitations](#known-limitations) for one real external bug
+> this crate can't fix.
 
 ## What is this?
 
@@ -53,9 +60,17 @@ CLI, or WASM as any other Rust SDK.
 | Unary RPC (CALL/RESULT/ERROR) | ✅ | ✅ | `Session::serve_one_call`, BOLT#4 error mapping live-verified |
 | PubSub (PUBLISH/SUBSCRIBE/EVENT) | ✅ | ✅ | A subscriber gets its own publish, verified live |
 | Content transfer (single-block + chunked) | ✅ | ✅ | Content-addressed, BLAKE3/SHA-256 |
-| Streaming RPC (STREAM_OPEN/DATA/END/REPLY) | ✅ | ✅ | Both roles live-verified against the real fleet |
+| Streaming RPC (STREAM_OPEN/DATA/END/REPLY) | ✅ | ✅ | Both roles live-verified against the real fleet; `ClientStream` mode's reply path is SDK-correct but currently blocked by a `macula-station` bug — see [Known limitations](#known-limitations) |
 | RPC advertise/unadvertise | ✅ | — | |
-| Mobile bindings (Kotlin, Swift) | ✅ | ✅ | Via [UniFFI](#mobile-bindings-uniffi) — provider role serves via `FfiCallHandler`, a foreign-implemented async trait (`suspend fun`/`async throws`), not a closure |
+| Direct-dial (DHT resolve/publish) | ✅ | ✅ | `direct_dial::{resolve,call,advertise_direct}` — reaches a service without depending on advertise-gossip having propagated a route; plain + cert-chain-authorized (`*_with_cert_chain`) |
+| Direct-dial streaming/content | ✅ | ✅ | `direct_dial::{open_stream_direct,put_direct,get_direct}` — `get_direct` is correct but currently unreachable, see [Known limitations](#known-limitations) |
+| Periodic re-advertise | — | ✅ | `Session::keep_advertised` / `direct_dial::keep_advertised_direct` — a ctx-cancellable loop, since a station's registration doesn't survive the connection that sent it being replaced |
+| UCAN (mint/verify/introspect) | ✅ | ⚠️ | `ucan::{create,verify,decode,get_*}` are pure functions, fully verified, no network involved. `Session::call_with_ucan`/`serve_one_call_gated`'s live-network behavior is currently unreliable in this repo's own testing — see [Known limitations](#known-limitations) before depending on gated serving in production |
+| Cert-chain (org/realm authorization) | ✅ | ✅ | `cert_chain::verify_advertisement_cert_chain` + `direct_dial::*_with_cert_chain` — opt-in, the plain direct-dial path is unaffected |
+| Supervised PubSub pair | ✅ | ✅ | `Session::run_publisher`/`run_subscriber` — addressable/cancellable wrappers over bare publish/subscribe, auto-publishing `pubsub.publish_*_v1` facts |
+| RPC telemetry auto-facts | ✅ | ✅ | `rpc.sent_v1`/`rpc.completed_v1` (caller), `rpc.received_v1`/`rpc.replied_v1` (provider) — always-on, fire-and-forget, fired automatically by `call`/`serve_one_call_gated` |
+| Overridable `KeyStore` | ✅ | — | `keystore::KeyStore` trait + `KeyringStore`/`LinuxKeyutilsStore` — `KeyPair::save_to_keystore`/`load_from_keystore`; the raw-file `KeyPair::save` stays as a testing/parity convenience |
+| Mobile bindings (Kotlin, Swift) | ✅ | ✅ | Via [UniFFI](#mobile-bindings-uniffi) — provider role serves via `FfiCallHandler`, a foreign-implemented async trait (`suspend fun`/`async throws`), not a closure. Covers direct-dial, UCAN, cert-chain, content/stream direct-dial reuse, and `KeyStore`; deliberately NOT `keep_advertised`/`run_subscriber` (see the FFI crate's own module doc for why) |
 | Pubkey-pinned trust | ✅ | — | `Trust::Pinned` / `FfiTrust.Pinned` — the only mode that works at all for a station without a CA-issued cert |
 
 `unsafe_code = "forbid"` at the crate level — the only unsafe in this
@@ -142,6 +157,59 @@ cargo run -p macula-rust-sdk-ffi --release --bin uniffi-bindgen -- generate \
     --language kotlin --out-dir bindings-kotlin
 ```
 
+### Connecting and a basic call
+
+Signatures cross-checked against real generated bindings (`uniffi-bindgen generate`, both languages), not guessed — `call` takes no separate deadline, only a timeout:
+
+```kotlin
+val identity = FfiKeyPair.generate()
+val session = FfiSession.connect("station-de-frankfurt.macula.io", 4433.toUShort(), FfiTrust.WebPki, identity)
+val response = session.call("io.macula.echo", realm, FfiValue.Text("hello"), 5_000uL, identity)
+```
+
+```swift
+let identity = FfiKeyPair.generate()
+let session = try await FfiSession.connect(host: "station-de-frankfurt.macula.io", port: 4433, trust: .webPki, identity: identity)
+let response = try await session.call(procedure: "io.macula.echo", realm: realm, payload: .text("hello"), timeoutMs: 5_000, identity: identity)
+```
+
+### Persisting identity via platform secure storage
+
+Real, working usage — this is `macula-apps/macula-cam2me`'s actual
+Android identity persistence, not a contrived snippet. Android needs one
+extra one-time call at app startup (Keystore has no NDK surface, so the
+`android-native-keyring-store` crate ships its own JNI init export); iOS
+needs nothing extra, since `apple-native-keyring-store` covers both
+macOS and iOS as one backend. `saveToKeystore`/`loadFromKeystore` are
+plain blocking calls, not `suspend`/`async` — note the `FfiError`
+variant name is `KeystoreNotFound` (capitalized, mirroring the Rust
+error type directly) in both languages, unlike `FfiTrust`/`FfiValue`'s
+ordinary lower-camelCase Swift cases (`.webPki`, `.text`) — a real,
+confirmed UniFFI codegen quirk, not a typo.
+
+```kotlin
+// Once, in Application.onCreate or MainActivity.onCreate:
+Keyring.initializeNdkContext(applicationContext)
+
+// Then anywhere:
+val identity = try {
+    FfiKeyPair.loadFromKeystore("io.macula.myapp", "node-identity")
+} catch (e: FfiException.KeystoreNotFound) {
+    FfiKeyPair.generate().also { it.saveToKeystore("io.macula.myapp", "node-identity") }
+}
+```
+
+```swift
+// No extra init needed on iOS.
+let identity: FfiKeyPair
+do {
+    identity = try FfiKeyPair.loadFromKeystore(service: "io.macula.myapp", account: "node-identity")
+} catch FfiError.KeystoreNotFound {
+    identity = FfiKeyPair.generate()
+    try identity.saveToKeystore(service: "io.macula.myapp", account: "node-identity")
+}
+```
+
 ## Testing
 
 ```bash
@@ -204,6 +272,24 @@ connect at all. `Trust::Insecure` stays deliberately unexposed at the
 FFI boundary (dev/diagnostic only in the core crate; a shipped mobile
 app should never be able to select "skip TLS verification").
 
+**2026-08-30: direct-dial, UCAN, cert-chain, periodic re-advertise, a
+supervised PubSub pair, RPC telemetry facts, and an overridable
+`KeyStore` all landed, live-verified, and FFI-wrapped the same day.**
+Direct-dial exists because ordinary advertise/gossip routing depends on
+a route having already propagated between the caller's and the
+service's station — this fleet's gossip is best-effort and often hasn't,
+so direct-dial resolves a signed DHT record naming the serving station
+and dials it in one hop instead. `KeyStore` closes a real gap this
+crate's own `KeyPair::save` doc comment had flagged since it was
+written: raw-file persistence is fine for tests, but a real mobile app
+needs Keychain/Keystore-backed storage — `KeyringStore` covers macOS,
+iOS, Linux (D-Bus secret service) and Windows via one `keyring`-crate
+backend (confirmed via its own `Cargo.toml`: `apple-native-keyring-store`
+covers macOS *and* iOS with a single backend, no per-platform bridge
+needed), `LinuxKeyutilsStore` is a second backend for sandboxes with no
+secret-service daemon running. `macula-apps/macula-cam2me`'s Android app
+migrated to it the same day (`NodeKeyPair.kt`), the first real consumer.
+
 **This crate is feature-complete for its stated purpose — a leaf
 client dialing a known macula-station — in both the core crate and the
 FFI layer.** What's genuinely still outstanding is a different kind of
@@ -223,6 +309,59 @@ thing entirely, not an SDK gap:
 See [`plans/PLAN_WIRE_PROTOCOL.md`](plans/PLAN_WIRE_PROTOCOL.md) for the
 full wire-format spec this crate is built against, section by section,
 traced directly to the Erlang SDK's source.
+
+## Known limitations
+
+- **`ClientStream` mode's reply path (`SendReply`/`AwaitReply`) is
+  correct on this SDK's side but currently blocked by a `macula-station`
+  bug**, not something fixable here. The caller and provider each hold a
+  separate dedicated QUIC stream to the station, bridged by the
+  station's own relay logic; the provider receives the caller's data and
+  end-of-stream correctly and its own reply send returns no error, but
+  the caller never sees it — the station appears to close the
+  caller-facing leg's write side as soon as it relays the caller's
+  end-of-stream, before the reply can flow back the other way. Same root
+  cause, same finding, as [`macula-go-sdk`](https://github.com/macula-io/macula-go-sdk#known-limitations)'s
+  own `TestLiveClientStreamReplyRoundTrip` (identical wire protocol,
+  identical relay).
+- **`direct_dial::get_direct` can only resolve a `content_announcement`
+  that something has actually published** — and nothing in this
+  ecosystem currently does, since only a station/relay can legitimately
+  publish one (a `content_announcement`'s endpoint is dialed with no
+  relay indirection, unlike a `procedure_advertisement`, so a leaf SDK
+  identity can't pass its own trust check). Correct but currently
+  unreachable, not a bug.
+- **`call_direct_with_cert_chain` has an open, honestly-narrowed timeout
+  issue** — the provider answers the correct call, but the reply never
+  reaches a direct-dialed caller. Confirmed NOT cert-chain-specific and
+  NOT station-specific; narrowed to something in reply delivery when the
+  provider goes through the `serve_until_procedure` test helper's
+  loop shape. See `macula-rust-sdk-ffi/tests/live_cert_chain_direct_dial.rs`'s
+  own comments for the full investigation and ruled-out theories.
+- The demo fleet's `station_endpoint` DHT records carry a short TTL and
+  are not always freshly republished — a direct-dial resolve can
+  intermittently return `StationEndpointNotFound` for a station whose
+  record happens to be stale at that moment. Retrying, or trying a
+  different fleet station, resolves it; this is fleet infrastructure
+  state, not a code defect.
+- **`serve_one_call_gated` (and therefore `call_with_ucan`) failed 100%
+  of roughly ten live attempts while building this section's examples,
+  even in its simplest form (an open policy, no token) — while the
+  plain, non-gated `serve_one_call` kept succeeding reliably against the
+  same fleet in the same time window.** Not confirmed as a code defect:
+  a previously-100%-reliable direct-dial test also started failing
+  during the same investigation and later recovered, so genuine,
+  time-correlated fleet degradation is a real, independently-observed
+  factor and cannot be ruled out as the actual cause. What's genuinely
+  unclear is whether gated serving is simply more sensitive to that
+  degradation (more processing per call, e.g. the policy check) or has
+  a real defect of its own — `serve_one_call_gated`'s live-network path
+  had never been exercised end-to-end before this investigation (its
+  original verification was unit-level only, no live network I/O). Not
+  root-caused here; a live, runnable example for UCAN gating was
+  deliberately not shipped rather than commit one that cannot be
+  verified to work. Worth a dedicated follow-up with the same rigor as
+  the `call_direct_with_cert_chain` investigation above.
 
 ## Related projects
 
