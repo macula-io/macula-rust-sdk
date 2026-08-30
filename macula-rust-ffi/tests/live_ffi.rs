@@ -127,7 +127,7 @@ async fn serve_until_procedure(
 /// `FfiCallHandler` trait; a separate session/identity resolves and calls
 /// it, and gets back a real RESULT it can inspect via `FfiValue`/
 /// `FfiCallResponse` — not just "reached the call stage" (see this
-/// session's own `macula-go-sdk`/`macula-rust` history for why that
+/// session's own `macula-go`/`macula-rust` history for why that
 /// weaker bar isn't good enough: it already hid a real
 /// missing-plain-ADVERTISE bug in `advertise_direct` once).
 #[tokio::test]
@@ -416,7 +416,7 @@ async fn ucan_gated_serve_one_call_through_the_ffi_surface() {
     // connection the instant it receives a CALL frame carrying a
     // non-empty `ucan_token` field (case 1 above, an EMPTY token, works
     // fine; this is specifically about a real, non-empty one). The client
-    // side (this crate, and macula-go-sdk's equivalent) sends exactly
+    // side (this crate, and macula-go's equivalent) sends exactly
     // what the wire protocol plan documents; the station itself was never
     // updated to tolerate the field. UCAN support was built and
     // unit-tested in both SDKs this session but this is the first attempt

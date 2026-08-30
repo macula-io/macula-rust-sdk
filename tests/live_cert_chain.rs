@@ -7,7 +7,7 @@
 //! No fleet provisioning needed: the realm CA/leaf chain is entirely
 //! self-issued by this test, since cert-chain authorization is a
 //! client-side check on an opaque DHT payload the station itself never
-//! inspects (mirrors `macula-go-sdk`'s `TestLiveResolveWithCertChain`,
+//! inspects (mirrors `macula-go`'s `TestLiveResolveWithCertChain`,
 //! which makes the same observation).
 //!
 //! Not run by default CI — `#[ignore]`d, matching this crate's other live

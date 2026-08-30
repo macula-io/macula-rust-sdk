@@ -298,7 +298,7 @@ async fn pubsub_round_trip_against_the_real_fleet() {
 }
 
 /// Real end-to-end proof that `run_subscriber`/`run_publisher` work, not
-/// just compile — same discipline as `macula-go-sdk`'s
+/// just compile — same discipline as `macula-go`'s
 /// `TestLiveRunSubscriberAndRunPublisher`: three SEPARATE sessions/
 /// identities (this fleet kicks whichever connection reuses an identity
 /// second, confirmed elsewhere this session), a subscriber genuinely
@@ -405,7 +405,7 @@ async fn run_subscriber_and_run_publisher_against_the_real_fleet() {
     // exactly one specific thing, but this is a SHARED PUBLIC demo fleet
     // with other real traffic on the wire, so a single call can genuinely
     // catch something unrelated first. Retry past that within an overall
-    // deadline, same resilience macula-go-sdk's RPC-telemetry-facts test
+    // deadline, same resilience macula-go's RPC-telemetry-facts test
     // needed for the identical reason.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     let mut confirmed = false;
@@ -442,7 +442,7 @@ async fn run_subscriber_and_run_publisher_against_the_real_fleet() {
 }
 
 /// Regression test for a real bug found live 2026-08-29 in the Go port
-/// of this exact `connect -> write -> Close` shape (macula-go-sdk's
+/// of this exact `connect -> write -> Close` shape (macula-go's
 /// `connection.Session.Close`): a PUBLISH sent immediately before
 /// `close` -- exactly what every one-shot CLI/tool invocation does --
 /// could be silently dropped, because `Connection::close` is abrupt and
@@ -982,7 +982,7 @@ async fn unary_call_provider_round_trip_against_the_real_fleet() {
 /// public fleet — with only one call made under a realm nobody else
 /// uses, there is exactly one of each fact to expect, so no request_id
 /// correlation against unrelated traffic is needed here (unlike
-/// `macula-go-sdk`'s equivalent test, which had to add that specifically
+/// `macula-go`'s equivalent test, which had to add that specifically
 /// because it published under a FIXED, shared topic/realm).
 #[tokio::test]
 #[ignore = "requires network access to a live macula-station"]

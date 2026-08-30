@@ -5,7 +5,7 @@
 //! stations happen to be involved.
 //!
 //! Ported from `macula-io/macula`'s `macula_direct_dial.erl`, cross-checked
-//! against `macula-go-sdk`'s own port of the same reference
+//! against `macula-go`'s own port of the same reference
 //! (`directdial/directdial.go`) — see that file's doc for the fuller
 //! reasoning behind each design choice made here.
 //!
@@ -21,7 +21,7 @@
 //!
 //! `cert_chain`-based org/realm authorization (Slice 7c Direction B,
 //! `macula_record:verify_advertisement_cert_chain/3` on the Erlang side) is
-//! opt-in here too, matching the reference and `macula-go-sdk`'s own port —
+//! opt-in here too, matching the reference and `macula-go`'s own port —
 //! see [`resolve_with_cert_chain`]/[`call_with_cert_chain`]/
 //! [`advertise_direct_with_cert_chain`]. Plain [`resolve`]/[`call`]/
 //! [`advertise_direct`] are completely unaffected.
@@ -433,7 +433,7 @@ pub async fn call_with_cert_chain(
 /// station to skip inter-station gossip propagation — it is not a
 /// substitute for the station actually knowing to route inbound CALLs
 /// here. **Found live, 2026-08-30**: an earlier version of this function
-/// (and its `macula-go-sdk` port, same gap, not yet fixed there as of this
+/// (and its `macula-go` port, same gap, not yet fixed there as of this
 /// writing) published only the DHT record — a direct-dial caller could
 /// resolve and dial the right station, but the station itself had never
 /// been told to route the call anywhere, so every call still failed with
@@ -529,7 +529,7 @@ impl std::error::Error for AdvertiseDirectError {}
 /// [`advertise_direct`] (unlike Erlang's `advertise/5`, which spawns a real
 /// per-call OTP supervisor) is already a stateless, side-effect-free-on-
 /// repeat async function: nothing is created per tick that could leak —
-/// same reasoning `macula-go-sdk`'s `KeepAdvertisedDirect` already applied
+/// same reasoning `macula-go`'s `KeepAdvertisedDirect` already applied
 /// and verified live.
 ///
 /// `interval` should leave real margin before `ttl` expires — production
@@ -770,7 +770,7 @@ impl std::error::Error for PutDirectError {}
 /// DHT for `station`'s `station_endpoint`; it does not need to already be
 /// connected to `station`.
 ///
-/// **Caveat found live in `macula-go-sdk`'s port of this same function**:
+/// **Caveat found live in `macula-go`'s port of this same function**:
 /// if `resolve_via` happens to already be connected to `station` (the
 /// common case when the caller doesn't have a separate resolver session),
 /// this call's own internal dial reuses `id` against the SAME station

@@ -249,7 +249,7 @@ Unary-RPC provider dispatch was the one gap left after the streaming
 and content-transfer provider roles landed — a service built on this
 crate could call RPCs and serve streams, but couldn't serve a
 request/response procedure at all. It's now built here and in
-[`macula-go-sdk`](https://github.com/macula-io/macula-go-sdk) in the
+[`macula-go`](https://github.com/macula-io/macula-go) in the
 same pass, so both SDKs serve RPCs, not just call them, and wrapped in
 the FFI layer the same day: [`FfiCallHandler`](#mobile-bindings-uniffi)
 is a **foreign trait** (`#[uniffi::export(foreign)]`), not a callback
@@ -321,7 +321,7 @@ traced directly to the Erlang SDK's source.
   the caller never sees it — the station appears to close the
   caller-facing leg's write side as soon as it relays the caller's
   end-of-stream, before the reply can flow back the other way. Same root
-  cause, same finding, as [`macula-go-sdk`](https://github.com/macula-io/macula-go-sdk#known-limitations)'s
+  cause, same finding, as [`macula-go`](https://github.com/macula-io/macula-go#known-limitations)'s
   own `TestLiveClientStreamReplyRoundTrip` (identical wire protocol,
   identical relay).
 - **`direct_dial::get_direct` can only resolve a `content_announcement`

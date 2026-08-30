@@ -11,14 +11,14 @@
 //! all, only generic `ed25519-dalek`/`serde_json`/`base64`/`sha2` — because
 //! no library implements 0.10.0 (the only actively maintained Rust/Go UCAN
 //! libraries target the incompatible 1.0.0-rc.1 CBOR/IPLD format, per
-//! `macula-go-sdk`'s own `ucan` package doc, which made the identical
+//! `macula-go`'s own `ucan` package doc, which made the identical
 //! choice porting this same reference). This module does the same: hand-
 //! rolled on the crypto/serialization primitives already in this crate
 //! (`ed25519-dalek` via [`crate::identity`], plus `serde`/`serde_json`/
 //! `base64` added for this module), matching the reference exactly rather
 //! than adopting an incompatible library.
 //!
-//! A token minted here verifies against `macula-go-sdk`'s `ucan` package,
+//! A token minted here verifies against `macula-go`'s `ucan` package,
 //! the Erlang macula SDK, or vice versa — same header shape, same payload
 //! field names (`iss`/`aud`/`exp`/`nbf`/`nnc`/`cap`/`fct`/`prf`), same
 //! signing input (`header_b64 + "." + payload_b64`), same algorithm. Field
@@ -26,7 +26,7 @@
 //! decodes into a struct, never re-encodes and compares bytes) — only the
 //! field NAMES and the exact bytes signed matter.
 //!
-//! Cross-referenced against `macula-go-sdk/ucan/{ucan,policy}.go`, itself
+//! Cross-referenced against `macula-go/ucan/{ucan,policy}.go`, itself
 //! independently verified against this same Erlang/Rust reference earlier
 //! this session — the two ports should stay behaviorally identical.
 

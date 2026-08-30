@@ -1,7 +1,7 @@
 //! Live proof that direct-dial's resolve-and-dial core, already verified
 //! for plain RPC (`tests/live_station.rs`) and cert-chain authorization
 //! (`tests/live_cert_chain.rs`), reuses cleanly for streaming and content
-//! transfer too — mirrors `macula-go-sdk`'s own `OpenStreamDirect`/
+//! transfer too — mirrors `macula-go`'s own `OpenStreamDirect`/
 //! `PutDirect`/`GetDirect` live tests.
 //!
 //! Separate identities per role throughout: this fleet enforces one

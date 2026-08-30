@@ -5,7 +5,7 @@
 //!
 //! Ported from `macula-io/macula`'s `src/record/macula_record.erl` and
 //! `src/macula.erl` (the `put_record`/`find_record`/`find_records` facade),
-//! cross-checked against `macula-go-sdk`'s own port of the same reference
+//! cross-checked against `macula-go`'s own port of the same reference
 //! (`dht/record.go`, `dht/client.go`) — see those files' doc comments for
 //! the fuller reasoning behind each field. Only the two record types
 //! direct-dial needs are ported; add more constructors here as other
@@ -398,7 +398,7 @@ pub fn read_station_endpoint(r: &Record) -> Result<StationEndpoint, ReadRecordEr
     // Erlang binary, unlike every other string field in this record (which
     // wraps with `{text, Bin}`) — so on the wire these are CBOR BYTE
     // strings (major type 2), not text strings, confirmed against a real
-    // station's own published record while building `macula-go-sdk`'s
+    // station's own published record while building `macula-go`'s
     // equivalent. Try bytes first, text as a fallback in case a future
     // publisher wraps these properly.
     let host_advertised = match r.payload.get("host_advertised") {
@@ -787,7 +787,7 @@ mod tests {
         // macula_record.erl's with_host_list/2 puts each host in as a bare
         // Erlang binary -- on the wire these decode as CBOR byte strings
         // (major type 2), not text, confirmed against a real station's own
-        // published record while building macula-go-sdk's equivalent. This
+        // published record while building macula-go's equivalent. This
         // guards that this crate reads that shape too, not just a
         // hypothetical text-wrapped one.
         let rec = Record {

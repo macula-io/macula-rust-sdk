@@ -621,7 +621,7 @@ impl Session {
     /// spawns a real per-call OTP supervisor and so needs a `reuse_sup`
     /// option to avoid leaking one per tick), so there is nothing
     /// equivalent to worry about leaking here — same reasoning
-    /// `macula-go-sdk`'s `KeepAdvertised` already applied and verified
+    /// `macula-go`'s `KeepAdvertised` already applied and verified
     /// live.
     ///
     /// A failed tick is reported via `on_error` but does not stop the
@@ -799,7 +799,7 @@ impl Session {
     /// reached the peer -- `Connection::close` is abrupt and does not
     /// wait for outstanding stream data to be delivered. Found live
     /// 2026-08-29 in the Go port of this exact pattern
-    /// (macula-go-sdk's connection.Session.Close): a PUBLISH sent
+    /// (macula-go's connection.Session.Close): a PUBLISH sent
     /// immediately before Close intermittently never reached the peer,
     /// root-caused to this race. Fixed proactively here before it was
     /// independently rediscovered against this crate -- same doc
@@ -896,7 +896,7 @@ impl Session {
     /// exactly like `serve_one_call` skips a non-"call" frame — it is NOT
     /// treated as fatal the way `recv_event`'s own contract treats any
     /// parse failure. Confirmed live in the Go port of this exact pattern
-    /// (`macula-go-sdk`'s `Session.RunSubscriber`): without this, a single
+    /// (`macula-go`'s `Session.RunSubscriber`): without this, a single
     /// non-EVENT frame arriving on the control stream aborted the whole
     /// subscriber loop.
     ///
@@ -1041,7 +1041,7 @@ impl std::error::Error for RunSubscriberError {}
 // `Opts` map with a `true` default (`maps:get(announce, Opts, true)`) --
 // technically overridable -- but the one real caller in this workspace
 // (`hecate_om_capabilities.erl`'s `advertise_opts/1`) never sets it to
-// `false`. Matching Go's `macula-go-sdk` decision here: no toggle exposed
+// `false`. Matching Go's `macula-go` decision here: no toggle exposed
 // on either side, since exposing one on `call`/`serve_one_call_gated` --
 // this crate's two most heavily used functions -- for an option nothing
 // in the reference ecosystem actually flips would be a real-blast-radius
@@ -1160,7 +1160,7 @@ async fn announce_rpc_replied(
 /// Fires `rpc.received_v1`/`rpc.replied_v1` around dispatch when `session`
 /// is `Some` -- `None` for the pure dispatch-logic unit tests in
 /// `ucan_gating_tests` below, which deliberately exercise this function
-/// with no network at all (mirrors `macula-go-sdk`'s identical
+/// with no network at all (mirrors `macula-go`'s identical
 /// nil-session-safe `announceFact`). `rpc.received_v1` fires only after
 /// `policy` and `lookup` both pass, matching `macula_response.erl`'s own
 /// per-request child only starting once the raw advertise mechanism
@@ -1243,7 +1243,7 @@ mod ucan_gating_tests {
     //! Proves `serve_one_call_gated`'s policy wiring end-to-end WITHOUT a
     //! network — `build_call_reply` is a plain async function of
     //! `(CallInfo, lookup, policy, self_pub)`, so its dispatch/reply logic
-    //! is fully testable in isolation. Mirrors `macula-go-sdk`'s own 4
+    //! is fully testable in isolation. Mirrors `macula-go`'s own 4
     //! connection-level UCAN-gating unit tests (`serve_ucan_test.go`).
     use super::*;
     use crate::identity::KeyPair;

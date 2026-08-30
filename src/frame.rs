@@ -2159,8 +2159,8 @@ mod tests {
     // (macula-io/macula, src/peering/macula_frame.erl:sign_publisher/2),
     // live in a rebar3 shell against the same fixed identity every other
     // vector test in this file uses. First publisher_sig implementation
-    // in any repo as of 2026-08-29 (macula-go-sdk, macula-rust,
-    // macula-dotnet-sdk all lacked it) -- no prior port existed to
+    // in any repo as of 2026-08-29 (macula-go, macula-rust,
+    // macula-dotnet all lacked it) -- no prior port existed to
     // cross-check against instead, so this is checked straight against
     // the Erlang source of truth.
     #[test]
@@ -2211,7 +2211,7 @@ mod tests {
 
     // Full encode/decode round trip with BOTH publisher_sig and the
     // per-hop signature present, mirroring exactly what a real caller
-    // (macula-go-sdk's connection.Session.Publish does this already;
+    // (macula-go's connection.Session.Publish does this already;
     // this crate's own connection layer should too) would build.
     #[test]
     fn publish_frame_with_both_signatures_round_trips() {

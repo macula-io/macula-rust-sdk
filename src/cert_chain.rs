@@ -12,7 +12,7 @@
 //! — same algorithm, using `rustls-webpki`'s native path validation instead
 //! of hand-rolling `pkix_path_validation`, and `x509-parser` (already used
 //! by [`crate::cert`] for the unrelated TLS pubkey-pinning tier) for field
-//! extraction. Cross-checked against `macula-go-sdk`'s own port
+//! extraction. Cross-checked against `macula-go`'s own port
 //! (`dht/cert_chain.go`), which uses `crypto/x509`'s native path validation
 //! the same way. Opt-in: this has no effect on plain (non-cert-chain)
 //! direct-dial, which remains exactly as it was.
