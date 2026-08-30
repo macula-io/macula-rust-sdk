@@ -39,6 +39,8 @@ use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
 use rand::rngs::OsRng;
 use sha2::{Digest, Sha256};
 
+use crate::keystore::{KeyStore, KeyStoreError};
+
 /// Matches `?DEFAULT_PUZZLE_DIFFICULTY` in `macula_identity.erl`. Grinding
 /// at this difficulty is sub-millisecond — see the module doc.
 pub const DEFAULT_PUZZLE_DIFFICULTY: u32 = 8;
@@ -167,6 +169,24 @@ impl KeyPair {
             return Err(LoadKeyError::PubkeyMismatch);
         }
         Ok(keypair)
+    }
+
+    /// Persist this keypair's seed to `store` — see `crate::keystore`'s
+    /// module doc for why this, not [`save`](Self::save), is what a real
+    /// mobile (or otherwise security-sensitive) binding should use.
+    pub fn save_to_keystore(&self, store: &dyn KeyStore) -> Result<(), KeyStoreError> {
+        store.save_seed(&self.private_bytes())
+    }
+
+    /// Reconstruct a keypair from a seed previously written by
+    /// [`save_to_keystore`](Self::save_to_keystore). Unlike
+    /// [`load`](Self::load), there is no separately-stored public key to
+    /// cross-check — a keystore-backed secret is either exactly the seed
+    /// this method wrote or [`KeyStoreError::InvalidSeedLength`], and the
+    /// public key a seed derives is always internally consistent by
+    /// construction (see [`from_seed_bytes`](Self::from_seed_bytes)).
+    pub fn load_from_keystore(store: &dyn KeyStore) -> Result<Self, KeyStoreError> {
+        Ok(Self::from_seed_bytes(store.load_seed()?))
     }
 }
 

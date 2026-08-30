@@ -93,12 +93,27 @@ pub enum FfiError {
     DirectDialTrustViolation { resolved: Vec<u8>, dialed: Vec<u8> },
     #[error("UCAN operation failed: {reason}")]
     Ucan { reason: String },
+    #[error("no seed is stored under this keystore identity")]
+    KeystoreNotFound,
+    #[error("platform secure store error: {reason}")]
+    Keystore { reason: String },
 }
 
 impl From<macula_rust_sdk::ucan::UcanError> for FfiError {
     fn from(e: macula_rust_sdk::ucan::UcanError) -> Self {
         FfiError::Ucan {
             reason: e.to_string(),
+        }
+    }
+}
+
+impl From<macula_rust_sdk::keystore::KeyStoreError> for FfiError {
+    fn from(e: macula_rust_sdk::keystore::KeyStoreError) -> Self {
+        match e {
+            macula_rust_sdk::keystore::KeyStoreError::NotFound => FfiError::KeystoreNotFound,
+            other => FfiError::Keystore {
+                reason: other.to_string(),
+            },
         }
     }
 }
@@ -779,6 +794,38 @@ impl FfiKeyPair {
     /// since it deterministically reconstructs this keypair.
     pub fn private_bytes(&self) -> Vec<u8> {
         self.0.private_bytes().to_vec()
+    }
+
+    /// Persist this identity's seed to the platform's native secure store
+    /// — Keychain on macOS/iOS, Secret Service on Linux, Credential
+    /// Manager on Windows, Keystore on Android — instead of handling the
+    /// raw bytes from [`private_bytes`](Self::private_bytes) yourself. See
+    /// `macula_rust_sdk::keystore`'s module doc for the full platform
+    /// story, including Android's one-time `initializeNdkContext` setup
+    /// requirement (unrelated to this method itself — a property of that
+    /// platform's Keystore, not something this crate can do for you).
+    ///
+    /// `service`/`account` address the credential the same way every
+    /// `keyring` consumer does — e.g. `("com.example.myapp",
+    /// "macula-identity")` — pick values scoped to your application, since
+    /// the underlying store is a shared OS-wide facility, not sandboxed to
+    /// this crate.
+    pub fn save_to_keystore(&self, service: String, account: String) -> Result<(), FfiError> {
+        let store = macula_rust_sdk::keystore::KeyringStore::new(&service, &account)?;
+        self.0.save_to_keystore(&store)?;
+        Ok(())
+    }
+
+    /// Reconstruct a keypair previously persisted with
+    /// [`save_to_keystore`](Self::save_to_keystore). Fails with
+    /// [`FfiError::KeystoreNotFound`] if nothing has been stored yet under
+    /// this `service`/`account` pair.
+    #[uniffi::constructor]
+    pub fn load_from_keystore(service: String, account: String) -> Result<Self, FfiError> {
+        let store = macula_rust_sdk::keystore::KeyringStore::new(&service, &account)?;
+        Ok(Self(
+            macula_rust_sdk::identity::KeyPair::load_from_keystore(&store)?,
+        ))
     }
 }
 

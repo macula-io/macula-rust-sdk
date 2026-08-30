@@ -16,6 +16,7 @@ pub mod dht;
 pub mod direct_dial;
 pub mod frame;
 pub mod identity;
+pub mod keystore;
 pub mod manifest;
 pub mod stream;
 pub mod transport;

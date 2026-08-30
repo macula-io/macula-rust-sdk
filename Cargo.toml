@@ -39,6 +39,27 @@ blake3 = "1.5"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 base64 = "0.22"
+# keystore.rs: platform-native secure storage for a persisted seed
+# (Keychain via Security.framework on macOS/iOS, Secret Service via D-Bus
+# on Linux, Credential Manager on Windows, Keystore via JNI on Android —
+# each selected automatically per target by keyring's own Cargo.toml
+# target-cfg blocks, not by any feature switching we do here). `v1`
+# (default) already covers macOS/iOS/Windows/Linux; `android-native-keyring-store`
+# is added explicitly since it is NOT part of `v1`'s default set.
+keyring = { version = "4", features = ["android-native-keyring-store"] }
+# keystore.rs's LinuxKeyutilsStore: a second, independently-selectable
+# KeyStore backend demonstrating the trait is genuinely overridable, not
+# just declared to be — uses the kernel's own keyutils facility directly
+# (no D-Bus/secret-service daemon required), which is what makes it real-
+# world useful on headless Linux (containers, CI, this dev sandbox) where
+# no secret-service provider is running. Built via keyring-core's
+# CredentialStoreApi::build() directly against one Store instance, NOT
+# through keyring's own v1::Entry/set_default_store (a process-global,
+# would collide with KeyringStore's own default-store selection if both
+# were used in one process).
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring-core = "1"
+linux-keyutils-keyring-store = "1"
 
 [dev-dependencies]
 hex = "0.4"
