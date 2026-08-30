@@ -344,24 +344,28 @@ traced directly to the Erlang SDK's source.
   record happens to be stale at that moment. Retrying, or trying a
   different fleet station, resolves it; this is fleet infrastructure
   state, not a code defect.
-- **`serve_one_call_gated` (and therefore `call_with_ucan`) failed 100%
-  of roughly ten live attempts while building this section's examples,
-  even in its simplest form (an open policy, no token) — while the
-  plain, non-gated `serve_one_call` kept succeeding reliably against the
-  same fleet in the same time window.** Not confirmed as a code defect:
-  a previously-100%-reliable direct-dial test also started failing
-  during the same investigation and later recovered, so genuine,
-  time-correlated fleet degradation is a real, independently-observed
-  factor and cannot be ruled out as the actual cause. What's genuinely
-  unclear is whether gated serving is simply more sensitive to that
-  degradation (more processing per call, e.g. the policy check) or has
-  a real defect of its own — `serve_one_call_gated`'s live-network path
-  had never been exercised end-to-end before this investigation (its
-  original verification was unit-level only, no live network I/O). Not
-  root-caused here; a live, runnable example for UCAN gating was
-  deliberately not shipped rather than commit one that cannot be
-  verified to work. Worth a dedicated follow-up with the same rigor as
-  the `call_direct_with_cert_chain` investigation above.
+- **RESOLVED**: an earlier draft of this section reported
+  `serve_one_call_gated`/`call_with_ucan` failing 100% of live attempts
+  while `serve_one_call` succeeded reliably in the same window, and left
+  it as an open, unconfirmed question. Root-caused: it was a test-harness
+  bug, not a real difference between gated and plain serving. The failing
+  harness spawned the provider's `Session` into a task that dropped it
+  the instant `serve_one_call`/`serve_one_call_gated` returned; `Session`
+  has no `Drop` impl, so the underlying QUIC connection can close before
+  the just-sent reply frame is actually flushed to the peer — the exact
+  same class of race already documented on [`Session::close`], just
+  never hit by drop instead of an explicit close before now. Confirmed
+  by direct A/B: 8/8 plain AND 8/8 gated calls succeeded once the
+  provider session was kept alive briefly after serving, interleaved on
+  the same station in the same window; the pre-existing
+  `unary_call_provider_round_trip_against_the_real_fleet` test also
+  passed 3/3 at the same moment, ruling out the fleet-degradation theory
+  entirely for this specific finding. **Practical takeaway for any
+  caller**: don't let a `Session` drop immediately after `serve_one_call`/
+  `publish`/any send-then-return call — keep it alive briefly (or call
+  [`Session::close`] explicitly) so in-flight writes have time to reach
+  the wire. See `examples/ucan.rs` for a real, live-verified gated-serving
+  example built once this was root-caused.
 
 ## Related projects
 
