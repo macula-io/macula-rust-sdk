@@ -29,3 +29,11 @@ uniffi = { version = "0.32", features = ["cli", "tokio"] }
 tokio = { version = "1", features = ["full"] }
 thiserror = "2"
 async-trait = "0.1"
+
+[dev-dependencies]
+# tests/live_cert_chain_direct_dial.rs's self-issued realm CA/leaf fixture,
+# mirroring ../tests/live_cert_chain.rs's own — versions matched to the
+# core crate's own pins.
+rcgen = { version = "0.13", default-features = false, features = ["pem", "ring", "x509-parser"] }
+time = "0.3"
+base64 = "0.22"

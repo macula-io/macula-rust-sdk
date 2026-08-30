@@ -798,8 +798,11 @@ name = "macula-rust-sdk-ffi"
 version = "0.2.0"
 dependencies = [
  "async-trait",
+ "base64",
  "macula-rust-sdk",
+ "rcgen",
  "thiserror 2.0.20",
+ "time",
  "tokio",
  "uniffi",
 ]

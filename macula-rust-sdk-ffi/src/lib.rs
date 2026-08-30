@@ -12,16 +12,34 @@
 //! CONNECT/HELLO (either [`FfiTrust::Pinned`] or [`FfiTrust::WebPki`] —
 //! see that type's own doc for when each applies), CALL/RESULT/ERROR as
 //! both caller AND provider (`call`/[`FfiSession::serve_one_call`]),
-//! PUBLISH/SUBSCRIBE/EVENT, content transfer, and streaming RPC — both
+//! UCAN-gated serving ([`FfiSession::serve_one_call_gated`]/
+//! [`FfiSession::call_with_ucan`]) and the standalone `ucan_*` mint/verify/
+//! introspect functions, PUBLISH/SUBSCRIBE/EVENT (including the supervised
+//! [`FfiSession::run_publisher`]), content transfer, streaming RPC — both
 //! the caller/consumer role (§13.1) and the provider role (§13.2/§6.9,
-//! `advertise`/`accept_stream`), and direct-dial resolution
+//! `advertise`/`accept_stream`), direct-dial resolution
 //! ([`FfiSession::resolve_direct`]/[`call_direct`](FfiSession::call_direct)/
-//! [`advertise_direct`](FfiSession::advertise_direct)). Not exposed:
-//! `Trust::Insecure` — deliberately, see [`FfiTrust`]'s own doc; the core
-//! crate's `keep_advertised`/`keep_advertised_direct` background-loop
-//! helpers — deliberately, see [`FfiSession::advertise_direct`]'s own doc
-//! for why a native background timer is the wrong shape for a mobile app
-//! and what to do instead.
+//! [`advertise_direct`](FfiSession::advertise_direct)) and its cert-chain-
+//! authorized variants (`*_with_cert_chain`), and direct-dial streaming/
+//! content transfer ([`FfiSession::open_stream_direct`]/
+//! [`FfiSession::put_direct`]/[`FfiSession::get_direct`]).
+//!
+//! Not exposed, each a real, reasoned decision rather than an oversight:
+//! `Trust::Insecure` — see [`FfiTrust`]'s own doc; the core crate's
+//! `keep_advertised`/`keep_advertised_direct` background-loop helpers —
+//! see [`FfiSession::advertise_direct`]'s own doc for why a native
+//! background timer is the wrong shape for a mobile app and what to do
+//! instead; `Session::run_subscriber` — same reasoning as
+//! `keep_advertised` (it takes a generic `stop: impl Future` and
+//! `handler: impl FnMut`, neither of which crosses the UniFFI boundary,
+//! and a native long-lived receive loop fights mobile app-lifecycle
+//! management the same way a background timer does) — its full external
+//! behavior (subscribe once, receive resiliently, unsubscribe when done)
+//! is still achievable by composing the already-exposed
+//! [`FfiSession::subscribe`]/[`FfiSession::recv_event`]/
+//! [`FfiSession::unsubscribe`] on the foreign side, catching and retrying
+//! past a non-EVENT-frame error the way `run_subscriber` does internally
+//! — nothing is lost, only where that retry loop lives.
 //!
 //! [`FfiValue`] mirrors every variant [`macula_rust_sdk::cbor::Value`]
 //! has, including recursive list/map shapes (`Items`/`Fields`, via
@@ -73,6 +91,16 @@ pub enum FfiError {
     Resolve { reason: String },
     #[error("direct-dial trust violation: the dialed peer's proven identity did not match the resolved station (see resolved/dialed fields)")]
     DirectDialTrustViolation { resolved: Vec<u8>, dialed: Vec<u8> },
+    #[error("UCAN operation failed: {reason}")]
+    Ucan { reason: String },
+}
+
+impl From<macula_rust_sdk::ucan::UcanError> for FfiError {
+    fn from(e: macula_rust_sdk::ucan::UcanError) -> Self {
+        FfiError::Ucan {
+            reason: e.to_string(),
+        }
+    }
 }
 
 /// `Vec<u8>` -> `[u8; 32]`, with both lengths actually reported on
@@ -304,6 +332,185 @@ impl From<macula_rust_sdk::direct_dial::AdvertiseDirectError> for FfiError {
     }
 }
 
+/// One entry in a UCAN token's capability list — mirrors
+/// [`macula_rust_sdk::ucan::Capability`].
+#[derive(uniffi::Record, Debug, Clone, PartialEq)]
+pub struct FfiCapability {
+    pub with: String,
+    pub can: String,
+}
+
+impl From<macula_rust_sdk::ucan::Capability> for FfiCapability {
+    fn from(c: macula_rust_sdk::ucan::Capability) -> Self {
+        FfiCapability {
+            with: c.with,
+            can: c.can,
+        }
+    }
+}
+
+impl From<FfiCapability> for macula_rust_sdk::ucan::Capability {
+    fn from(c: FfiCapability) -> Self {
+        macula_rust_sdk::ucan::Capability {
+            with: c.with,
+            can: c.can,
+        }
+    }
+}
+
+/// A UCAN token's decoded claims — a mirror of
+/// [`macula_rust_sdk::ucan::Payload`], minus `facts`: the core type's
+/// `facts` field is an arbitrary `serde_json::Value` map, which has no
+/// UniFFI-representable shape (unlike [`FfiValue`], which exists
+/// specifically to give CBOR values one) — the same class of narrowing
+/// [`FfiValue::Int`] already documents for `i128`. A caller needing the
+/// raw `fct` claim can decode the token bytes on the foreign side with any
+/// JSON library.
+#[derive(uniffi::Record, Debug, Clone)]
+pub struct FfiUcanPayload {
+    pub issuer: String,
+    pub audience: String,
+    pub capabilities: Vec<FfiCapability>,
+    pub expires_at: Option<i64>,
+    pub not_before: Option<i64>,
+    pub nonce: String,
+    pub proofs: Vec<String>,
+}
+
+impl From<macula_rust_sdk::ucan::Payload> for FfiUcanPayload {
+    fn from(p: macula_rust_sdk::ucan::Payload) -> Self {
+        FfiUcanPayload {
+            issuer: p.issuer,
+            audience: p.audience,
+            capabilities: p.capabilities.into_iter().map(Into::into).collect(),
+            expires_at: p.expires_at,
+            not_before: p.not_before,
+            nonce: p.nonce,
+            proofs: p.proofs,
+        }
+    }
+}
+
+/// Mints a new UCAN token, self-issued and signed by `identity` — see
+/// [`macula_rust_sdk::ucan::create`]'s own doc for the full contract
+/// (`issuer`/`audience` are opaque DID strings, not validated here).
+#[uniffi::export]
+pub fn ucan_create(
+    issuer: String,
+    audience: String,
+    capabilities: Vec<FfiCapability>,
+    identity: &FfiKeyPair,
+    expires_at: Option<i64>,
+    not_before: Option<i64>,
+) -> Result<Vec<u8>, FfiError> {
+    let opts = macula_rust_sdk::ucan::CreateOpts {
+        expires_at,
+        not_before,
+        ..Default::default()
+    };
+    macula_rust_sdk::ucan::create(
+        &issuer,
+        &audience,
+        capabilities.into_iter().map(Into::into).collect(),
+        &identity.0,
+        opts,
+    )
+    .map_err(FfiError::from)
+}
+
+/// Verifies `token`'s signature against `public_key` (32 bytes) and its
+/// `exp`/`nbf` claims against the current time — see
+/// [`macula_rust_sdk::ucan::verify`]'s own doc, including its check order.
+/// Only a successful [`ucan_verify`] result should ever back an
+/// authorization decision — [`ucan_decode`] and the `ucan_get_*` getters
+/// below never check the signature.
+#[uniffi::export]
+pub fn ucan_verify(token: Vec<u8>, public_key: Vec<u8>) -> Result<FfiUcanPayload, FfiError> {
+    let key = to_32(public_key)?;
+    macula_rust_sdk::ucan::verify(&token, &key)
+        .map(FfiUcanPayload::from)
+        .map_err(FfiError::from)
+}
+
+/// Parses `token`'s payload WITHOUT verifying its signature or checking
+/// expiration — see [`ucan_verify`]'s doc for why that distinction matters.
+#[uniffi::export]
+pub fn ucan_decode(token: Vec<u8>) -> Result<FfiUcanPayload, FfiError> {
+    macula_rust_sdk::ucan::decode(&token)
+        .map(FfiUcanPayload::from)
+        .map_err(FfiError::from)
+}
+
+/// `token`'s `iss` claim, unverified — see [`ucan_verify`]'s doc.
+#[uniffi::export]
+pub fn ucan_get_issuer(token: Vec<u8>) -> Result<String, FfiError> {
+    macula_rust_sdk::ucan::get_issuer(&token).map_err(FfiError::from)
+}
+
+/// `token`'s `aud` claim, unverified — see [`ucan_verify`]'s doc.
+#[uniffi::export]
+pub fn ucan_get_audience(token: Vec<u8>) -> Result<String, FfiError> {
+    macula_rust_sdk::ucan::get_audience(&token).map_err(FfiError::from)
+}
+
+/// `token`'s `cap` claim, unverified — see [`ucan_verify`]'s doc.
+#[uniffi::export]
+pub fn ucan_get_capabilities(token: Vec<u8>) -> Result<Vec<FfiCapability>, FfiError> {
+    macula_rust_sdk::ucan::get_capabilities(&token)
+        .map(|caps| caps.into_iter().map(Into::into).collect())
+        .map_err(FfiError::from)
+}
+
+/// `token`'s `exp` claim, unverified — see [`ucan_verify`]'s doc.
+#[uniffi::export]
+pub fn ucan_get_expiration(token: Vec<u8>) -> Result<Option<i64>, FfiError> {
+    macula_rust_sdk::ucan::get_expiration(&token).map_err(FfiError::from)
+}
+
+/// `token`'s `prf` claim, unverified — see [`ucan_verify`]'s doc.
+#[uniffi::export]
+pub fn ucan_get_proofs(token: Vec<u8>) -> Result<Vec<String>, FfiError> {
+    macula_rust_sdk::ucan::get_proofs(&token).map_err(FfiError::from)
+}
+
+/// Whether `token`'s `exp` claim is in the past, unverified — see
+/// [`ucan_verify`]'s doc. A token with no `exp` claim is never expired.
+#[uniffi::export]
+pub fn ucan_is_expired(token: Vec<u8>) -> Result<bool, FfiError> {
+    macula_rust_sdk::ucan::is_expired(&token).map_err(FfiError::from)
+}
+
+/// `token`'s content identifier (SHA-256, base64url-no-pad) — used only
+/// for proof-chain references between UCANs. See
+/// [`macula_rust_sdk::ucan::compute_cid`]'s own doc.
+#[uniffi::export]
+pub fn ucan_compute_cid(token: Vec<u8>) -> String {
+    macula_rust_sdk::ucan::compute_cid(&token)
+}
+
+/// What a provider requires to answer one inbound CALL — a mirror of
+/// [`macula_rust_sdk::ucan::Policy`], passed to
+/// [`FfiSession::serve_one_call_gated`]. `Open` is what
+/// [`FfiSession::serve_one_call`] uses internally.
+#[derive(uniffi::Enum, Debug, Clone)]
+pub enum FfiPolicy {
+    Open,
+    Required { issuer: Vec<u8> },
+}
+
+impl TryFrom<FfiPolicy> for macula_rust_sdk::ucan::Policy {
+    type Error = FfiError;
+
+    fn try_from(p: FfiPolicy) -> Result<Self, FfiError> {
+        Ok(match p {
+            FfiPolicy::Open => macula_rust_sdk::ucan::Policy::open(),
+            FfiPolicy::Required { issuer } => {
+                macula_rust_sdk::ucan::Policy::required(to_32(issuer)?)
+            }
+        })
+    }
+}
+
 /// Provider role: implement this trait on the foreign side (Kotlin,
 /// Swift) to serve inbound unary CALLs — see
 /// [`FfiSession::serve_one_call`]. Adapts
@@ -483,6 +690,18 @@ pub struct FfiAcceptedStream {
     pub info: FfiStreamOpenInfo,
 }
 
+/// What [`FfiSession::open_stream_direct`]/
+/// [`FfiSession::open_stream_direct_with_cert_chain`] hand back: the fresh
+/// [`FfiSession`] dialed for this stream, and the [`FfiStream`] itself.
+/// Unlike [`FfiAcceptedStream`] (a stream on an EXISTING session), a
+/// direct-dial stream opens a brand new session — the caller owns it and
+/// must close it once done, alongside the stream.
+#[derive(uniffi::Record)]
+pub struct FfiOpenedDirectStream {
+    pub session: std::sync::Arc<FfiSession>,
+    pub stream: std::sync::Arc<FfiStream>,
+}
+
 /// How to trust whatever certificate the station presents — mirrors
 /// [`macula_rust_sdk::transport::Trust`], minus `Insecure`.
 ///
@@ -592,6 +811,21 @@ impl FfiSession {
         Ok(Self(tokio::sync::Mutex::new(Some(session))))
     }
 
+    /// This session's own connected station's node id (32 bytes), as
+    /// proven by the HELLO frame's own signature during the handshake.
+    /// Needed to call [`put_direct`](Self::put_direct) against "whatever
+    /// station this session is already on" — the common case, and
+    /// otherwise unreachable through this FFI surface without a
+    /// [`resolve_direct`](Self::resolve_direct) result to read a station
+    /// id from instead.
+    pub async fn station_id(&self) -> Vec<u8> {
+        let guard = self.0.lock().await;
+        guard
+            .as_ref()
+            .map(|s| s.station.node_id.to_vec())
+            .unwrap_or_default()
+    }
+
     /// Send a signed CALL and wait for the matching RESULT or ERROR.
     /// `realm` must be exactly 32 bytes. `timeout_ms` bounds both the
     /// wait for a response and the frame's own `deadline_ms` field
@@ -640,6 +874,25 @@ impl FfiSession {
         timeout_ms: u64,
         identity: &FfiKeyPair,
     ) -> Result<(), FfiError> {
+        self.serve_one_call_gated(handler, FfiPolicy::Open, timeout_ms, identity)
+            .await
+    }
+
+    /// [`serve_one_call`](Self::serve_one_call), additionally gating the
+    /// inbound CALL through `policy` BEFORE `handler` ever runs — see
+    /// [`FfiPolicy`]. A rejected caller gets a BOLT#4 `unauthorized` error
+    /// and never reaches `handler`; `handler` itself never sees the raw
+    /// UCAN token either way, matching
+    /// [`macula_rust_sdk::connection::Session::serve_one_call_gated`]'s own
+    /// contract exactly.
+    pub async fn serve_one_call_gated(
+        &self,
+        handler: std::sync::Arc<dyn FfiCallHandler>,
+        policy: FfiPolicy,
+        timeout_ms: u64,
+        identity: &FfiKeyPair,
+    ) -> Result<(), FfiError> {
+        let policy: macula_rust_sdk::ucan::Policy = policy.try_into()?;
         let mut guard = self.0.lock().await;
         let session = guard.as_mut().ok_or(FfiError::Closed)?;
 
@@ -669,8 +922,9 @@ impl FfiSession {
         };
 
         session
-            .serve_one_call(
+            .serve_one_call_gated(
                 lookup,
+                move |_, _| policy.clone(),
                 &identity.0,
                 std::time::Duration::from_millis(timeout_ms),
             )
@@ -894,6 +1148,315 @@ impl FfiSession {
         )
         .await
         .map_err(FfiError::from)
+    }
+
+    /// As [`call`](Self::call), attaching `ucan_token` (e.g. from
+    /// [`ucan_create`]) to the outgoing CALL — for invoking a procedure
+    /// gated by a [`FfiPolicy::Required`] policy on the provider side.
+    pub async fn call_with_ucan(
+        &self,
+        procedure: String,
+        realm: Vec<u8>,
+        payload: FfiValue,
+        timeout_ms: u64,
+        identity: &FfiKeyPair,
+        ucan_token: Vec<u8>,
+    ) -> Result<FfiCallResponse, FfiError> {
+        let realm = to_32(realm)?;
+        let deadline_ms = (now_ms() + timeout_ms) as i128;
+        let mut guard = self.0.lock().await;
+        let session = guard.as_mut().ok_or(FfiError::Closed)?;
+        let response = session
+            .call_with_ucan(
+                &procedure,
+                realm,
+                payload.into(),
+                deadline_ms,
+                &identity.0,
+                std::time::Duration::from_millis(timeout_ms),
+                ucan_token,
+            )
+            .await
+            .map_err(|e| FfiError::Call {
+                reason: e.to_string(),
+            })?;
+        FfiCallResponse::try_from(response)
+    }
+
+    /// The supervised counterpart to the bare [`publish`](Self::publish)
+    /// primitive — see
+    /// [`macula_rust_sdk::connection::Session::run_publisher`]'s own doc.
+    /// `announce` controls whether `pubsub.publish_started_v1`/
+    /// `pubsub.publish_completed_v1` facts are published around this
+    /// publish (a fact-publish failure never fails the underlying publish
+    /// either way).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn run_publisher(
+        &self,
+        topic: String,
+        realm: Vec<u8>,
+        seq: u64,
+        payload: FfiValue,
+        published_at_ms: u64,
+        announce: bool,
+        identity: &FfiKeyPair,
+    ) -> Result<(), FfiError> {
+        let realm = to_32(realm)?;
+        let spec = macula_rust_sdk::frame::PublishSpec::new(
+            topic,
+            realm,
+            identity.0.node_id(),
+            seq,
+            payload.into(),
+            published_at_ms,
+        );
+        let mut guard = self.0.lock().await;
+        let session = guard.as_mut().ok_or(FfiError::Closed)?;
+        session
+            .run_publisher(&spec, &identity.0, announce)
+            .await
+            .map_err(|e| FfiError::Send {
+                reason: e.to_string(),
+            })
+    }
+
+    /// [`resolve_direct`](Self::resolve_direct) plus Slice 7c Direction B
+    /// managed-realm authorization: only an advertisement whose embedded
+    /// cert chain validates to `realm_ca_pem` and names `expected_org` is
+    /// trusted. Opt-in — [`resolve_direct`](Self::resolve_direct) itself is
+    /// unaffected.
+    pub async fn resolve_direct_with_cert_chain(
+        &self,
+        procedure: String,
+        realm: Vec<u8>,
+        realm_ca_pem: Vec<u8>,
+        expected_org: String,
+        identity: &FfiKeyPair,
+    ) -> Result<FfiResolved, FfiError> {
+        let realm = to_32(realm)?;
+        let mut guard = self.0.lock().await;
+        let session = guard.as_mut().ok_or(FfiError::Closed)?;
+        let resolved = macula_rust_sdk::direct_dial::resolve_with_cert_chain(
+            session,
+            &identity.0,
+            realm,
+            &procedure,
+            &realm_ca_pem,
+            &expected_org,
+        )
+        .await?;
+        Ok(resolved.into())
+    }
+
+    /// [`call_direct`](Self::call_direct), resolved via
+    /// [`resolve_direct_with_cert_chain`](Self::resolve_direct_with_cert_chain)
+    /// instead of [`resolve_direct`](Self::resolve_direct) — see both for
+    /// the full contract. Opt-in managed-realm authorization;
+    /// [`call_direct`](Self::call_direct) itself is unaffected.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn call_direct_with_cert_chain(
+        &self,
+        procedure: String,
+        realm: Vec<u8>,
+        realm_ca_pem: Vec<u8>,
+        expected_org: String,
+        payload: FfiValue,
+        timeout_ms: u64,
+        identity: &FfiKeyPair,
+    ) -> Result<FfiCallResponse, FfiError> {
+        let realm = to_32(realm)?;
+        let mut guard = self.0.lock().await;
+        let session = guard.as_mut().ok_or(FfiError::Closed)?;
+        let response = macula_rust_sdk::direct_dial::call_with_cert_chain(
+            session,
+            &identity.0,
+            realm,
+            &procedure,
+            &realm_ca_pem,
+            &expected_org,
+            payload.into(),
+            std::time::Duration::from_millis(timeout_ms),
+        )
+        .await?;
+        FfiCallResponse::try_from(response)
+    }
+
+    /// [`advertise_direct`](Self::advertise_direct) plus an embedded X.509
+    /// service-cert chain, for Slice 7c Direction B managed-realm
+    /// authorization — see
+    /// [`resolve_direct_with_cert_chain`](Self::resolve_direct_with_cert_chain)/
+    /// [`call_direct_with_cert_chain`](Self::call_direct_with_cert_chain)
+    /// for the corresponding checks. Opt-in:
+    /// [`advertise_direct`](Self::advertise_direct) itself is unaffected.
+    pub async fn advertise_direct_with_cert_chain(
+        &self,
+        procedure: String,
+        realm: Vec<u8>,
+        ttl_ms: u64,
+        cert_chain_pem: Vec<u8>,
+        identity: &FfiKeyPair,
+    ) -> Result<(), FfiError> {
+        let realm = to_32(realm)?;
+        let mut guard = self.0.lock().await;
+        let session = guard.as_mut().ok_or(FfiError::Closed)?;
+        macula_rust_sdk::direct_dial::advertise_direct_with_cert_chain(
+            session,
+            &identity.0,
+            realm,
+            &procedure,
+            std::time::Duration::from_millis(ttl_ms),
+            cert_chain_pem,
+        )
+        .await
+        .map_err(FfiError::from)
+    }
+
+    /// Resolves `procedure`'s provider via direct-dial (through this
+    /// session, used only to query the DHT) and opens a stream to it
+    /// there, in one hop, in a SEPARATE session from this one — mirrors
+    /// [`call_direct`](Self::call_direct)'s own resolve-then-dial shape for
+    /// [`stream_open`](Self::stream_open) instead of
+    /// [`call`](Self::call). The caller owns BOTH the returned
+    /// [`FfiOpenedDirectStream::session`] and
+    /// [`FfiOpenedDirectStream::stream`] — unlike a unary call, which owns
+    /// its dial for exactly one request/reply, a stream outlives this
+    /// function call, so the returned session must be closed once the
+    /// stream (and any other work on it) is done.
+    pub async fn open_stream_direct(
+        &self,
+        procedure: String,
+        realm: Vec<u8>,
+        mode: FfiStreamMode,
+        args: FfiValue,
+        timeout_ms: u64,
+        identity: &FfiKeyPair,
+    ) -> Result<FfiOpenedDirectStream, FfiError> {
+        let realm = to_32(realm)?;
+        let deadline_ms = (now_ms() + timeout_ms) as i128;
+        let mut guard = self.0.lock().await;
+        let session = guard.as_mut().ok_or(FfiError::Closed)?;
+        let (opened_session, handle) = macula_rust_sdk::direct_dial::open_stream_direct(
+            session,
+            &identity.0,
+            realm,
+            &procedure,
+            mode.into(),
+            args.into(),
+            deadline_ms,
+            std::time::Duration::from_millis(timeout_ms),
+        )
+        .await
+        .map_err(|e| FfiError::Resolve {
+            reason: e.to_string(),
+        })?;
+        Ok(FfiOpenedDirectStream {
+            session: std::sync::Arc::new(FfiSession(tokio::sync::Mutex::new(Some(opened_session)))),
+            stream: std::sync::Arc::new(FfiStream(tokio::sync::Mutex::new(Some(handle)))),
+        })
+    }
+
+    /// [`open_stream_direct`](Self::open_stream_direct), resolved via
+    /// [`resolve_direct_with_cert_chain`](Self::resolve_direct_with_cert_chain)
+    /// instead of [`resolve_direct`](Self::resolve_direct) — see both for
+    /// the full contract. Opt-in managed-realm authorization;
+    /// [`open_stream_direct`](Self::open_stream_direct) itself is
+    /// unaffected.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn open_stream_direct_with_cert_chain(
+        &self,
+        procedure: String,
+        realm: Vec<u8>,
+        realm_ca_pem: Vec<u8>,
+        expected_org: String,
+        mode: FfiStreamMode,
+        args: FfiValue,
+        timeout_ms: u64,
+        identity: &FfiKeyPair,
+    ) -> Result<FfiOpenedDirectStream, FfiError> {
+        let realm = to_32(realm)?;
+        let deadline_ms = (now_ms() + timeout_ms) as i128;
+        let mut guard = self.0.lock().await;
+        let session = guard.as_mut().ok_or(FfiError::Closed)?;
+        let (opened_session, handle) =
+            macula_rust_sdk::direct_dial::open_stream_direct_with_cert_chain(
+                session,
+                &identity.0,
+                realm,
+                &procedure,
+                &realm_ca_pem,
+                &expected_org,
+                mode.into(),
+                args.into(),
+                deadline_ms,
+                std::time::Duration::from_millis(timeout_ms),
+            )
+            .await
+            .map_err(|e| FfiError::Resolve {
+                reason: e.to_string(),
+            })?;
+        Ok(FfiOpenedDirectStream {
+            session: std::sync::Arc::new(FfiSession(tokio::sync::Mutex::new(Some(opened_session)))),
+            stream: std::sync::Arc::new(FfiStream(tokio::sync::Mutex::new(Some(handle)))),
+        })
+    }
+
+    /// Stores `data` at a KNOWN `station` (32 bytes) directly, in one hop,
+    /// instead of going through whatever station this session happens to
+    /// be connected to — see
+    /// [`macula_rust_sdk::direct_dial::put_direct`]'s own doc, including
+    /// its identity-collision caveat when this session is already
+    /// connected to `station` (use a different identity for this session
+    /// than `identity` if so).
+    pub async fn put_direct(
+        &self,
+        station: Vec<u8>,
+        data: Vec<u8>,
+        name: String,
+        timeout_ms: u64,
+        identity: &FfiKeyPair,
+    ) -> Result<Vec<u8>, FfiError> {
+        let station = to_32(station)?;
+        let mut guard = self.0.lock().await;
+        let session = guard.as_mut().ok_or(FfiError::Closed)?;
+        let mcid = macula_rust_sdk::direct_dial::put_direct(
+            session,
+            &identity.0,
+            station,
+            &data,
+            name,
+            std::time::Duration::from_millis(timeout_ms),
+        )
+        .await
+        .map_err(|e| FfiError::Content {
+            reason: e.to_string(),
+        })?;
+        Ok(mcid.to_vec())
+    }
+
+    /// Fetches the content addressed by `mcid` (34 bytes) directly from
+    /// whichever station announced it, resolved via this session's DHT
+    /// query — see [`macula_rust_sdk::direct_dial::get_direct`]'s own doc.
+    /// Unlike [`put_direct`](Self::put_direct), no `station` is needed: a
+    /// `content_announcement` names its own announcer.
+    pub async fn get_direct(
+        &self,
+        mcid: Vec<u8>,
+        timeout_ms: u64,
+        identity: &FfiKeyPair,
+    ) -> Result<Vec<u8>, FfiError> {
+        let mcid = to_mcid(mcid)?;
+        let mut guard = self.0.lock().await;
+        let session = guard.as_mut().ok_or(FfiError::Closed)?;
+        macula_rust_sdk::direct_dial::get_direct(
+            session,
+            &identity.0,
+            mcid,
+            std::time::Duration::from_millis(timeout_ms),
+        )
+        .await
+        .map_err(|e| FfiError::Content {
+            reason: e.to_string(),
+        })
     }
 
     /// Provider role: block for the next inbound STREAM_OPEN, bounded by
