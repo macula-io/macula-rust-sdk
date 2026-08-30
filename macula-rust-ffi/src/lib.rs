@@ -519,9 +519,7 @@ impl TryFrom<FfiPolicy> for macula_rust::ucan::Policy {
     fn try_from(p: FfiPolicy) -> Result<Self, FfiError> {
         Ok(match p {
             FfiPolicy::Open => macula_rust::ucan::Policy::open(),
-            FfiPolicy::Required { issuer } => {
-                macula_rust::ucan::Policy::required(to_32(issuer)?)
-            }
+            FfiPolicy::Required { issuer } => macula_rust::ucan::Policy::required(to_32(issuer)?),
         })
     }
 }
@@ -823,9 +821,9 @@ impl FfiKeyPair {
     #[uniffi::constructor]
     pub fn load_from_keystore(service: String, account: String) -> Result<Self, FfiError> {
         let store = macula_rust::keystore::KeyringStore::new(&service, &account)?;
-        Ok(Self(
-            macula_rust::identity::KeyPair::load_from_keystore(&store)?,
-        ))
+        Ok(Self(macula_rust::identity::KeyPair::load_from_keystore(
+            &store,
+        )?))
     }
 }
 
@@ -849,12 +847,11 @@ impl FfiSession {
         trust: FfiTrust,
         identity: &FfiKeyPair,
     ) -> Result<Self, FfiError> {
-        let session =
-            macula_rust::connection::connect(&host, port, trust.try_into()?, &identity.0)
-                .await
-                .map_err(|e| FfiError::Connect {
-                    reason: e.to_string(),
-                })?;
+        let session = macula_rust::connection::connect(&host, port, trust.try_into()?, &identity.0)
+            .await
+            .map_err(|e| FfiError::Connect {
+                reason: e.to_string(),
+            })?;
         Ok(Self(tokio::sync::Mutex::new(Some(session))))
     }
 
@@ -1071,8 +1068,7 @@ impl FfiSession {
         identity: &FfiKeyPair,
     ) -> Result<(), FfiError> {
         let realm = to_32(realm)?;
-        let spec =
-            macula_rust::frame::AdvertiseSpec::new(realm, procedure, identity.0.node_id());
+        let spec = macula_rust::frame::AdvertiseSpec::new(realm, procedure, identity.0.node_id());
         let mut guard = self.0.lock().await;
         let session = guard.as_mut().ok_or(FfiError::Closed)?;
         session
@@ -1091,8 +1087,7 @@ impl FfiSession {
         identity: &FfiKeyPair,
     ) -> Result<(), FfiError> {
         let realm = to_32(realm)?;
-        let spec =
-            macula_rust::frame::UnadvertiseSpec::new(realm, procedure, identity.0.node_id());
+        let spec = macula_rust::frame::UnadvertiseSpec::new(realm, procedure, identity.0.node_id());
         let mut guard = self.0.lock().await;
         let session = guard.as_mut().ok_or(FfiError::Closed)?;
         session

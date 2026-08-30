@@ -473,11 +473,7 @@ async fn publish_survives_immediate_close_against_the_real_fleet() {
 
     sub_session
         .subscribe(
-            &macula_rust::frame::SubscribeSpec::new(
-                topic.clone(),
-                realm,
-                sub_identity.node_id(),
-            ),
+            &macula_rust::frame::SubscribeSpec::new(topic.clone(), realm, sub_identity.node_id()),
             &sub_identity,
         )
         .await
@@ -809,10 +805,7 @@ async fn streaming_provider_round_trip_against_the_real_fleet() {
         open_info.procedure, open_info.mode
     );
     assert_eq!(open_info.procedure, procedure);
-    assert_eq!(
-        open_info.mode,
-        macula_rust::frame::StreamMode::ServerStream
-    );
+    assert_eq!(open_info.mode, macula_rust::frame::StreamMode::ServerStream);
 
     provider_handle
         .send_data(
@@ -1018,11 +1011,7 @@ async fn rpc_telemetry_facts_against_the_real_fleet() {
     ] {
         watcher
             .subscribe(
-                &macula_rust::frame::SubscribeSpec::new(
-                    topic,
-                    realm,
-                    watcher_identity.node_id(),
-                ),
+                &macula_rust::frame::SubscribeSpec::new(topic, realm, watcher_identity.node_id()),
                 &watcher_identity,
             )
             .await
@@ -1107,10 +1096,7 @@ async fn rpc_telemetry_facts_against_the_real_fleet() {
         .await
         .expect("call should succeed");
     assert!(
-        matches!(
-            response,
-            macula_rust::frame::CallResponse::Result { .. }
-        ),
+        matches!(response, macula_rust::frame::CallResponse::Result { .. }),
         "expected a RESULT, got {response:?}"
     );
 
@@ -1129,8 +1115,7 @@ async fn rpc_telemetry_facts_against_the_real_fleet() {
         else {
             continue;
         };
-        let Ok(evt) =
-            macula_rust::frame::parse_event(&value.expect("recv_frame should not error"))
+        let Ok(evt) = macula_rust::frame::parse_event(&value.expect("recv_frame should not error"))
         else {
             continue;
         };
@@ -1466,9 +1451,7 @@ async fn cross_station_streaming_round_trip_frankfurt_provider_milan_caller() {
         macula_rust::stream::StreamItem::Data { body, .. } => {
             assert_eq!(
                 body,
-                macula_rust::cbor::Value::Bytes(
-                    b"audio frame from phone1 (frankfurt)".to_vec()
-                )
+                macula_rust::cbor::Value::Bytes(b"audio frame from phone1 (frankfurt)".to_vec())
             );
             println!("OBSERVED: caller (Milan) received phone1's frame from Frankfurt");
         }

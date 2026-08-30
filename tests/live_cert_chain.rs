@@ -173,9 +173,7 @@ async fn cert_chain_survives_a_real_dht_round_trip() {
     let recs = macula_rust::dht::find_records(
         &mut resolver_session,
         &caller_identity,
-        macula_rust::dht::procedure_key(&macula_rust::dht::discovery_uri(
-            realm, &procedure,
-        )),
+        macula_rust::dht::procedure_key(&macula_rust::dht::discovery_uri(realm, &procedure)),
     )
     .await
     .expect("find_records should return the published record");
