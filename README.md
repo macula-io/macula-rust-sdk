@@ -65,7 +65,7 @@ CLI, or WASM as any other Rust SDK.
 | Direct-dial (DHT resolve/publish) | ✅ | ✅ | `direct_dial::{resolve,call,advertise_direct}` — reaches a service without depending on advertise-gossip having propagated a route; plain + cert-chain-authorized (`*_with_cert_chain`) |
 | Direct-dial streaming/content | ✅ | ✅ | `direct_dial::{open_stream_direct,put_direct,get_direct}` — `get_direct` is correct but currently unreachable, see [Known limitations](#known-limitations) |
 | Periodic re-advertise | — | ✅ | `Session::keep_advertised` / `direct_dial::keep_advertised_direct` — a ctx-cancellable loop, since a station's registration doesn't survive the connection that sent it being replaced |
-| UCAN (mint/verify/introspect) | ✅ | ⚠️ | `ucan::{create,verify,decode,get_*}` are pure functions, fully verified, no network involved. `Session::call_with_ucan`/`serve_one_call_gated`'s live-network behavior is currently unreliable in this repo's own testing — see [Known limitations](#known-limitations) before depending on gated serving in production |
+| UCAN (mint/verify/introspect) | ✅ | ✅ | `ucan::{create,verify,decode,get_*}` are pure functions; `Session::call_with_ucan`/`serve_one_call_gated` live-verified end-to-end (see [`examples/ucan.rs`](examples/ucan.rs) and [Known limitations](#known-limitations) for the resolved investigation) |
 | Cert-chain (org/realm authorization) | ✅ | ✅ | `cert_chain::verify_advertisement_cert_chain` + `direct_dial::*_with_cert_chain` — opt-in, the plain direct-dial path is unaffected |
 | Supervised PubSub pair | ✅ | ✅ | `Session::run_publisher`/`run_subscriber` — addressable/cancellable wrappers over bare publish/subscribe, auto-publishing `pubsub.publish_*_v1` facts |
 | RPC telemetry auto-facts | ✅ | ✅ | `rpc.sent_v1`/`rpc.completed_v1` (caller), `rpc.received_v1`/`rpc.replied_v1` (provider) — always-on, fire-and-forget, fired automatically by `call`/`serve_one_call_gated` |
@@ -331,13 +331,19 @@ traced directly to the Erlang SDK's source.
   relay indirection, unlike a `procedure_advertisement`, so a leaf SDK
   identity can't pass its own trust check). Correct but currently
   unreachable, not a bug.
-- **`call_direct_with_cert_chain` has an open, honestly-narrowed timeout
-  issue** — the provider answers the correct call, but the reply never
-  reaches a direct-dialed caller. Confirmed NOT cert-chain-specific and
-  NOT station-specific; narrowed to something in reply delivery when the
-  provider goes through the `serve_until_procedure` test helper's
-  loop shape. See `macula-rust-sdk-ffi/tests/live_cert_chain_direct_dial.rs`'s
-  own comments for the full investigation and ruled-out theories.
+- **RESOLVED**: an earlier draft of this section reported
+  `call_direct_with_cert_chain` timing out waiting for a reply after a
+  successful resolve+dial, narrowed but not root-caused across several
+  investigation rounds. Root-caused: the same premature-`Session`-drop
+  race as the `serve_one_call_gated` finding below — the FFI test's
+  `serve_task` dropped the provider `Session` the instant
+  `serve_until_procedure` returned, closing the QUIC connection before
+  the reply frame reached the peer. Fixed by keeping the session alive
+  300ms after the last reply, matching the identical fix already applied
+  there. Confirmed with 5 consecutive clean passes (was failing reliably
+  before). No SDK defect — the cert-chain mechanism itself was never
+  broken. See `macula-rust-sdk-ffi/tests/live_cert_chain_direct_dial.rs`'s
+  own comments for the ruled-out theories from the earlier rounds.
 - The demo fleet's `station_endpoint` DHT records carry a short TTL and
   are not always freshly republished — a direct-dial resolve can
   intermittently return `StationEndpointNotFound` for a station whose
