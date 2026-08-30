@@ -28,6 +28,7 @@ use crate::identity::KeyPair;
 /// Record type tags — `macula_record.erl`'s `?TYPE_*` constants.
 pub const TYPE_PROCEDURE_ADVERTISEMENT: u8 = 0x06;
 pub const TYPE_STATION_ENDPOINT: u8 = 0x12;
+pub const TYPE_CONTENT_ANNOUNCEMENT: u8 = 0x11;
 
 /// Matches `macula_record`'s `?DEFAULT_TTL_MS` (48h) — the TTL a
 /// `procedure_advertisement` gets when the caller doesn't specify one.
@@ -130,6 +131,56 @@ pub fn new_procedure_advertisement_with_cert_chain(
     rec
 }
 
+/// Builds an UNSIGNED `content_announcement` record naming
+/// `announcer_node` as reachable at `endpoint` for `mcid`. Sign before
+/// [`put_record`]. Mirrors `macula_record:content_announcement/3,4` — see
+/// [`ContentAnnouncement`] for which optional metadata fields are not
+/// ported.
+pub fn new_content_announcement(
+    announcer_node: [u8; 32],
+    mcid: crate::manifest::Mcid,
+    endpoint: impl Into<String>,
+    ttl: Duration,
+) -> Record {
+    let payload = Value::Map(vec![
+        (
+            Value::text("announcer_node"),
+            Value::Bytes(announcer_node.to_vec()),
+        ),
+        (Value::text("mcid"), Value::Bytes(mcid.to_vec())),
+        (Value::text("endpoint"), Value::text(endpoint)),
+    ]);
+    new_envelope(TYPE_CONTENT_ANNOUNCEMENT, announcer_node, payload, ttl)
+}
+
+/// Extracts a `content_announcement` record's typed fields, or an error if
+/// `r` isn't one or is malformed. Mirrors
+/// `macula_record:read_content_announcement/1`.
+pub fn read_content_announcement(r: &Record) -> Result<ContentAnnouncement, ReadRecordError> {
+    if r.record_type != TYPE_CONTENT_ANNOUNCEMENT {
+        return Err(ReadRecordError::WrongRecordType);
+    }
+    let announcer_node = bytes32_field(&r.payload, "announcer_node")?;
+    let mcid: crate::manifest::Mcid = match r.payload.get("mcid") {
+        Some(Value::Bytes(b)) => b
+            .as_slice()
+            .try_into()
+            .map_err(|_| ReadRecordError::WrongFieldType("mcid"))?,
+        Some(_) => return Err(ReadRecordError::WrongFieldType("mcid")),
+        None => return Err(ReadRecordError::MissingField("mcid")),
+    };
+    let endpoint = match r.payload.get("endpoint") {
+        Some(Value::Text(t)) => t.clone(),
+        Some(_) => return Err(ReadRecordError::WrongFieldType("endpoint")),
+        None => return Err(ReadRecordError::MissingField("endpoint")),
+    };
+    Ok(ContentAnnouncement {
+        announcer_node,
+        mcid,
+        endpoint,
+    })
+}
+
 /// The exact bytes `macula_record:canonical_unsigned/1` signs and
 /// verifies: deterministic CBOR of the envelope map using the COMPACT
 /// single-letter keys (t/k/v/c/x/p), signature excluded. This is a
@@ -226,6 +277,15 @@ pub fn station_endpoint_key(station_pubkey: [u8; 32]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
+/// The DHT storage key for every `content_announcement` naming `mcid`:
+/// `SHA-256(mcid)`. Matches `macula_record:content_key/1`. Consumers use
+/// this with [`find_records`] (there may be more than one announcer)
+/// before holding any record.
+pub fn content_key(mcid: crate::manifest::Mcid) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(mcid).into()
+}
+
 /// Matches `macula_direct_dial`'s `discovery_uri/2`: the DHT
 /// lookup/advertisement key input is `hex(realm) + "/" + procedure`, so the
 /// same procedure name under different realms doesn't collide in the DHT.
@@ -258,6 +318,22 @@ pub struct ProcedureAdvertisement {
 pub struct StationEndpoint {
     pub quic_port: u16,
     pub host_advertised: Vec<String>,
+}
+
+/// A `content_announcement` record's fields, read out of its payload —
+/// mirrors `macula_record:read_content_announcement/1`. The optional
+/// `name`/`size`/`chunk_count` metadata fields
+/// (`content_announcement_opts()`) are not ported — direct-dial content
+/// fetch doesn't need them to resolve and dial; add them if a future
+/// caller needs to prioritize candidates without fetching the manifest.
+#[derive(Debug, Clone)]
+pub struct ContentAnnouncement {
+    pub announcer_node: [u8; 32],
+    pub mcid: crate::manifest::Mcid,
+    /// A dialable seed URL, e.g. `"https://host:4433"` — matches
+    /// `macula_client:seed()`'s own format, NOT a `station_endpoint`'s
+    /// split host/port.
+    pub endpoint: String,
 }
 
 #[derive(Debug, PartialEq, Eq)]

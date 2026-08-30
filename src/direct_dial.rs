@@ -32,9 +32,12 @@ use std::time::Duration;
 use crate::cbor::Value;
 use crate::cert_chain::{self, CertChainError};
 use crate::connection::{self, Session};
+use crate::content;
 use crate::dht::{self, DhtError, Record};
-use crate::frame::CallResponse;
+use crate::frame::{CallResponse, StreamMode};
 use crate::identity::KeyPair;
+use crate::manifest::Mcid;
+use crate::stream::{self, StreamHandle};
 use crate::transport::Trust;
 
 fn now_ms() -> i128 {
@@ -572,4 +575,356 @@ pub async fn keep_advertised_direct<F>(
             }
         }
     }
+}
+
+/// The dial-then-pin sequence every direct-dial call shape needs after
+/// resolving: dial `resolved`'s host:port, then check the freshly
+/// connected session's own signature-verified HELLO identity against
+/// `resolved.station` — factored out here (unlike [`call`]/
+/// [`call_with_cert_chain`], which had it inline before this existed)
+/// because [`open_stream_direct`]/[`put_direct`]/[`get_direct`] all need
+/// the identical sequence against a station identity that isn't
+/// necessarily reached via [`resolve`].
+#[derive(Debug)]
+pub enum DialAndVerifyError {
+    Dial(connection::HandshakeError),
+    /// The dialed peer's own signature-verified HELLO identity didn't
+    /// match the pubkey the signed DHT chain resolved — a trust
+    /// violation, not a retryable error.
+    TrustViolation {
+        resolved: [u8; 32],
+        dialed: [u8; 32],
+    },
+}
+
+impl std::fmt::Display for DialAndVerifyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DialAndVerifyError::Dial(e) => write!(f, "direct_dial: dialing resolved station: {e}"),
+            DialAndVerifyError::TrustViolation { resolved, dialed } => write!(
+                f,
+                "direct_dial: trust violation -- resolved station {} but the dialed peer proved identity {}",
+                hex_of(resolved),
+                hex_of(dialed)
+            ),
+        }
+    }
+}
+
+impl std::error::Error for DialAndVerifyError {}
+
+async fn dial_and_verify(
+    host: &str,
+    port: u16,
+    station: [u8; 32],
+    id: &KeyPair,
+    timeout: Duration,
+) -> Result<Session, DialAndVerifyError> {
+    let target = tokio::time::timeout(
+        timeout,
+        connection::connect(host, port, Trust::Insecure, id),
+    )
+    .await
+    .unwrap_or(Err(connection::HandshakeError::Timeout))
+    .map_err(DialAndVerifyError::Dial)?;
+
+    if target.station.node_id != station {
+        let dialed = target.station.node_id;
+        target.close("trust_violation", None, id).await;
+        return Err(DialAndVerifyError::TrustViolation {
+            resolved: station,
+            dialed,
+        });
+    }
+    Ok(target)
+}
+
+#[derive(Debug)]
+pub enum OpenStreamDirectError {
+    Resolve(ResolveError),
+    Dial(DialAndVerifyError),
+    Open(stream::OpenError),
+}
+
+impl std::fmt::Display for OpenStreamDirectError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OpenStreamDirectError::Resolve(e) => write!(f, "{e}"),
+            OpenStreamDirectError::Dial(e) => write!(f, "{e}"),
+            OpenStreamDirectError::Open(e) => write!(f, "direct_dial: open stream: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for OpenStreamDirectError {}
+
+/// Resolves `procedure`'s provider via direct-dial (through `resolve_via`,
+/// used only to query the DHT) and opens a stream there, in one hop, in a
+/// SEPARATE connection from `resolve_via` — the streaming-RPC counterpart
+/// to [`call`]. The provider must have advertised via [`advertise_direct`]:
+/// streaming's provider side (`macula_streamer.erl`) shares the identical
+/// `procedure_advertisement` mechanism RPC uses (confirmed against
+/// `macula_streamer.erl`/`macula_stream_sink.erl`'s own `advertise_direct`/
+/// `start_link_direct` — both are `macula_response:advertise_direct`/
+/// `macula_direct_dial:call_stream` under the hood, nothing stream-specific
+/// added), so no separate stream-shaped advertise function exists or is
+/// needed.
+///
+/// The caller owns the returned [`Session`] (and must close it once the
+/// stream and any other work on it is done) alongside the
+/// [`StreamHandle`] itself, since — unlike [`call`], which owns its dial
+/// for exactly one request/reply — a stream outlives the single function
+/// call that opens it.
+#[allow(clippy::too_many_arguments)]
+pub async fn open_stream_direct(
+    resolve_via: &mut Session,
+    id: &KeyPair,
+    realm: [u8; 32],
+    procedure: &str,
+    mode: StreamMode,
+    args: Value,
+    deadline_ms: i128,
+    timeout: Duration,
+) -> Result<(Session, StreamHandle), OpenStreamDirectError> {
+    let resolved = resolve(resolve_via, id, realm, procedure)
+        .await
+        .map_err(OpenStreamDirectError::Resolve)?;
+    let mut target = dial_and_verify(&resolved.host, resolved.port, resolved.station, id, timeout)
+        .await
+        .map_err(OpenStreamDirectError::Dial)?;
+    match StreamHandle::open(&mut target, procedure, realm, mode, args, deadline_ms, id).await {
+        Ok(handle) => Ok((target, handle)),
+        Err(e) => {
+            target.close("normal", None, id).await;
+            Err(OpenStreamDirectError::Open(e))
+        }
+    }
+}
+
+/// [`open_stream_direct`], resolved via [`resolve_with_cert_chain`]
+/// instead of [`resolve`] — see both for the full contract. Opt-in
+/// managed-realm authorization; [`open_stream_direct`] itself is
+/// unaffected.
+#[allow(clippy::too_many_arguments)]
+pub async fn open_stream_direct_with_cert_chain(
+    resolve_via: &mut Session,
+    id: &KeyPair,
+    realm: [u8; 32],
+    procedure: &str,
+    realm_ca_pem: &[u8],
+    expected_org: &str,
+    mode: StreamMode,
+    args: Value,
+    deadline_ms: i128,
+    timeout: Duration,
+) -> Result<(Session, StreamHandle), OpenStreamDirectError> {
+    let resolved = resolve_with_cert_chain(
+        resolve_via,
+        id,
+        realm,
+        procedure,
+        realm_ca_pem,
+        expected_org,
+    )
+    .await
+    .map_err(OpenStreamDirectError::Resolve)?;
+    let mut target = dial_and_verify(&resolved.host, resolved.port, resolved.station, id, timeout)
+        .await
+        .map_err(OpenStreamDirectError::Dial)?;
+    match StreamHandle::open(&mut target, procedure, realm, mode, args, deadline_ms, id).await {
+        Ok(handle) => Ok((target, handle)),
+        Err(e) => {
+            target.close("normal", None, id).await;
+            Err(OpenStreamDirectError::Open(e))
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum PutDirectError {
+    Resolve(ResolveError),
+    Dial(DialAndVerifyError),
+    Put(content::PutError),
+}
+
+impl std::fmt::Display for PutDirectError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PutDirectError::Resolve(e) => write!(f, "{e}"),
+            PutDirectError::Dial(e) => write!(f, "{e}"),
+            PutDirectError::Put(e) => write!(f, "direct_dial: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for PutDirectError {}
+
+/// Stores `data` at a KNOWN `station` directly, in one hop, instead of
+/// going through whatever station `resolve_via` happens to be connected
+/// to. Mirrors `macula_feeder:start_link_direct/5,6`, which — unlike
+/// procedure/stream direct-dial — takes the target station's pubkey
+/// directly rather than resolving one via a `procedure_advertisement`:
+/// content has no "procedure" to advertise, so there is nothing to
+/// resolve here beyond the station's own `station_endpoint`
+/// ([`resolve_station_endpoint`]). `resolve_via` is used only to query the
+/// DHT for `station`'s `station_endpoint`; it does not need to already be
+/// connected to `station`.
+///
+/// **Caveat found live in `macula-go-sdk`'s port of this same function**:
+/// if `resolve_via` happens to already be connected to `station` (the
+/// common case when the caller doesn't have a separate resolver session),
+/// this call's own internal dial reuses `id` against the SAME station
+/// `resolve_via` is on — this fleet enforces one connection per identity
+/// and kicks whichever connects second, so `resolve_via`'s own connection
+/// can be closed out from under the caller by this call. Use a different
+/// identity for `resolve_via` than for `id` if the caller needs
+/// `resolve_via` to keep working afterward against that same station.
+pub async fn put_direct(
+    resolve_via: &mut Session,
+    id: &KeyPair,
+    station: [u8; 32],
+    data: &[u8],
+    name: impl Into<String>,
+    timeout: Duration,
+) -> Result<Mcid, PutDirectError> {
+    let resolved = resolve_station_endpoint(resolve_via, id, station)
+        .await
+        .map_err(PutDirectError::Resolve)?;
+    let mut target = dial_and_verify(&resolved.host, resolved.port, resolved.station, id, timeout)
+        .await
+        .map_err(PutDirectError::Dial)?;
+    let result = content::put(&mut target, data, name, id)
+        .await
+        .map_err(PutDirectError::Put);
+    target.close("normal", None, id).await;
+    result
+}
+
+/// `mcid` has no live, verifiable `content_announcement` in the DHT —
+/// either nobody announced it (common: a single-block content put alone is
+/// never announced, matching `macula_content_transfer:put_single_block/3`),
+/// or every candidate found failed signature/self-consistency
+/// verification.
+#[derive(Debug)]
+pub struct ContentNotAnnounced;
+
+impl std::fmt::Display for ContentNotAnnounced {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "direct_dial: content has no verifiable announcement in the DHT"
+        )
+    }
+}
+
+impl std::error::Error for ContentNotAnnounced {}
+
+#[derive(Debug)]
+pub enum GetDirectError {
+    Dht(DhtError),
+    NotAnnounced(ContentNotAnnounced),
+    /// A `content_announcement`'s `endpoint` field wasn't a dialable
+    /// `host:port` or URL.
+    EndpointParse(String),
+    Dial(DialAndVerifyError),
+    Get(content::GetError),
+}
+
+impl std::fmt::Display for GetDirectError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            GetDirectError::Dht(e) => write!(f, "direct_dial: find content providers: {e}"),
+            GetDirectError::NotAnnounced(e) => write!(f, "{e}"),
+            GetDirectError::EndpointParse(endpoint) => {
+                write!(
+                    f,
+                    "direct_dial: content provider endpoint {endpoint:?}: not a URL or host:port"
+                )
+            }
+            GetDirectError::Dial(e) => write!(f, "{e}"),
+            GetDirectError::Get(e) => write!(f, "direct_dial: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for GetDirectError {}
+
+/// Fetches and verifies the content addressed by `mcid` from whichever
+/// station a signed `content_announcement` names as its host, dialing
+/// that station in one hop instead of relaying through `resolve_via`'s own
+/// station. Mirrors `macula_direct_dial:get_content/3`.
+///
+/// **Architectural note this module's other direct-dial functions don't
+/// need**: a `content_announcement`'s `endpoint` is the FINAL dial target
+/// directly (see `macula_record:read_content_announcement/1`'s `endpoint`
+/// field and `macula:get_content_station/5`'s use of it as-is) — unlike
+/// `procedure_advertisement`, there is no station-relay indirection, so
+/// the announcer must genuinely BE independently dialable there. A plain
+/// outbound-only leaf (everything this SDK's own identity/session model
+/// supports) cannot legitimately publish one of these about itself — only
+/// something with its own listening identity (`macula-station`, or a
+/// dedicated content-serving relay) can; confirmed directly against
+/// `macula.erl`, which states a `content_announcement` is made
+/// "automatically by the station on receipt," not by an arbitrary
+/// publisher. This crate therefore does not expose a client-facing
+/// "announce content direct": [`dht::new_content_announcement`] stays a
+/// low-level primitive (mirroring `macula_record.erl`'s own export) for
+/// that kind of infrastructure-tier code, not ordinary leaf use.
+/// [`get_direct`] itself has no such limitation — resolving and fetching
+/// FROM an already-announced provider is a perfectly ordinary leaf
+/// operation.
+pub async fn get_direct(
+    resolve_via: &mut Session,
+    id: &KeyPair,
+    mcid: Mcid,
+    timeout: Duration,
+) -> Result<Vec<u8>, GetDirectError> {
+    let recs = dht::find_records(resolve_via, id, dht::content_key(mcid))
+        .await
+        .map_err(GetDirectError::Dht)?;
+    let adv = first_trusted_content_provider(&recs)
+        .ok_or(GetDirectError::NotAnnounced(ContentNotAnnounced))?;
+    let (host, port) = parse_seed_url(&adv.endpoint)
+        .ok_or_else(|| GetDirectError::EndpointParse(adv.endpoint.clone()))?;
+    let mut target = dial_and_verify(&host, port, adv.announcer_node, id, timeout)
+        .await
+        .map_err(GetDirectError::Dial)?;
+    let result = content::get(&mut target, mcid, id)
+        .await
+        .map_err(GetDirectError::Get);
+    target.close("normal", None, id).await;
+    result
+}
+
+/// Mirrors `macula.erl`'s `decode_provider/1`: the record's OWN signature
+/// must verify, AND the payload's claimed `announcer_node` must equal the
+/// record's own envelope key — a record merely stored under the right key
+/// but self-signed by a different identity would otherwise still be
+/// trusted.
+fn first_trusted_content_provider(recs: &[Record]) -> Option<dht::ContentAnnouncement> {
+    recs.iter().find_map(|rec| {
+        dht::verify(rec).ok()?;
+        let adv = dht::read_content_announcement(rec).ok()?;
+        (adv.announcer_node == rec.key).then_some(adv)
+    })
+}
+
+/// Splits a `content_announcement`'s `endpoint` (a dialable seed URL, e.g.
+/// `"https://host:4433"` — `macula_client:seed()`'s own format) into the
+/// host/port pair [`connection::connect`] wants. Distinct from
+/// `station_endpoint`'s already-split `host_advertised`/`quic_port`
+/// fields — `content_announcement` embeds a single ready-to-dial URL
+/// instead. Tolerates a bare `host:port` with no scheme too, matching this
+/// crate's own tolerance elsewhere for a station config given without one.
+fn parse_seed_url(seed: &str) -> Option<(String, u16)> {
+    if let Some(rest) = seed
+        .strip_prefix("https://")
+        .or_else(|| seed.strip_prefix("http://"))
+    {
+        let hostport = rest.split('/').next().unwrap_or(rest);
+        let (host, port_str) = hostport.rsplit_once(':')?;
+        return Some((host.to_string(), port_str.parse().ok()?));
+    }
+    let (host, port_str) = seed.rsplit_once(':')?;
+    Some((host.to_string(), port_str.parse().ok()?))
 }
