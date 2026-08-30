@@ -14,8 +14,14 @@
 //! both caller AND provider (`call`/[`FfiSession::serve_one_call`]),
 //! PUBLISH/SUBSCRIBE/EVENT, content transfer, and streaming RPC — both
 //! the caller/consumer role (§13.1) and the provider role (§13.2/§6.9,
-//! `advertise`/`accept_stream`). Not exposed: `Trust::Insecure` —
-//! deliberately, see [`FfiTrust`]'s own doc.
+//! `advertise`/`accept_stream`), and direct-dial resolution
+//! ([`FfiSession::resolve_direct`]/[`call_direct`](FfiSession::call_direct)/
+//! [`advertise_direct`](FfiSession::advertise_direct)). Not exposed:
+//! `Trust::Insecure` — deliberately, see [`FfiTrust`]'s own doc; the core
+//! crate's `keep_advertised`/`keep_advertised_direct` background-loop
+//! helpers — deliberately, see [`FfiSession::advertise_direct`]'s own doc
+//! for why a native background timer is the wrong shape for a mobile app
+//! and what to do instead.
 //!
 //! [`FfiValue`] mirrors every variant [`macula_rust_sdk::cbor::Value`]
 //! has, including recursive list/map shapes (`Items`/`Fields`, via
@@ -63,6 +69,10 @@ pub enum FfiError {
     Closed,
     #[error("the call handler failed: {reason}")]
     CallHandlerFailed { reason: String },
+    #[error("direct-dial resolution failed: {reason}")]
+    Resolve { reason: String },
+    #[error("direct-dial trust violation: the dialed peer's proven identity did not match the resolved station (see resolved/dialed fields)")]
+    DirectDialTrustViolation { resolved: Vec<u8>, dialed: Vec<u8> },
 }
 
 /// `Vec<u8>` -> `[u8; 32]`, with both lengths actually reported on
@@ -233,6 +243,63 @@ impl TryFrom<macula_rust_sdk::frame::CallResponse> for FfiCallResponse {
                 reported_by: reported_by.to_vec(),
                 detail,
             }),
+        }
+    }
+}
+
+/// A resolved direct-dial target — a mirror of
+/// [`macula_rust_sdk::direct_dial::Resolved`]: the station's own node id
+/// (32 bytes) plus its dialable host/port. Returned by
+/// [`FfiSession::resolve_direct`]; [`FfiSession::call_direct`] does this
+/// same resolution internally, so most callers never need this type
+/// directly — it's exposed for a caller that wants to resolve once and
+/// decide what to do with the target itself (e.g. displaying it, or
+/// dialing via a mechanism this crate doesn't cover).
+#[derive(uniffi::Record, Debug, Clone)]
+pub struct FfiResolved {
+    pub station: Vec<u8>,
+    pub host: String,
+    pub port: u16,
+}
+
+impl From<macula_rust_sdk::direct_dial::Resolved> for FfiResolved {
+    fn from(r: macula_rust_sdk::direct_dial::Resolved) -> Self {
+        FfiResolved {
+            station: r.station.to_vec(),
+            host: r.host,
+            port: r.port,
+        }
+    }
+}
+
+impl From<macula_rust_sdk::direct_dial::ResolveError> for FfiError {
+    fn from(e: macula_rust_sdk::direct_dial::ResolveError) -> Self {
+        FfiError::Resolve {
+            reason: e.to_string(),
+        }
+    }
+}
+
+impl From<macula_rust_sdk::direct_dial::CallError> for FfiError {
+    fn from(e: macula_rust_sdk::direct_dial::CallError) -> Self {
+        use macula_rust_sdk::direct_dial::CallError;
+        match e {
+            CallError::Resolve(re) => re.into(),
+            CallError::TrustViolation { resolved, dialed } => FfiError::DirectDialTrustViolation {
+                resolved: resolved.to_vec(),
+                dialed: dialed.to_vec(),
+            },
+            other => FfiError::Call {
+                reason: other.to_string(),
+            },
+        }
+    }
+}
+
+impl From<macula_rust_sdk::direct_dial::AdvertiseDirectError> for FfiError {
+    fn from(e: macula_rust_sdk::direct_dial::AdvertiseDirectError) -> Self {
+        FfiError::Send {
+            reason: e.to_string(),
         }
     }
 }
@@ -733,6 +800,100 @@ impl FfiSession {
             .map_err(|e| FfiError::Send {
                 reason: e.to_string(),
             })
+    }
+
+    /// Direct-dial resolution: finds `procedure`'s currently-advertised
+    /// serving station and its dialable host/port via the mesh DHT,
+    /// through this session (used only to query the DHT — it does not
+    /// need to be connected to the station that will end up serving the
+    /// call). The provider must have advertised via
+    /// [`advertise_direct`](Self::advertise_direct) — a plain
+    /// [`advertise`](Self::advertise) publishes no discoverable record.
+    /// Most callers want [`call_direct`](Self::call_direct) instead,
+    /// which does this resolution internally; this is exposed separately
+    /// for a caller that wants the resolved target itself.
+    pub async fn resolve_direct(
+        &self,
+        procedure: String,
+        realm: Vec<u8>,
+        identity: &FfiKeyPair,
+    ) -> Result<FfiResolved, FfiError> {
+        let realm = to_32(realm)?;
+        let mut guard = self.0.lock().await;
+        let session = guard.as_mut().ok_or(FfiError::Closed)?;
+        let resolved =
+            macula_rust_sdk::direct_dial::resolve(session, &identity.0, realm, &procedure).await?;
+        Ok(resolved.into())
+    }
+
+    /// Resolves `procedure`'s provider via direct-dial (through this
+    /// session, used only to query the DHT) and calls it there, in one
+    /// hop, in a SEPARATE connection from this session — see
+    /// [`macula_rust_sdk::direct_dial::call`]'s own doc for the full trust
+    /// model. Use this instead of [`call`](Self::call) when the provider
+    /// is reachable only via [`advertise_direct`](Self::advertise_direct)
+    /// (e.g. no ordinary advertise-gossip route has propagated between
+    /// the two stations involved).
+    pub async fn call_direct(
+        &self,
+        procedure: String,
+        realm: Vec<u8>,
+        payload: FfiValue,
+        timeout_ms: u64,
+        identity: &FfiKeyPair,
+    ) -> Result<FfiCallResponse, FfiError> {
+        let realm = to_32(realm)?;
+        let mut guard = self.0.lock().await;
+        let session = guard.as_mut().ok_or(FfiError::Closed)?;
+        let response = macula_rust_sdk::direct_dial::call(
+            session,
+            &identity.0,
+            realm,
+            &procedure,
+            payload.into(),
+            std::time::Duration::from_millis(timeout_ms),
+        )
+        .await?;
+        FfiCallResponse::try_from(response)
+    }
+
+    /// Publishes a signed direct-dial advertisement for `procedure` naming
+    /// this session's own currently-connected station — sends the
+    /// ordinary ADVERTISE frame first (so an inbound CALL routed here the
+    /// normal way still works, matching
+    /// [`advertise`](Self::advertise)'s own effect), then publishes a
+    /// signed `procedure_advertisement` DHT record so a caller on a
+    /// different station can [`resolve_direct`](Self::resolve_direct)/
+    /// [`call_direct`](Self::call_direct) here directly, skipping
+    /// inter-station gossip propagation. `ttl_ms` is the DHT record's
+    /// lifetime — this call does not repeat itself; a long-lived provider
+    /// must call it again on its own schedule before `ttl_ms` elapses
+    /// (deliberately not wrapped in a background loop here — see this
+    /// crate's own module doc for why: unlike the core crate's
+    /// `keep_advertised_direct`, a native background timer inside a
+    /// mobile app fights the OS's own app-lifecycle/background-execution
+    /// model; the foreign side should drive its own periodic re-advertise
+    /// using whatever scheduling mechanism its platform provides, calling
+    /// this method each time).
+    pub async fn advertise_direct(
+        &self,
+        procedure: String,
+        realm: Vec<u8>,
+        ttl_ms: u64,
+        identity: &FfiKeyPair,
+    ) -> Result<(), FfiError> {
+        let realm = to_32(realm)?;
+        let mut guard = self.0.lock().await;
+        let session = guard.as_mut().ok_or(FfiError::Closed)?;
+        macula_rust_sdk::direct_dial::advertise_direct(
+            session,
+            &identity.0,
+            realm,
+            &procedure,
+            std::time::Duration::from_millis(ttl_ms),
+        )
+        .await
+        .map_err(FfiError::from)
     }
 
     /// Provider role: block for the next inbound STREAM_OPEN, bounded by
