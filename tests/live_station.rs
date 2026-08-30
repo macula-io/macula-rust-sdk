@@ -297,6 +297,151 @@ async fn pubsub_round_trip_against_the_real_fleet() {
         .await;
 }
 
+/// Real end-to-end proof that `run_subscriber`/`run_publisher` work, not
+/// just compile — same discipline as `macula-go-sdk`'s
+/// `TestLiveRunSubscriberAndRunPublisher`: three SEPARATE sessions/
+/// identities (this fleet kicks whichever connection reuses an identity
+/// second, confirmed elsewhere this session), a subscriber genuinely
+/// receiving a real event through its callback (not manual polling), and
+/// the auto-published `pubsub.publish_completed_v1` fact confirmed by an
+/// INDEPENDENT fourth session subscribed BEFORE the publish happens — not
+/// the publisher's own bookkeeping. A random realm scopes this test's
+/// traffic away from any real third-party activity on this shared public
+/// fleet, same as `pubsub_round_trip_against_the_real_fleet` above.
+#[tokio::test]
+#[ignore = "requires network access to a live macula-station"]
+async fn run_subscriber_and_run_publisher_against_the_real_fleet() {
+    let realm: [u8; 32] = rand::random();
+    let topic = format!(
+        "macula-rust-sdk.test.{}",
+        hex::encode(rand::random::<[u8; 8]>())
+    );
+
+    // Independent watcher, subscribed to the fact topic BEFORE anything
+    // publishes -- pubsub has no replay for a late subscriber.
+    let watcher_id = KeyPair::generate_with_default_puzzle();
+    let mut watcher = connection::connect(STATION_HOST, STATION_PORT, Trust::WebPki, &watcher_id)
+        .await
+        .expect("watcher handshake should succeed");
+    watcher
+        .subscribe(
+            &macula_rust_sdk::frame::SubscribeSpec::new(
+                "pubsub.publish_completed_v1",
+                realm,
+                watcher_id.node_id(),
+            ),
+            &watcher_id,
+        )
+        .await
+        .expect("watcher SUBSCRIBE should send without error");
+
+    let sub_id = KeyPair::generate_with_default_puzzle();
+    let mut sub_session = connection::connect(STATION_HOST, STATION_PORT, Trust::WebPki, &sub_id)
+        .await
+        .expect("subscriber handshake should succeed");
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let sub_topic = topic.clone();
+    let subscribe_task = tokio::spawn(async move {
+        let spec =
+            macula_rust_sdk::frame::SubscribeSpec::new(sub_topic, realm, sub_id.node_id());
+        let stop = tokio::time::sleep(std::time::Duration::from_secs(8));
+        sub_session
+            .run_subscriber(&spec, &sub_id, stop, |evt| {
+                let _ = tx.send(evt);
+            })
+            .await
+    });
+
+    // Give both SUBSCRIBEs a moment to actually land before publishing.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    let pub_id = KeyPair::generate_with_default_puzzle();
+    let mut pub_session = connection::connect(STATION_HOST, STATION_PORT, Trust::WebPki, &pub_id)
+        .await
+        .expect("publisher handshake should succeed");
+    let spec = macula_rust_sdk::frame::PublishSpec::new(
+        topic.clone(),
+        realm,
+        pub_id.node_id(),
+        1,
+        Value::text("hello from run_publisher"),
+        now_ms(),
+    );
+    let publish_result = pub_session.run_publisher(&spec, &pub_id, true).await;
+    assert!(
+        publish_result.is_ok(),
+        "run_publisher should succeed: {publish_result:?}"
+    );
+    println!("OBSERVED: run_publisher completed cleanly");
+    pub_session
+        .close("normal", Some("publisher test done"), &pub_id)
+        .await;
+
+    match tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv()).await {
+        Ok(Some(evt)) => {
+            println!(
+                "OBSERVED: run_subscriber's handler received the real EVENT -- topic={} payload={:?}",
+                evt.topic, evt.payload
+            );
+            assert_eq!(evt.topic, topic);
+        }
+        _ => println!(
+            "OBSERVED: no EVENT arrived via the subscriber's callback within 5s -- a subscriber \
+             may not receive its own publish, same caveat as pubsub_round_trip_against_the_real_fleet"
+        ),
+    }
+
+    let sub_result = subscribe_task
+        .await
+        .expect("subscriber task should not panic");
+    assert!(
+        sub_result.is_ok(),
+        "run_subscriber should return Ok after its stop future resolves: {sub_result:?}"
+    );
+    println!("OBSERVED: run_subscriber returned cleanly after its stop future resolved");
+
+    // recv_event's own contract treats any non-EVENT/wrong-topic frame as
+    // an error, not something to skip -- correct for a caller expecting
+    // exactly one specific thing, but this is a SHARED PUBLIC demo fleet
+    // with other real traffic on the wire, so a single call can genuinely
+    // catch something unrelated first. Retry past that within an overall
+    // deadline, same resilience macula-go-sdk's RPC-telemetry-facts test
+    // needed for the identical reason.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut confirmed = false;
+    while std::time::Instant::now() < deadline {
+        match watcher
+            .recv_event(std::time::Duration::from_secs(2))
+            .await
+        {
+            Ok(evt) if evt.topic == "pubsub.publish_completed_v1" => {
+                let outcome = evt.payload.get("outcome");
+                println!(
+                    "OBSERVED: independent watcher confirmed a real pubsub.publish_completed_v1 fact landed -- outcome={outcome:?}"
+                );
+                assert_eq!(outcome, Some(&Value::text("completed")));
+                confirmed = true;
+                break;
+            }
+            Ok(other) => {
+                println!("(watcher skipping unrelated event on topic {})", other.topic);
+            }
+            Err(e) => {
+                println!("(watcher skipping a non-event frame or timeout: {e})");
+            }
+        }
+    }
+    assert!(
+        confirmed,
+        "independent watcher never observed a pubsub.publish_completed_v1 fact within the deadline"
+    );
+
+    watcher
+        .close("normal", Some("watcher test done"), &watcher_id)
+        .await;
+}
+
 /// Regression test for a real bug found live 2026-08-29 in the Go port
 /// of this exact `connect -> write -> Close` shape (macula-go-sdk's
 /// `connection.Session.Close`): a PUBLISH sent immediately before

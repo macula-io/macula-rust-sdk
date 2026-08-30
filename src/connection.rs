@@ -212,6 +212,47 @@ impl FrameStream {
             .unwrap_or(Err(CallError::Recv(RecvFrameError::Timeout)))
     }
 
+    /// As [`call`](Self::call), additionally attaching `ucan_token` to the
+    /// outgoing CALL frame — for invoking a procedure gated by a
+    /// [`crate::ucan::Policy::required`] policy. A procedure that isn't
+    /// gated ignores the token; one that is checks it (see
+    /// [`Session::serve_one_call_gated`]) before ever running its
+    /// handler, so an invalid/missing token comes back as a BOLT#4
+    /// `unauthorized` error frame, not a Rust error from this call.
+    ///
+    /// One parameter over [`call`](Self::call)'s own count, for the one
+    /// new thing this adds — same reasoning
+    /// [`crate::direct_dial::keep_advertised_direct`] already gives for
+    /// its own allow.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn call_with_ucan(
+        &mut self,
+        procedure: &str,
+        realm: [u8; 32],
+        payload: Value,
+        deadline_ms: i128,
+        identity: &KeyPair,
+        timeout: Duration,
+        ucan_token: Vec<u8>,
+    ) -> Result<frame::CallResponse, CallError> {
+        let call_id: [u8; 16] = rand::random();
+        let mut spec = frame::CallSpec::new(
+            call_id,
+            procedure,
+            realm,
+            payload,
+            deadline_ms,
+            identity.node_id(),
+        );
+        spec.ucan_token = ucan_token;
+        let signed = frame::sign(frame::call(&spec), identity);
+        self.send_frame(signed).await.map_err(CallError::Send)?;
+
+        tokio::time::timeout(timeout, self.await_call_response(call_id))
+            .await
+            .unwrap_or(Err(CallError::Recv(RecvFrameError::Timeout)))
+    }
+
     async fn await_call_response(
         &mut self,
         call_id: [u8; 16],
@@ -461,6 +502,35 @@ impl Session {
             .await
     }
 
+    /// As [`call`](Self::call), attaching `ucan_token` (e.g. from
+    /// [`crate::ucan::create`]) to the outgoing CALL — for invoking a
+    /// procedure gated by a [`crate::ucan::Policy::required`] policy on
+    /// the provider side. See [`FrameStream::call_with_ucan`] for the
+    /// full contract.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn call_with_ucan(
+        &mut self,
+        procedure: &str,
+        realm: [u8; 32],
+        payload: Value,
+        deadline_ms: i128,
+        identity: &KeyPair,
+        timeout: Duration,
+        ucan_token: Vec<u8>,
+    ) -> Result<frame::CallResponse, CallError> {
+        self.control
+            .call_with_ucan(
+                procedure,
+                realm,
+                payload,
+                deadline_ms,
+                identity,
+                timeout,
+                ucan_token,
+            )
+            .await
+    }
+
     /// Send a signed PUBLISH, carrying the end-to-end `publisher_sig`
     /// (over topic/realm/publisher/seq/payload, independent of frame
     /// type) so the resulting EVENT survives being relayed beyond one
@@ -629,18 +699,53 @@ impl Session {
     where
         L: Fn(&[u8; 32], &str) -> Option<CallHandler>,
     {
-        tokio::time::timeout(timeout, self.serve_one_call_inner(lookup, identity))
-            .await
-            .unwrap_or(Err(ServeCallError::Timeout))
+        self.serve_one_call_gated(
+            lookup,
+            |_, _| crate::ucan::Policy::open(),
+            identity,
+            timeout,
+        )
+        .await
     }
 
-    async fn serve_one_call_inner<L>(
+    /// [`serve_one_call`](Self::serve_one_call), additionally gating each
+    /// inbound CALL through `policy` BEFORE `lookup` runs — mirrors
+    /// `macula_station_link.erl`'s `handle_inbound_call/2` exactly: an
+    /// open policy (the default [`serve_one_call`](Self::serve_one_call)
+    /// uses) behaves identically; a [`crate::ucan::Policy::required`]
+    /// policy demands a CALL's `ucan_token` verify against the required
+    /// issuer, and refuses with BOLT#4 `unauthorized` WITHOUT ever
+    /// invoking `lookup` or a handler if it doesn't — a [`CallHandler`]
+    /// never sees the raw token either way, matching the reference's own
+    /// handler contract (payload only).
+    pub async fn serve_one_call_gated<L, P>(
         &mut self,
         lookup: L,
+        policy: P,
+        identity: &KeyPair,
+        timeout: Duration,
+    ) -> Result<(), ServeCallError>
+    where
+        L: Fn(&[u8; 32], &str) -> Option<CallHandler>,
+        P: Fn(&[u8; 32], &str) -> crate::ucan::Policy,
+    {
+        tokio::time::timeout(
+            timeout,
+            self.serve_one_call_gated_inner(lookup, policy, identity),
+        )
+        .await
+        .unwrap_or(Err(ServeCallError::Timeout))
+    }
+
+    async fn serve_one_call_gated_inner<L, P>(
+        &mut self,
+        lookup: L,
+        policy: P,
         identity: &KeyPair,
     ) -> Result<(), ServeCallError>
     where
         L: Fn(&[u8; 32], &str) -> Option<CallHandler>,
+        P: Fn(&[u8; 32], &str) -> crate::ucan::Policy,
     {
         loop {
             let value = self
@@ -651,7 +756,7 @@ impl Session {
             let Ok(call_info) = frame::parse_call(&value) else {
                 continue; // not ours -- see this method's doc on the limitation
             };
-            let reply = build_call_reply(call_info, &lookup, identity.node_id()).await;
+            let reply = build_call_reply(call_info, &lookup, &policy, identity.node_id()).await;
             let signed = frame::sign(reply, identity);
             self.control
                 .send_frame(signed)
@@ -699,6 +804,141 @@ impl Session {
         tokio::time::sleep(Self::CLOSE_DRAIN).await;
         self.connection.close(0u32.into(), reason.as_bytes());
     }
+
+    /// The supervised counterpart to the bare [`publish`](Self::publish)
+    /// primitive, matching `macula_publisher.erl` in spirit: publishes
+    /// `pubsub.publish_started_v1` before the publish and
+    /// `pubsub.publish_completed_v1` after, both under `spec`'s own realm.
+    /// Fact-publish failures are silently discarded — matching
+    /// `macula_publisher.erl`'s own `publish/5` helper, which throws away
+    /// its result unconditionally (`_ = macula:publish(...), ok`).
+    ///
+    /// Unlike Erlang's version — a supervised worker process a caller can
+    /// kill mid-flight — this crate's bare `publish` is already a
+    /// synchronous, near-instant frame send (no ack on this wire, no
+    /// network round-trip to await), so there is no meaningful "cancel
+    /// before it starts" window worth a dedicated mechanism. Await this
+    /// directly, or wrap it in `tokio::select!`/`tokio::time::timeout`
+    /// yourself if you need to abandon it early — dropping a `Future` IS
+    /// real cancellation in Rust; Erlang has to simulate that by killing a
+    /// worker process.
+    pub async fn run_publisher(
+        &mut self,
+        spec: &frame::PublishSpec,
+        identity: &KeyPair,
+        announce: bool,
+    ) -> Result<(), SendFrameError> {
+        let publish_id: [u8; 16] = rand::random();
+        if announce {
+            let payload = Value::Map(vec![])
+                .with_field("publish_id", Value::Bytes(publish_id.to_vec()))
+                .with_field("topic", Value::Bytes(spec.topic.as_bytes().to_vec()));
+            let fact = frame::PublishSpec::new(
+                "pubsub.publish_started_v1",
+                spec.realm,
+                identity.node_id(),
+                rand::random(),
+                payload,
+                now_ms(),
+            );
+            let _ = self.publish(&fact, identity).await;
+        }
+
+        let result = self.publish(spec, identity).await;
+
+        if announce {
+            let payload =
+                Value::Map(vec![]).with_field("publish_id", Value::Bytes(publish_id.to_vec()));
+            let payload = match &result {
+                Ok(()) => payload.with_field("outcome", Value::text("completed")),
+                Err(e) => payload
+                    .with_field("outcome", Value::text("failed"))
+                    .with_field("reason", Value::text(e.to_string())),
+            };
+            let fact = frame::PublishSpec::new(
+                "pubsub.publish_completed_v1",
+                spec.realm,
+                identity.node_id(),
+                rand::random(),
+                payload,
+                now_ms(),
+            );
+            let _ = self.publish(&fact, identity).await;
+        }
+
+        result
+    }
+
+    /// The supervised counterpart to the bare
+    /// [`subscribe`](Self::subscribe)/[`recv_event`](Self::recv_event)
+    /// primitives, matching `macula_subscriber.erl` in spirit: subscribes
+    /// once, then dispatches every inbound EVENT to `handler` until `stop`
+    /// resolves. Unsubscribes on return, including on cancellation.
+    ///
+    /// Mirrors [`serve_one_call`](Self::serve_one_call)'s own frame loop,
+    /// not [`recv_event`](Self::recv_event): a shared control stream can
+    /// carry other frame types between one EVENT and the next, so a
+    /// wrong-frame-type parse failure is skipped and polling continues,
+    /// exactly like `serve_one_call` skips a non-"call" frame — it is NOT
+    /// treated as fatal the way `recv_event`'s own contract treats any
+    /// parse failure. Confirmed live in the Go port of this exact pattern
+    /// (`macula-go-sdk`'s `Session.RunSubscriber`): without this, a single
+    /// non-EVENT frame arriving on the control stream aborted the whole
+    /// subscriber loop.
+    ///
+    /// No OTP pid to address a running subscriber by; `stop` plays that
+    /// role — matches [`keep_advertised`](Self::keep_advertised)'s own
+    /// cancellation shape exactly, not a new one. `handler` cannot itself
+    /// stop the loop (no return value) — by the same design `keep_advertised`
+    /// already established, where `on_error` can only report, not halt;
+    /// stopping is always external, via `stop`.
+    pub async fn run_subscriber<F>(
+        &mut self,
+        spec: &frame::SubscribeSpec,
+        identity: &KeyPair,
+        stop: F,
+        mut handler: impl FnMut(frame::EventInfo),
+    ) -> Result<(), RunSubscriberError>
+    where
+        F: std::future::Future<Output = ()>,
+    {
+        self.subscribe(spec, identity)
+            .await
+            .map_err(RunSubscriberError::Subscribe)?;
+
+        tokio::pin!(stop);
+        let result = loop {
+            tokio::select! {
+                _ = &mut stop => break Ok(()),
+                frame_result = self.control.recv_frame() => {
+                    let value = match frame_result {
+                        Ok(v) => v,
+                        Err(e) => break Err(RunSubscriberError::Recv(e)),
+                    };
+                    let Ok(evt) = frame::parse_event(&value) else {
+                        continue; // not ours -- see this method's doc on the limitation
+                    };
+                    handler(evt);
+                }
+            }
+        };
+
+        let _ = self
+            .unsubscribe(
+                &frame::UnsubscribeSpec::new(spec.topic.clone(), spec.realm, spec.subscriber),
+                identity,
+            )
+            .await;
+
+        result
+    }
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock before 1970")
+        .as_millis() as u64
 }
 
 #[derive(Debug)]
@@ -738,19 +978,55 @@ impl std::fmt::Display for ServeCallError {
 
 impl std::error::Error for ServeCallError {}
 
+/// Errors from [`Session::run_subscriber`].
+#[derive(Debug)]
+pub enum RunSubscriberError {
+    Subscribe(SendFrameError),
+    Recv(RecvFrameError),
+}
+
+impl std::fmt::Display for RunSubscriberError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RunSubscriberError::Subscribe(e) => write!(f, "subscribing: {e}"),
+            RunSubscriberError::Recv(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for RunSubscriberError {}
+
 /// Build the RESULT/ERROR reply for one inbound CALL — mirrors
 /// `macula_station_link.erl`'s `handle_inbound_call/2` +
-/// `safe_invoke_handler/4` exactly: a lookup miss is
-/// `unknown_next_peer`; the handler running to completion produces a
-/// RESULT (`Ok`) or `unknown_error` with `detail` (`Err`); a handler
-/// panic — caught via `tokio::spawn`, the same "one transient task per
-/// call" shape the reference's own "one process per call" uses — is
-/// `temporary_relay_failure`, with no `detail`, matching the reference
-/// not sending one on a crash either.
-async fn build_call_reply<L>(call_info: frame::CallInfo, lookup: &L, self_pub: [u8; 32]) -> Value
+/// `safe_invoke_handler/4` exactly: `policy` is checked FIRST (a
+/// rejection is BOLT#4 `unauthorized`, and `lookup`/a handler never run
+/// at all); then a lookup miss is `unknown_next_peer`; the handler
+/// running to completion produces a RESULT (`Ok`) or `unknown_error` with
+/// `detail` (`Err`); a handler panic — caught via `tokio::spawn`, the
+/// same "one transient task per call" shape the reference's own "one
+/// process per call" uses — is `temporary_relay_failure`, with no
+/// `detail`, matching the reference not sending one on a crash either.
+async fn build_call_reply<L, P>(
+    call_info: frame::CallInfo,
+    lookup: &L,
+    policy: &P,
+    self_pub: [u8; 32],
+) -> Value
 where
     L: Fn(&[u8; 32], &str) -> Option<CallHandler>,
+    P: Fn(&[u8; 32], &str) -> crate::ucan::Policy,
 {
+    if policy(&call_info.realm, &call_info.procedure)
+        .check(&call_info.ucan_token)
+        .is_err()
+    {
+        return frame::call_error(&frame::CallErrorSpec::new(
+            call_info.call_id,
+            bolt4::Code::Unauthorized,
+            self_pub,
+        ));
+    }
+
     let Some(handler) = lookup(&call_info.realm, &call_info.procedure) else {
         return frame::call_error(&frame::CallErrorSpec::new(
             call_info.call_id,
@@ -774,5 +1050,125 @@ where
             bolt4::Code::TemporaryRelayFailure,
             self_pub,
         )),
+    }
+}
+
+#[cfg(test)]
+mod ucan_gating_tests {
+    //! Proves `serve_one_call_gated`'s policy wiring end-to-end WITHOUT a
+    //! network — `build_call_reply` is a plain async function of
+    //! `(CallInfo, lookup, policy, self_pub)`, so its dispatch/reply logic
+    //! is fully testable in isolation. Mirrors `macula-go-sdk`'s own 4
+    //! connection-level UCAN-gating unit tests (`serve_ucan_test.go`).
+    use super::*;
+    use crate::identity::KeyPair;
+    use crate::ucan::{self, Policy};
+
+    fn call_info(ucan_token: Vec<u8>) -> frame::CallInfo {
+        frame::CallInfo {
+            call_id: [1; 16],
+            procedure: "test.proc".into(),
+            realm: [0; 32],
+            payload: Value::Null,
+            deadline_ms: 0,
+            caller: [2; 32],
+            ucan_token,
+        }
+    }
+
+    fn never_called_lookup() -> impl Fn(&[u8; 32], &str) -> Option<CallHandler> {
+        |_, _| panic!("handler lookup must not run when policy rejects the call")
+    }
+
+    fn echo_lookup() -> impl Fn(&[u8; 32], &str) -> Option<CallHandler> {
+        |_, _| {
+            Some(Arc::new(|payload: Value| {
+                Box::pin(async move { Ok(payload) })
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn open_policy_never_gates_dispatch() {
+        let reply = build_call_reply(
+            call_info(Vec::new()),
+            &echo_lookup(),
+            &|_, _| Policy::open(),
+            [0; 32],
+        )
+        .await;
+        assert!(matches!(
+            frame::parse_call_response(&reply),
+            Ok(frame::CallResponse::Result { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn required_policy_refuses_a_call_with_no_token_before_lookup_runs() {
+        let id = KeyPair::generate();
+        let reply = build_call_reply(
+            call_info(Vec::new()),
+            &never_called_lookup(),
+            &move |_, _| Policy::required(id.node_id()),
+            [0; 32],
+        )
+        .await;
+        match frame::parse_call_response(&reply) {
+            Ok(frame::CallResponse::Error { code, .. }) => {
+                assert_eq!(code, bolt4::Code::Unauthorized as u8)
+            }
+            other => panic!("expected an Unauthorized ERROR frame, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn required_policy_refuses_a_token_from_the_wrong_issuer_before_lookup_runs() {
+        let required_issuer = KeyPair::generate();
+        let impostor = KeyPair::generate();
+        let bad_token = ucan::create(
+            "did:iss",
+            "did:aud",
+            vec![],
+            &impostor,
+            ucan::CreateOpts::default(),
+        )
+        .unwrap();
+        let reply = build_call_reply(
+            call_info(bad_token),
+            &never_called_lookup(),
+            &move |_, _| Policy::required(required_issuer.node_id()),
+            [0; 32],
+        )
+        .await;
+        match frame::parse_call_response(&reply) {
+            Ok(frame::CallResponse::Error { code, .. }) => {
+                assert_eq!(code, bolt4::Code::Unauthorized as u8)
+            }
+            other => panic!("expected an Unauthorized ERROR frame, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn required_policy_lets_a_valid_token_reach_the_handler() {
+        let id = KeyPair::generate();
+        let good_token = ucan::create(
+            "did:iss",
+            "did:aud",
+            vec![],
+            &id,
+            ucan::CreateOpts::default(),
+        )
+        .unwrap();
+        let reply = build_call_reply(
+            call_info(good_token),
+            &echo_lookup(),
+            &move |_, _| Policy::required(id.node_id()),
+            [0; 32],
+        )
+        .await;
+        assert!(matches!(
+            frame::parse_call_response(&reply),
+            Ok(frame::CallResponse::Result { .. })
+        ));
     }
 }
