@@ -343,8 +343,7 @@ async fn run_subscriber_and_run_publisher_against_the_real_fleet() {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let sub_topic = topic.clone();
     let subscribe_task = tokio::spawn(async move {
-        let spec =
-            macula_rust_sdk::frame::SubscribeSpec::new(sub_topic, realm, sub_id.node_id());
+        let spec = macula_rust_sdk::frame::SubscribeSpec::new(sub_topic, realm, sub_id.node_id());
         let stop = tokio::time::sleep(std::time::Duration::from_secs(8));
         sub_session
             .run_subscriber(&spec, &sub_id, stop, |evt| {
@@ -411,10 +410,7 @@ async fn run_subscriber_and_run_publisher_against_the_real_fleet() {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     let mut confirmed = false;
     while std::time::Instant::now() < deadline {
-        match watcher
-            .recv_event(std::time::Duration::from_secs(2))
-            .await
-        {
+        match watcher.recv_event(std::time::Duration::from_secs(2)).await {
             Ok(evt) if evt.topic == "pubsub.publish_completed_v1" => {
                 let outcome = evt.payload.get("outcome");
                 println!(
@@ -425,7 +421,10 @@ async fn run_subscriber_and_run_publisher_against_the_real_fleet() {
                 break;
             }
             Ok(other) => {
-                println!("(watcher skipping unrelated event on topic {})", other.topic);
+                println!(
+                    "(watcher skipping unrelated event on topic {})",
+                    other.topic
+                );
             }
             Err(e) => {
                 println!("(watcher skipping a non-event frame or timeout: {e})");
@@ -977,6 +976,187 @@ async fn unary_call_provider_round_trip_against_the_real_fleet() {
         .await;
     caller_session
         .close("normal", Some("unary caller test done"), &caller_identity)
+        .await;
+}
+
+/// Proves `call`/`serve_one_call` genuinely auto-publish `rpc.sent_v1`/
+/// `rpc.completed_v1` (caller) and `rpc.received_v1`/`rpc.replied_v1`
+/// (provider) — confirmed by an INDEPENDENT watcher session, not the
+/// caller's/provider's own bookkeeping. A random realm (same trick
+/// `unary_call_provider_round_trip_against_the_real_fleet` and the pubsub
+/// live test already use) scopes every fact this test's own call
+/// generates away from any real third-party activity on this shared
+/// public fleet — with only one call made under a realm nobody else
+/// uses, there is exactly one of each fact to expect, so no request_id
+/// correlation against unrelated traffic is needed here (unlike
+/// `macula-go-sdk`'s equivalent test, which had to add that specifically
+/// because it published under a FIXED, shared topic/realm).
+#[tokio::test]
+#[ignore = "requires network access to a live macula-station"]
+async fn rpc_telemetry_facts_against_the_real_fleet() {
+    let provider_identity = KeyPair::generate_with_default_puzzle();
+    let caller_identity = KeyPair::generate_with_default_puzzle();
+    let watcher_identity = KeyPair::generate_with_default_puzzle();
+
+    let realm: [u8; 32] = rand::random();
+    let procedure = format!(
+        "macula_rust_sdk.test_rpc_facts.{}",
+        hex::encode(rand::random::<[u8; 8]>())
+    );
+
+    // Watcher subscribes to all 4 topics BEFORE anything happens — pubsub
+    // has no replay for a late subscriber.
+    let mut watcher =
+        connection::connect(STATION_HOST, STATION_PORT, Trust::WebPki, &watcher_identity)
+            .await
+            .expect("watcher handshake should succeed");
+    for topic in [
+        "rpc.sent_v1",
+        "rpc.completed_v1",
+        "rpc.received_v1",
+        "rpc.replied_v1",
+    ] {
+        watcher
+            .subscribe(
+                &macula_rust_sdk::frame::SubscribeSpec::new(
+                    topic,
+                    realm,
+                    watcher_identity.node_id(),
+                ),
+                &watcher_identity,
+            )
+            .await
+            .expect("watcher SUBSCRIBE should send without error");
+    }
+
+    let mut provider_session = connection::connect(
+        STATION_HOST,
+        STATION_PORT,
+        Trust::WebPki,
+        &provider_identity,
+    )
+    .await
+    .expect("provider handshake should succeed");
+    let mut caller_session =
+        connection::connect(STATION_HOST, STATION_PORT, Trust::WebPki, &caller_identity)
+            .await
+            .expect("caller handshake should succeed");
+
+    let advertise_spec = macula_rust_sdk::frame::AdvertiseSpec::new(
+        realm,
+        procedure.clone(),
+        provider_identity.node_id(),
+    );
+    provider_session
+        .advertise(&advertise_spec, &provider_identity)
+        .await
+        .expect("advertise should send");
+
+    // Give both the advertise and the 4 SUBSCRIBEs a moment to land.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    let target_procedure = procedure.clone();
+    let lookup = move |_realm: &[u8; 32], proc: &str| -> Option<connection::CallHandler> {
+        if proc != target_procedure {
+            return None;
+        }
+        Some(std::sync::Arc::new(|payload: Value| {
+            Box::pin(async move { Ok(payload) })
+                as connection::BoxFuture<'static, Result<Value, String>>
+        }))
+    };
+
+    // Returns provider_session/provider_identity back out, rather than
+    // letting them drop when the task ends, so they can be explicitly
+    // `.close()`d below — NOT a stylistic choice. A bare `Drop` right
+    // after `serve_one_call` returns races the just-sent RESULT frame
+    // against abrupt QUIC connection teardown with zero drain time,
+    // exactly the "PUBLISH sent immediately before Close intermittently
+    // never reached the peer" gotcha `Session::close`'s own doc already
+    // warns about (quinn's `write_all`/`finish` only hand data to its
+    // send-scheduling machinery, they don't wait for the peer to receive
+    // it) — except a bare drop has even less margin than `close()`'s own
+    // built-in drain sleep. Found live: an earlier draft of this test let
+    // `provider_session` drop bare and got a deterministic, 100%-reproducible
+    // caller-side timeout even though `serve_one_call` itself returned
+    // `Ok(())` every time — isolated by bisection against
+    // `unary_call_provider_round_trip_against_the_real_fleet` (which
+    // already returns its sessions and explicitly closes them, and never
+    // hits this), not a fleet flake and not caused by the RPC telemetry
+    // facts this test actually exists to check.
+    let serve_task = tokio::spawn(async move {
+        let result = provider_session
+            .serve_one_call(
+                lookup,
+                &provider_identity,
+                std::time::Duration::from_secs(15),
+            )
+            .await;
+        (result, provider_session, provider_identity)
+    });
+
+    let response = caller_session
+        .call(
+            &procedure,
+            realm,
+            Value::text("hello"),
+            (now_ms() + 10_000) as i128,
+            &caller_identity,
+            std::time::Duration::from_secs(10),
+        )
+        .await
+        .expect("call should succeed");
+    assert!(
+        matches!(
+            response,
+            macula_rust_sdk::frame::CallResponse::Result { .. }
+        ),
+        "expected a RESULT, got {response:?}"
+    );
+
+    let (serve_result, provider_session, provider_identity) =
+        serve_task.await.expect("serve task should not panic");
+    serve_result.expect("provider should serve the inbound CALL");
+    provider_session
+        .close("normal", Some("rpc facts test done"), &provider_identity)
+        .await;
+
+    let mut seen = std::collections::HashSet::new();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while seen.len() < 4 && std::time::Instant::now() < deadline {
+        let Ok(value) =
+            tokio::time::timeout(std::time::Duration::from_secs(1), watcher.recv_frame()).await
+        else {
+            continue;
+        };
+        let Ok(evt) =
+            macula_rust_sdk::frame::parse_event(&value.expect("recv_frame should not error"))
+        else {
+            continue;
+        };
+        if seen.insert(evt.topic.clone()) {
+            println!(
+                "OBSERVED: {} fact landed with payload={:?}",
+                evt.topic, evt.payload
+            );
+        }
+    }
+    assert_eq!(
+        seen,
+        std::collections::HashSet::from([
+            "rpc.sent_v1".to_string(),
+            "rpc.completed_v1".to_string(),
+            "rpc.received_v1".to_string(),
+            "rpc.replied_v1".to_string(),
+        ]),
+        "expected all 4 RPC telemetry facts to land, only saw: {seen:?}"
+    );
+
+    caller_session
+        .close("normal", Some("rpc facts test done"), &caller_identity)
+        .await;
+    watcher
+        .close("normal", Some("rpc facts test done"), &watcher_identity)
         .await;
 }
 

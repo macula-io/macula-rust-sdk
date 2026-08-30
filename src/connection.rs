@@ -487,7 +487,9 @@ impl Session {
     }
 
     /// Send a signed CALL on the control stream and wait for the
-    /// matching RESULT or ERROR — see [`FrameStream::call`].
+    /// matching RESULT or ERROR — see [`FrameStream::call`]. Announces
+    /// `rpc.sent_v1`/`rpc.completed_v1` around the call — see
+    /// [`announce_rpc_sent`] for why these are always on.
     pub async fn call(
         &mut self,
         procedure: &str,
@@ -497,16 +499,22 @@ impl Session {
         identity: &KeyPair,
         timeout: Duration,
     ) -> Result<frame::CallResponse, CallError> {
-        self.control
+        let request_id: [u8; 16] = rand::random();
+        announce_rpc_sent(&mut *self, realm, identity, request_id).await;
+        let result = self
+            .control
             .call(procedure, realm, payload, deadline_ms, identity, timeout)
-            .await
+            .await;
+        announce_rpc_completed(&mut *self, realm, identity, request_id, &result).await;
+        result
     }
 
     /// As [`call`](Self::call), attaching `ucan_token` (e.g. from
     /// [`crate::ucan::create`]) to the outgoing CALL — for invoking a
     /// procedure gated by a [`crate::ucan::Policy::required`] policy on
     /// the provider side. See [`FrameStream::call_with_ucan`] for the
-    /// full contract.
+    /// full contract. Announces `rpc.sent_v1`/`rpc.completed_v1` the same
+    /// way [`call`](Self::call) does.
     #[allow(clippy::too_many_arguments)]
     pub async fn call_with_ucan(
         &mut self,
@@ -518,7 +526,10 @@ impl Session {
         timeout: Duration,
         ucan_token: Vec<u8>,
     ) -> Result<frame::CallResponse, CallError> {
-        self.control
+        let request_id: [u8; 16] = rand::random();
+        announce_rpc_sent(&mut *self, realm, identity, request_id).await;
+        let result = self
+            .control
             .call_with_ucan(
                 procedure,
                 realm,
@@ -528,7 +539,9 @@ impl Session {
                 timeout,
                 ucan_token,
             )
-            .await
+            .await;
+        announce_rpc_completed(&mut *self, realm, identity, request_id, &result).await;
+        result
     }
 
     /// Send a signed PUBLISH, carrying the end-to-end `publisher_sig`
@@ -756,7 +769,8 @@ impl Session {
             let Ok(call_info) = frame::parse_call(&value) else {
                 continue; // not ours -- see this method's doc on the limitation
             };
-            let reply = build_call_reply(call_info, &lookup, &policy, identity.node_id()).await;
+            let reply =
+                build_call_reply(call_info, &lookup, &policy, identity, Some(&mut *self)).await;
             let signed = frame::sign(reply, identity);
             self.control
                 .send_frame(signed)
@@ -1006,16 +1020,174 @@ impl std::error::Error for RunSubscriberError {}
 /// same "one transient task per call" shape the reference's own "one
 /// process per call" uses — is `temporary_relay_failure`, with no
 /// `detail`, matching the reference not sending one on a crash either.
+// RPC telemetry auto-facts, matching `macula_request.erl` (caller side:
+// rpc.sent_v1/rpc.completed_v1) and `macula_response.erl` (provider side:
+// rpc.received_v1/rpc.replied_v1) exactly -- same topic names, same
+// `request_id` field (16 fresh random bytes per call, independent of the
+// wire CALL frame's own `call_id` -- the reference tracks its own request
+// lifecycle separately from the wire frame, and this does too), same realm
+// as the call itself, fire-and-forget (a fact-publish failure here never
+// fails the underlying `call`/`serve_one_call_gated`, matching
+// `macula_response.erl`'s own `_ = macula:publish(...), ok` and
+// `macula_request.erl`'s identical `publish/5` helper -- same pattern this
+// crate's own `run_publisher` already uses for its pubsub facts).
+//
+// Always on, matching the reference's ACTUAL behavior on each side, not
+// just a blanket claim -- checked directly rather than assumed:
+// `macula_request.erl`'s `start_link/7` and `start_link_direct/8` both
+// hardcode `true` literally at the tuple-construction call site; there is
+// no `Opts` key or parameter that reaches it at all on the caller side.
+// `macula_response.erl`'s `advertise/6` DOES read `announce` from its
+// `Opts` map with a `true` default (`maps:get(announce, Opts, true)`) --
+// technically overridable -- but the one real caller in this workspace
+// (`hecate_om_capabilities.erl`'s `advertise_opts/1`) never sets it to
+// `false`. Matching Go's `macula-go-sdk` decision here: no toggle exposed
+// on either side, since exposing one on `call`/`serve_one_call_gated` --
+// this crate's two most heavily used functions -- for an option nothing
+// in the reference ecosystem actually flips would be a real-blast-radius
+// signature change for no practical benefit.
+const RPC_SENT_TOPIC: &str = "rpc.sent_v1";
+const RPC_COMPLETED_TOPIC: &str = "rpc.completed_v1";
+const RPC_RECEIVED_TOPIC: &str = "rpc.received_v1";
+const RPC_REPLIED_TOPIC: &str = "rpc.replied_v1";
+
+fn request_id_payload(request_id: [u8; 16]) -> Value {
+    Value::Map(vec![]).with_field("request_id", Value::Bytes(request_id.to_vec()))
+}
+
+async fn announce_fact(
+    session: &mut Session,
+    realm: [u8; 32],
+    identity: &KeyPair,
+    topic: &str,
+    payload: Value,
+) {
+    let fact = frame::PublishSpec::new(
+        topic,
+        realm,
+        identity.node_id(),
+        rand::random(),
+        payload,
+        now_ms(),
+    );
+    let _ = session.publish(&fact, identity).await;
+}
+
+async fn announce_rpc_sent(
+    session: &mut Session,
+    realm: [u8; 32],
+    identity: &KeyPair,
+    request_id: [u8; 16],
+) {
+    announce_fact(
+        session,
+        realm,
+        identity,
+        RPC_SENT_TOPIC,
+        request_id_payload(request_id),
+    )
+    .await;
+}
+
+/// Matches `macula_request.erl`'s `outcome_fields/2`: `completed` (no Rust
+/// error, not a bolt4 ERROR frame) or `failed` (either). Erlang
+/// additionally has a `cancelled` outcome from its own
+/// gen_server-cancellable `macula_request:cancel/1` -- this crate's plain
+/// `call` has no cancellation concept independent of an ordinary
+/// error/timeout at this layer, so that outcome is not reachable here and
+/// is not fabricated (same reasoning Go's port already documented).
+async fn announce_rpc_completed(
+    session: &mut Session,
+    realm: [u8; 32],
+    identity: &KeyPair,
+    request_id: [u8; 16],
+    result: &Result<frame::CallResponse, CallError>,
+) {
+    let payload = request_id_payload(request_id);
+    let payload = match result {
+        Err(e) => payload
+            .with_field("outcome", Value::text("failed"))
+            .with_field("reason", Value::text(e.to_string())),
+        Ok(frame::CallResponse::Error { name, .. }) => payload
+            .with_field("outcome", Value::text("failed"))
+            .with_field("reason", Value::text(name.clone())),
+        Ok(frame::CallResponse::Result { .. }) => {
+            payload.with_field("outcome", Value::text("completed"))
+        }
+    };
+    announce_fact(session, realm, identity, RPC_COMPLETED_TOPIC, payload).await;
+}
+
+async fn announce_rpc_received(
+    session: &mut Session,
+    realm: [u8; 32],
+    identity: &KeyPair,
+    request_id: [u8; 16],
+) {
+    announce_fact(
+        session,
+        realm,
+        identity,
+        RPC_RECEIVED_TOPIC,
+        request_id_payload(request_id),
+    )
+    .await;
+}
+
+/// Matches `macula_response.erl`'s `outcome_fields/2`: `replied` (`{ok,
+/// _}`) or `failed` (`{error, Reason}`). A handler panic is deliberately
+/// NOT announced here at all -- matching the reference exactly, where a
+/// crashing `Module:handle_request/2` crashes the whole per-request child
+/// before its own `publish_replied/2` call is ever reached, so
+/// `REQUEST_REPLIED` is never published for a crash there either.
+async fn announce_rpc_replied(
+    session: &mut Session,
+    realm: [u8; 32],
+    identity: &KeyPair,
+    request_id: [u8; 16],
+    handler_err: Option<&str>,
+) {
+    let payload = request_id_payload(request_id);
+    let payload = match handler_err {
+        Some(reason) => payload
+            .with_field("outcome", Value::text("failed"))
+            .with_field("reason", Value::text(reason)),
+        None => payload.with_field("outcome", Value::text("replied")),
+    };
+    announce_fact(session, realm, identity, RPC_REPLIED_TOPIC, payload).await;
+}
+
+/// Fires `rpc.received_v1`/`rpc.replied_v1` around dispatch when `session`
+/// is `Some` -- `None` for the pure dispatch-logic unit tests in
+/// `ucan_gating_tests` below, which deliberately exercise this function
+/// with no network at all (mirrors `macula-go-sdk`'s identical
+/// nil-session-safe `announceFact`). `rpc.received_v1` fires only after
+/// `policy` and `lookup` both pass, matching `macula_response.erl`'s own
+/// per-request child only starting once the raw advertise mechanism
+/// already decided to dispatch to a real handler -- a UCAN-rejected or
+/// unadvertised-procedure CALL announces neither fact.
+///
+/// `#[allow(needless_option_as_deref)]`: the lint is right that
+/// `Option<&mut Session>::as_deref_mut()`'s RETURN type is identical to
+/// its input type, but wrong that the call is needless here -- three
+/// separate call sites below each need their own short-lived reborrow
+/// from the same `session` local; using `session` directly at any one of
+/// them would move it out for the rest of the function, breaking the
+/// other two.
+#[allow(clippy::needless_option_as_deref)]
 async fn build_call_reply<L, P>(
     call_info: frame::CallInfo,
     lookup: &L,
     policy: &P,
-    self_pub: [u8; 32],
+    identity: &KeyPair,
+    mut session: Option<&mut Session>,
 ) -> Value
 where
     L: Fn(&[u8; 32], &str) -> Option<CallHandler>,
     P: Fn(&[u8; 32], &str) -> crate::ucan::Policy,
 {
+    let self_pub = identity.node_id();
+
     if policy(&call_info.realm, &call_info.procedure)
         .check(&call_info.ucan_token)
         .is_err()
@@ -1035,11 +1207,24 @@ where
         ));
     };
 
+    let request_id: [u8; 16] = rand::random();
+    if let Some(s) = session.as_deref_mut() {
+        announce_rpc_received(s, call_info.realm, identity, request_id).await;
+    }
+
     let payload = call_info.payload;
     let outcome = tokio::spawn(async move { handler(payload).await }).await;
     match outcome {
-        Ok(Ok(value)) => frame::result(&frame::ResultSpec::new(call_info.call_id, value, self_pub)),
+        Ok(Ok(value)) => {
+            if let Some(s) = session.as_deref_mut() {
+                announce_rpc_replied(s, call_info.realm, identity, request_id, None).await;
+            }
+            frame::result(&frame::ResultSpec::new(call_info.call_id, value, self_pub))
+        }
         Ok(Err(reason)) => {
+            if let Some(s) = session.as_deref_mut() {
+                announce_rpc_replied(s, call_info.realm, identity, request_id, Some(&reason)).await;
+            }
             let mut spec =
                 frame::CallErrorSpec::new(call_info.call_id, bolt4::Code::UnknownError, self_pub);
             spec.detail = Some(reason);
@@ -1090,11 +1275,13 @@ mod ucan_gating_tests {
 
     #[tokio::test]
     async fn open_policy_never_gates_dispatch() {
+        let identity = KeyPair::generate();
         let reply = build_call_reply(
             call_info(Vec::new()),
             &echo_lookup(),
             &|_, _| Policy::open(),
-            [0; 32],
+            &identity,
+            None,
         )
         .await;
         assert!(matches!(
@@ -1106,11 +1293,13 @@ mod ucan_gating_tests {
     #[tokio::test]
     async fn required_policy_refuses_a_call_with_no_token_before_lookup_runs() {
         let id = KeyPair::generate();
+        let identity = KeyPair::generate();
         let reply = build_call_reply(
             call_info(Vec::new()),
             &never_called_lookup(),
             &move |_, _| Policy::required(id.node_id()),
-            [0; 32],
+            &identity,
+            None,
         )
         .await;
         match frame::parse_call_response(&reply) {
@@ -1133,11 +1322,13 @@ mod ucan_gating_tests {
             ucan::CreateOpts::default(),
         )
         .unwrap();
+        let identity = KeyPair::generate();
         let reply = build_call_reply(
             call_info(bad_token),
             &never_called_lookup(),
             &move |_, _| Policy::required(required_issuer.node_id()),
-            [0; 32],
+            &identity,
+            None,
         )
         .await;
         match frame::parse_call_response(&reply) {
@@ -1159,11 +1350,13 @@ mod ucan_gating_tests {
             ucan::CreateOpts::default(),
         )
         .unwrap();
+        let identity = KeyPair::generate();
         let reply = build_call_reply(
             call_info(good_token),
             &echo_lookup(),
             &move |_, _| Policy::required(id.node_id()),
-            [0; 32],
+            &identity,
+            None,
         )
         .await;
         assert!(matches!(
