@@ -11,6 +11,8 @@ pub mod cbor;
 pub mod cert;
 pub mod connection;
 pub mod content;
+pub mod dht;
+pub mod direct_dial;
 pub mod frame;
 pub mod identity;
 pub mod manifest;

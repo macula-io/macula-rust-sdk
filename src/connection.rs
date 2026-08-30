@@ -529,6 +529,49 @@ impl Session {
         self.control.send_frame(signed).await
     }
 
+    /// Sends an ADVERTISE for `spec` immediately, then again every
+    /// `interval`, until `stop` resolves. [`advertise`](Self::advertise)'s
+    /// own doc notes the station's registration is tied to the connection
+    /// that sent it — a long-lived server needs to keep re-asserting it.
+    /// [`advertise`](Self::advertise) is a stateless, side-effect-free-on-
+    /// repeat wire send (unlike the Erlang reference's `advertise/5`, which
+    /// spawns a real per-call OTP supervisor and so needs a `reuse_sup`
+    /// option to avoid leaking one per tick), so there is nothing
+    /// equivalent to worry about leaking here — same reasoning
+    /// `macula-go-sdk`'s `KeepAdvertised` already applied and verified
+    /// live.
+    ///
+    /// A failed tick is reported via `on_error` but does not stop the
+    /// loop — it tries again at the next interval regardless. This cannot
+    /// detect or repair a dead session on its own; if the underlying
+    /// connection has actually gone down, every tick will keep failing
+    /// until `stop` resolves. See
+    /// [`crate::direct_dial::keep_advertised_direct`] for the direct-dial
+    /// equivalent (same shape, same reasoning).
+    pub async fn keep_advertised<F>(
+        &mut self,
+        spec: &frame::AdvertiseSpec,
+        identity: &KeyPair,
+        interval: Duration,
+        stop: F,
+        on_error: impl Fn(SendFrameError),
+    ) where
+        F: std::future::Future<Output = ()>,
+    {
+        tokio::pin!(stop);
+        let mut ticker = tokio::time::interval(interval);
+        loop {
+            tokio::select! {
+                _ = &mut stop => return,
+                _ = ticker.tick() => {
+                    if let Err(e) = self.advertise(spec, identity).await {
+                        on_error(e);
+                    }
+                }
+            }
+        }
+    }
+
     /// Read the next frame and parse it as an EVENT, bounded by
     /// `timeout`. Any non-EVENT frame received first is an error, not
     /// silently skipped — unlike [`call`](Self::call)'s response wait,

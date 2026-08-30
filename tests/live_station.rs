@@ -1317,3 +1317,222 @@ async fn cross_station_unary_call_round_trip_frankfurt_provider_milan_caller() {
         )
         .await;
 }
+
+/// Full direct-dial loop, end to end: a provider advertises via
+/// `direct_dial::advertise_direct` (publishing a signed DHT record, not
+/// the ordinary gossip ADVERTISE), a caller resolves that record over a
+/// SEPARATE connection via `direct_dial::resolve`, and `direct_dial::call`
+/// dials the resolved station directly and gets a REAL RESULT back —
+/// proving the whole chain (sign, publish, resolve, verify the trust
+/// chain, dial, call, serve) works against the real fleet, not just that
+/// resolution reaches the call stage.
+#[tokio::test]
+#[ignore = "requires network access to a live macula-station"]
+async fn direct_dial_advertise_resolve_and_call_round_trip_against_the_real_fleet() {
+    let provider_identity = KeyPair::generate_with_default_puzzle();
+    let caller_identity = KeyPair::generate_with_default_puzzle();
+
+    let mut provider_session =
+        connection::connect(MILAN_HOST, MILAN_PORT, Trust::WebPki, &provider_identity)
+            .await
+            .expect("provider handshake should succeed");
+    // Used only to query the DHT -- per direct_dial::resolve's own doc, it
+    // does not need to be connected to the same station that ends up
+    // serving the call. Dialing a DIFFERENT station than the provider's
+    // own makes that claim meaningful rather than accidentally true.
+    let mut resolve_session =
+        connection::connect(STATION_HOST, STATION_PORT, Trust::WebPki, &caller_identity)
+            .await
+            .expect("resolve-side handshake should succeed");
+
+    let realm: [u8; 32] = rand::random();
+    let procedure = format!(
+        "macula_rust_sdk.test_direct_dial.{}",
+        hex::encode(rand::random::<[u8; 8]>())
+    );
+
+    macula_rust_sdk::direct_dial::advertise_direct(
+        &mut provider_session,
+        &provider_identity,
+        realm,
+        &procedure,
+        std::time::Duration::from_secs(120),
+    )
+    .await
+    .expect("advertise_direct should publish the DHT record");
+
+    let target_procedure = procedure.clone();
+    let lookup = move |_realm: &[u8; 32], proc: &str| -> Option<connection::CallHandler> {
+        if proc != target_procedure {
+            return None;
+        }
+        let handler: connection::CallHandler = std::sync::Arc::new(|payload: Value| {
+            Box::pin(async move {
+                let n = match payload.get("n") {
+                    Some(Value::Int(n)) => *n,
+                    _ => return Err("missing or non-integer field \"n\"".to_string()),
+                };
+                Ok(Value::Int(n * 2))
+            }) as connection::BoxFuture<'static, Result<Value, String>>
+        });
+        Some(handler)
+    };
+
+    let serve_task = tokio::spawn(async move {
+        let result = provider_session
+            .serve_one_call(
+                lookup,
+                &provider_identity,
+                std::time::Duration::from_secs(20),
+            )
+            .await;
+        (result, provider_session, provider_identity)
+    });
+
+    let payload = Value::Map(vec![(Value::text("n"), Value::Int(21))]);
+    let response = macula_rust_sdk::direct_dial::call(
+        &mut resolve_session,
+        &caller_identity,
+        realm,
+        &procedure,
+        payload,
+        std::time::Duration::from_secs(15),
+    )
+    .await
+    .expect("direct-dial call should resolve, dial, and complete");
+
+    let (serve_result, provider_session, provider_identity) =
+        serve_task.await.expect("serve task should not panic");
+    serve_result.expect("provider should serve the direct-dialed inbound CALL");
+
+    match response {
+        macula_rust_sdk::frame::CallResponse::Result { payload, .. } => {
+            assert_eq!(
+                payload,
+                Value::Int(42),
+                "21 * 2 should reply with RESULT 42"
+            );
+        }
+        other => panic!("expected a RESULT, got {other:?}"),
+    }
+    println!(
+        "OBSERVED: direct-dial resolved+dialed a station DIFFERENT from the resolve session's own, and got a real RESULT for procedure={procedure}"
+    );
+
+    provider_session
+        .close(
+            "normal",
+            Some("direct-dial provider test done"),
+            &provider_identity,
+        )
+        .await;
+    resolve_session
+        .close(
+            "normal",
+            Some("direct-dial resolve-side test done"),
+            &caller_identity,
+        )
+        .await;
+}
+
+/// Proves `direct_dial::keep_advertised_direct` genuinely re-publishes on
+/// each tick (not a no-op) and stops cleanly once told to.
+#[tokio::test]
+#[ignore = "requires network access to a live macula-station"]
+async fn keep_advertised_direct_republishes_against_the_real_fleet() {
+    // Two independent identities on purpose: `publisher_identity` is owned
+    // by the spawned loop task; `reader_identity` is only ever used by this
+    // test's own verifying reads. `_dht.find_record` doesn't care who's
+    // asking, so there's no need to share one identity across an await
+    // boundary that would otherwise fight the loop task for ownership.
+    let publisher_identity = KeyPair::generate_with_default_puzzle();
+    let reader_identity = KeyPair::generate_with_default_puzzle();
+
+    let mut reader_session =
+        connection::connect(STATION_HOST, STATION_PORT, Trust::WebPki, &reader_identity)
+            .await
+            .expect("reader handshake should succeed");
+    let mut loop_session = connection::connect(
+        STATION_HOST,
+        STATION_PORT,
+        Trust::WebPki,
+        &publisher_identity,
+    )
+    .await
+    .expect("loop session handshake should succeed");
+
+    let realm: [u8; 32] = rand::random();
+    let procedure = format!(
+        "macula_rust_sdk.test_keep_advertised.{}",
+        hex::encode(rand::random::<[u8; 8]>())
+    );
+    let uri = macula_rust_sdk::dht::discovery_uri(realm, &procedure);
+    let key = macula_rust_sdk::dht::procedure_key(&uri);
+
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let loop_procedure = procedure.clone();
+    let loop_task = tokio::spawn(async move {
+        macula_rust_sdk::direct_dial::keep_advertised_direct(
+            &mut loop_session,
+            &publisher_identity,
+            realm,
+            &loop_procedure,
+            std::time::Duration::from_secs(120),
+            std::time::Duration::from_millis(500),
+            async move {
+                let _ = stop_rx.await;
+            },
+            |e| eprintln!("keep_advertised_direct tick failed (non-fatal): {e}"),
+        )
+        .await;
+        (loop_session, publisher_identity)
+    });
+
+    // Give the first (immediate) tick time to land, then read it back.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let first = macula_rust_sdk::dht::find_record(&mut reader_session, &reader_identity, key)
+        .await
+        .expect("first tick should already be visible");
+
+    // Wait past a second tick and confirm the record genuinely changed --
+    // not a stale read of the same one.
+    tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+    let second = macula_rust_sdk::dht::find_record(&mut reader_session, &reader_identity, key)
+        .await
+        .expect("second tick should be visible");
+    assert!(
+        second.created_at > first.created_at,
+        "expected the second tick's created_at ({}) to be strictly after the first's ({})",
+        second.created_at,
+        first.created_at
+    );
+    println!(
+        "OBSERVED: created_at advanced from {} to {} across two KeepAdvertisedDirect ticks",
+        first.created_at, second.created_at
+    );
+
+    stop_tx
+        .send(())
+        .expect("loop task should still be listening for stop");
+    let (loop_session, publisher_identity) =
+        tokio::time::timeout(std::time::Duration::from_secs(5), loop_task)
+            .await
+            .expect("keep_advertised_direct should return promptly after stop")
+            .expect("loop task should not panic");
+    println!("OBSERVED: keep_advertised_direct returned promptly after stop");
+
+    reader_session
+        .close(
+            "normal",
+            Some("keep_advertised_direct reader test done"),
+            &reader_identity,
+        )
+        .await;
+    loop_session
+        .close(
+            "normal",
+            Some("keep_advertised_direct loop session done"),
+            &publisher_identity,
+        )
+        .await;
+}
