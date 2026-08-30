@@ -18,3 +18,4 @@ pub mod identity;
 pub mod manifest;
 pub mod stream;
 pub mod transport;
+pub mod ucan;

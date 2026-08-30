@@ -360,9 +360,11 @@ pub fn call_error(spec: &CallErrorSpec) -> Value {
 }
 
 /// The fields a provider needs from an *inbound* CALL — the
-/// counterpart to [`CallResponse`] for the receiving side. Doesn't
-/// carry `source_route`/`retry_budget`/`ucan_token`: nothing in the
-/// provider role built so far acts on any of them.
+/// counterpart to [`CallResponse`] for the receiving side. Still doesn't
+/// carry `source_route`/`retry_budget`: nothing in the provider role
+/// built so far acts on either. `ucan_token` IS carried — added for
+/// [`crate::connection::Session::serve_one_call_gated`]'s policy check,
+/// which runs before a handler ever sees the call.
 #[derive(Debug, Clone)]
 pub struct CallInfo {
     pub call_id: [u8; 16],
@@ -371,6 +373,9 @@ pub struct CallInfo {
     pub payload: Value,
     pub deadline_ms: i128,
     pub caller: [u8; 32],
+    /// Empty if the caller attached none — matches [`CallSpec::new`]'s
+    /// own default and `macula_station_link.erl`'s "absent token" case.
+    pub ucan_token: Vec<u8>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -440,6 +445,10 @@ pub fn parse_call(frame: &Value) -> Result<CallInfo, ParseCallError> {
         Some(_) => return Err(ParseCallError::WrongFieldType("caller")),
         None => return Err(ParseCallError::MissingField("caller")),
     };
+    let ucan_token = match frame.get("ucan_token") {
+        Some(Value::Bytes(b)) => b.clone(),
+        _ => Vec::new(),
+    };
     Ok(CallInfo {
         call_id,
         procedure,
@@ -447,6 +456,7 @@ pub fn parse_call(frame: &Value) -> Result<CallInfo, ParseCallError> {
         payload,
         deadline_ms,
         caller,
+        ucan_token,
     })
 }
 
