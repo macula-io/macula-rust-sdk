@@ -9,6 +9,7 @@
 pub mod bolt4;
 pub mod cbor;
 pub mod cert;
+pub mod cert_chain;
 pub mod connection;
 pub mod content;
 pub mod dht;

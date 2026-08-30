@@ -21,14 +21,16 @@
 //!
 //! `cert_chain`-based org/realm authorization (Slice 7c Direction B,
 //! `macula_record:verify_advertisement_cert_chain/3` on the Erlang side) is
-//! NOT ported here — it is opt-in even in the reference implementation,
-//! and blocked behind direct-dial itself existing at all in this SDK, same
-//! call `macula-go-sdk` made.
+//! opt-in here too, matching the reference and `macula-go-sdk`'s own port —
+//! see [`resolve_with_cert_chain`]/[`call_with_cert_chain`]/
+//! [`advertise_direct_with_cert_chain`]. Plain [`resolve`]/[`call`]/
+//! [`advertise_direct`] are completely unaffected.
 
 use std::future::Future;
 use std::time::Duration;
 
 use crate::cbor::Value;
+use crate::cert_chain::{self, CertChainError};
 use crate::connection::{self, Session};
 use crate::dht::{self, DhtError, Record};
 use crate::frame::CallResponse;
@@ -64,6 +66,13 @@ pub enum ResolveError {
     /// signer didn't match the station it's supposed to describe.
     StationEndpointSignerMismatch,
     Dht(DhtError),
+    /// [`resolve_with_cert_chain`] only: at least one candidate
+    /// advertisement's envelope signature verified (otherwise
+    /// [`ResolveError::NoTrustedAdvertisement`] would apply instead), but
+    /// none passed cert-chain authorization for the expected org — carries
+    /// the specific [`CertChainError`] from the LAST candidate tried
+    /// (absent chain, wrong org, untrusted chain, etc.).
+    NoAuthorizedAdvertisement(CertChainError),
 }
 
 impl std::fmt::Display for ResolveError {
@@ -87,6 +96,10 @@ impl std::fmt::Display for ResolveError {
                 write!(f, "direct_dial: station_endpoint signer mismatch")
             }
             ResolveError::Dht(e) => write!(f, "direct_dial: {e}"),
+            ResolveError::NoAuthorizedAdvertisement(e) => write!(
+                f,
+                "direct_dial: no candidate advertisement is cert-chain-authorized for the expected org: {e}"
+            ),
         }
     }
 }
@@ -143,6 +156,72 @@ fn first_trusted_advertisement(recs: &[Record]) -> Option<dht::ProcedureAdvertis
         dht::verify(rec).ok()?;
         dht::read_procedure_advertisement(rec).ok()
     })
+}
+
+/// [`resolve`] plus Slice 7c Direction B managed-realm authorization: only
+/// an advertisement whose embedded cert chain validates to `realm_ca_pem`
+/// and names `expected_org` is trusted. Opt-in — [`resolve`] itself is
+/// unaffected and remains the right choice for unmanaged realms.
+pub async fn resolve_with_cert_chain(
+    session: &mut Session,
+    id: &KeyPair,
+    realm: [u8; 32],
+    procedure: &str,
+    realm_ca_pem: &[u8],
+    expected_org: &str,
+) -> Result<Resolved, ResolveError> {
+    let uri = dht::discovery_uri(realm, procedure);
+    let key = dht::procedure_key(&uri);
+
+    let mut recs: Vec<Record> = Vec::new();
+    for _ in 0..RESOLVE_RETRIES {
+        match dht::find_records(session, id, key).await {
+            Ok(found) if !found.is_empty() => {
+                recs = found;
+                break;
+            }
+            Ok(_) => {}
+            Err(e) => return Err(ResolveError::Dht(e)),
+        }
+        tokio::time::sleep(RESOLVE_RETRY_DELAY).await;
+    }
+    if recs.is_empty() {
+        return Err(ResolveError::ProcedureNotAdvertised);
+    }
+
+    let adv = first_authorized_advertisement(&recs, realm_ca_pem, expected_org)?;
+    resolve_station_endpoint(session, id, adv.serving_station).await
+}
+
+/// [`first_trusted_advertisement`] plus the cert-chain check. Matches Go's
+/// `firstAuthorizedAdvertisement`: if every candidate fails even the plain
+/// envelope-signature check, report [`ResolveError::NoTrustedAdvertisement`]
+/// (same as the plain path); only report
+/// [`ResolveError::NoAuthorizedAdvertisement`] once at least one candidate's
+/// signature verified but none passed cert-chain authorization.
+fn first_authorized_advertisement(
+    recs: &[Record],
+    realm_ca_pem: &[u8],
+    expected_org: &str,
+) -> Result<dht::ProcedureAdvertisement, ResolveError> {
+    let mut last_cert_err: Option<CertChainError> = None;
+    for rec in recs {
+        if dht::verify(rec).is_err() {
+            continue;
+        }
+        match cert_chain::verify_advertisement_cert_chain(realm_ca_pem, rec, expected_org) {
+            Ok(()) => {
+                if let Ok(adv) = dht::read_procedure_advertisement(rec) {
+                    return Ok(adv);
+                }
+            }
+            Err(e) => last_cert_err = Some(e),
+        }
+    }
+    match last_cert_err {
+        Some(e) => Err(ResolveError::NoAuthorizedAdvertisement(e)),
+        None => Err(ResolveError::NoTrustedAdvertisement),
+    }
 }
 
 /// Retries past a resolved-but-stale record, not just an absent one — the
@@ -282,6 +361,57 @@ pub async fn call(
     result
 }
 
+/// [`call`], resolved via [`resolve_with_cert_chain`] instead of
+/// [`resolve`] — see both for the full contract. Opt-in managed-realm
+/// authorization; [`call`] itself is unaffected.
+#[allow(clippy::too_many_arguments)]
+pub async fn call_with_cert_chain(
+    resolve_via: &mut Session,
+    id: &KeyPair,
+    realm: [u8; 32],
+    procedure: &str,
+    realm_ca_pem: &[u8],
+    expected_org: &str,
+    payload: Value,
+    timeout: Duration,
+) -> Result<CallResponse, CallError> {
+    let resolved = resolve_with_cert_chain(
+        resolve_via,
+        id,
+        realm,
+        procedure,
+        realm_ca_pem,
+        expected_org,
+    )
+    .await
+    .map_err(CallError::Resolve)?;
+
+    let mut target = tokio::time::timeout(
+        timeout,
+        connection::connect(&resolved.host, resolved.port, Trust::Insecure, id),
+    )
+    .await
+    .unwrap_or(Err(connection::HandshakeError::Timeout))
+    .map_err(CallError::Dial)?;
+
+    if target.station.node_id != resolved.station {
+        let dialed = target.station.node_id;
+        target.close("trust_violation", None, id).await;
+        return Err(CallError::TrustViolation {
+            resolved: resolved.station,
+            dialed,
+        });
+    }
+
+    let deadline_ms = now_ms() + timeout.as_millis() as i128;
+    let result = target
+        .call(procedure, realm, payload, deadline_ms, id, timeout)
+        .await
+        .map_err(CallError::Call);
+    target.close("normal", None, id).await;
+    result
+}
+
 /// Publishes a signed `procedure_advertisement` naming `session`'s own
 /// currently-connected station (`session.station.node_id`) as `procedure`'s
 /// server, discoverable by any caller's [`resolve`]/[`call`]. Mirrors
@@ -331,6 +461,38 @@ pub async fn advertise_direct(
 
     let uri = dht::discovery_uri(realm, procedure);
     let rec = dht::new_procedure_advertisement(id.node_id(), uri, session.station.node_id, ttl);
+    let rec = dht::sign(rec, id);
+    dht::put_record(session, id, &rec)
+        .await
+        .map_err(AdvertiseDirectError::Dht)
+}
+
+/// [`advertise_direct`] plus an embedded X.509 service-cert chain, for
+/// Slice 7c Direction B managed-realm authorization — see
+/// [`resolve_with_cert_chain`]/[`call_with_cert_chain`] for the
+/// corresponding checks. Opt-in: plain [`advertise_direct`] is unaffected.
+pub async fn advertise_direct_with_cert_chain(
+    session: &mut Session,
+    id: &KeyPair,
+    realm: [u8; 32],
+    procedure: &str,
+    ttl: Duration,
+    cert_chain_pem: Vec<u8>,
+) -> Result<(), AdvertiseDirectError> {
+    let advertise_spec = crate::frame::AdvertiseSpec::new(realm, procedure, id.node_id());
+    session
+        .advertise(&advertise_spec, id)
+        .await
+        .map_err(AdvertiseDirectError::Advertise)?;
+
+    let uri = dht::discovery_uri(realm, procedure);
+    let rec = dht::new_procedure_advertisement_with_cert_chain(
+        id.node_id(),
+        uri,
+        session.station.node_id,
+        ttl,
+        cert_chain_pem,
+    );
     let rec = dht::sign(rec, id);
     dht::put_record(session, id, &rec)
         .await

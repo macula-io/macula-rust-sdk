@@ -84,9 +84,9 @@ fn new_envelope(record_type: u8, key: [u8; 32], payload: Value, ttl: Duration) -
 /// resolver must derive the identical URI or the DHT storage key
 /// ([`procedure_key`]) will not agree. Sign before [`put_record`].
 ///
-/// Mirrors `macula_record:procedure_advertisement/3,4` (`cert_chain` and
-/// the other opt-in fields are not ported — out of scope until direct-dial
-/// itself is proven live, same call `macula-go-sdk` made).
+/// Mirrors `macula_record:procedure_advertisement/3,4`. See
+/// [`new_procedure_advertisement_with_cert_chain`] for the `cert_chain`
+/// variant.
 pub fn new_procedure_advertisement(
     advertiser_node: [u8; 32],
     procedure_uri: impl Into<String>,
@@ -106,6 +106,28 @@ pub fn new_procedure_advertisement(
         ),
     ]);
     new_envelope(TYPE_PROCEDURE_ADVERTISEMENT, advertiser_node, payload, ttl)
+}
+
+/// [`new_procedure_advertisement`] plus an embedded X.509 service-cert
+/// chain (leaf-first PEM: leaf ++ org CA), for Slice 7c Direction B
+/// managed-realm authorization — see
+/// [`cert_chain::verify_advertisement_cert_chain`](crate::cert_chain::verify_advertisement_cert_chain)
+/// for the corresponding check. Opt-in: plain [`new_procedure_advertisement`]
+/// is unaffected and remains the right choice for unmanaged realms.
+pub fn new_procedure_advertisement_with_cert_chain(
+    advertiser_node: [u8; 32],
+    procedure_uri: impl Into<String>,
+    serving_station: [u8; 32],
+    ttl: Duration,
+    cert_chain_pem: Vec<u8>,
+) -> Record {
+    let mut rec = new_procedure_advertisement(advertiser_node, procedure_uri, serving_station, ttl);
+    let Value::Map(mut entries) = rec.payload else {
+        unreachable!("new_procedure_advertisement always returns a Map payload");
+    };
+    entries.push((Value::text("cert_chain"), Value::Bytes(cert_chain_pem)));
+    rec.payload = Value::Map(entries);
+    rec
 }
 
 /// The exact bytes `macula_record:canonical_unsigned/1` signs and
@@ -217,13 +239,17 @@ pub fn discovery_uri(realm: [u8; 32], procedure: &str) -> String {
 }
 
 /// A `procedure_advertisement` record's fields, read out of its payload —
-/// mirrors `macula_record:read_procedure_advertisement/1` (the
-/// `cert_chain` field is not ported — see this module's doc).
+/// mirrors `macula_record:read_procedure_advertisement/1`. `cert_chain` is
+/// `None` when the advertisement carries no `cert_chain` field (the common,
+/// unmanaged-realm case); see
+/// [`cert_chain::verify_advertisement_cert_chain`](crate::cert_chain::verify_advertisement_cert_chain).
 #[derive(Debug, Clone)]
 pub struct ProcedureAdvertisement {
     pub procedure_uri: String,
     pub advertiser_node: [u8; 32],
     pub serving_station: [u8; 32],
+    /// Optional: leaf-first PEM bundle, leaf ++ org CA.
+    pub cert_chain: Option<Vec<u8>>,
 }
 
 /// A `station_endpoint` record's fields, read out of its payload — mirrors
@@ -268,10 +294,16 @@ pub fn read_procedure_advertisement(r: &Record) -> Result<ProcedureAdvertisement
     };
     let advertiser_node = bytes32_field(&r.payload, "advertiser_node")?;
     let serving_station = bytes32_field(&r.payload, "serving_station")?;
+    // Absent is valid, not an error — the common, unmanaged-realm case.
+    let cert_chain = match r.payload.get("cert_chain") {
+        Some(Value::Bytes(b)) => Some(b.clone()),
+        _ => None,
+    };
     Ok(ProcedureAdvertisement {
         procedure_uri,
         advertiser_node,
         serving_station,
+        cert_chain,
     })
 }
 

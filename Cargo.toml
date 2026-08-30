@@ -25,6 +25,11 @@ quinn = "0.11"
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
 webpki-roots = "0.26"
 x509-parser = "0.16"
+# cert_chain.rs: pure X.509 path validation (no hostname/SAN check, unlike
+# rustls's own ServerCertVerifier machinery in cert.rs) to a caller-supplied
+# realm CA — already transitively pulled in by rustls, declared directly
+# here since cert_chain.rs uses its EndEntityCert::verify_for_usage API.
+rustls-webpki = { version = "0.103", features = ["ring"] }
 tokio = { version = "1", features = ["full"] }
 uuid = { version = "1", features = ["v7"] }
 blake3 = "1.5"
@@ -43,4 +48,14 @@ tempfile = "3"
 # happens to present that cert type — see src/cert.rs's tests. Not a
 # runtime dependency of the crate itself (see src/cert.rs's module doc:
 # a dialing client never generates or presents a cert of its own).
-rcgen = { version = "0.13", default-features = false, features = ["pem", "ring"] }
+
+# Test-only, cert_chain.rs's own tests: signed_by() needs a SubjectPublicKeyInfo
+# constructed from a raw advertiser Ed25519 pubkey rather than a freshly
+# rcgen-generated one (the leaf must bind the SAME key that signed the
+# advertisement) — SubjectPublicKeyInfo::from_der needs this feature.
+rcgen = { version = "0.13", default-features = false, features = ["pem", "ring", "x509-parser"] }
+# Test-only, cert_chain.rs's own tests: rcgen's CertificateParams
+# not_before/not_after fields take this crate's OffsetDateTime directly;
+# not re-exported by rcgen, so declared explicitly (already transitively
+# present via rcgen itself).
+time = "0.3"
