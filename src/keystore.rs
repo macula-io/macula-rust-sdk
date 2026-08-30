@@ -262,7 +262,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     fn test_store() -> LinuxKeyutilsStore {
-        LinuxKeyutilsStore::new("macula-rust-sdk-test", "keystore-round-trip-test-entry")
+        LinuxKeyutilsStore::new("macula-rust-test", "keystore-round-trip-test-entry")
             .expect("Store::new/build should succeed -- keyutils is always available on Linux")
     }
 

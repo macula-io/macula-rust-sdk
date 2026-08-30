@@ -1,11 +1,11 @@
-//! UniFFI (Kotlin/Swift) bindings for [`macula_rust_sdk`]. A thin wrapper,
+//! UniFFI (Kotlin/Swift) bindings for [`macula_rust`]. A thin wrapper,
 //! not a reimplementation — everything here delegates straight to the
 //! core crate; nothing wire-level lives in this crate at all.
 //!
 //! Structure mirrors `iroh-ffi`'s relationship to `iroh`: a separate
 //! crate depending on the core one, so the core crate carries zero
 //! UniFFI dependency and zero FFI-shaped types. That separation is what
-//! keeps `macula-rust-sdk` itself just as usable from plain Rust, a CLI,
+//! keeps `macula-rust` itself just as usable from plain Rust, a CLI,
 //! or WASM as it was before this crate existed.
 //!
 //! Every application primitive the core crate has is wrapped: identity,
@@ -41,7 +41,7 @@
 //! past a non-EVENT-frame error the way `run_subscriber` does internally
 //! — nothing is lost, only where that retry loop lives.
 //!
-//! [`FfiValue`] mirrors every variant [`macula_rust_sdk::cbor::Value`]
+//! [`FfiValue`] mirrors every variant [`macula_rust::cbor::Value`]
 //! has, including recursive list/map shapes (`Items`/`Fields`, via
 //! `Vec` — see the type's own doc for why they aren't named `List`/
 //! `Map` like the core type), narrowed only where the FFI boundary
@@ -52,9 +52,9 @@
 //! Generate the bindings with the `uniffi-bindgen` binary this crate
 //! also builds, e.g.:
 //! ```text
-//! cargo build -p macula-rust-sdk-ffi --release
-//! cargo run -p macula-rust-sdk-ffi --bin uniffi-bindgen -- generate \
-//!     --library target/release/libmacula_rust_sdk_ffi.so \
+//! cargo build -p macula-rust-ffi --release
+//! cargo run -p macula-rust-ffi --bin uniffi-bindgen -- generate \
+//!     --library target/release/libmacula_rust_ffi.so \
 //!     --language kotlin --out-dir bindings/kotlin
 //! ```
 
@@ -99,18 +99,18 @@ pub enum FfiError {
     Keystore { reason: String },
 }
 
-impl From<macula_rust_sdk::ucan::UcanError> for FfiError {
-    fn from(e: macula_rust_sdk::ucan::UcanError) -> Self {
+impl From<macula_rust::ucan::UcanError> for FfiError {
+    fn from(e: macula_rust::ucan::UcanError) -> Self {
         FfiError::Ucan {
             reason: e.to_string(),
         }
     }
 }
 
-impl From<macula_rust_sdk::keystore::KeyStoreError> for FfiError {
-    fn from(e: macula_rust_sdk::keystore::KeyStoreError) -> Self {
+impl From<macula_rust::keystore::KeyStoreError> for FfiError {
+    fn from(e: macula_rust::keystore::KeyStoreError) -> Self {
         match e {
-            macula_rust_sdk::keystore::KeyStoreError::NotFound => FfiError::KeystoreNotFound,
+            macula_rust::keystore::KeyStoreError::NotFound => FfiError::KeystoreNotFound,
             other => FfiError::Keystore {
                 reason: other.to_string(),
             },
@@ -133,7 +133,7 @@ fn to_32(bytes: Vec<u8>) -> Result<[u8; 32], FfiError> {
 /// `Vec<u8>` -> `[u8; 34]` — same as [`to_32`], for an MCID
 /// (`<<Version:8, Codec:8, Hash:32/binary>>`, `plans/PLAN_WIRE_PROTOCOL.md`
 /// §12.1).
-fn to_mcid(bytes: Vec<u8>) -> Result<macula_rust_sdk::manifest::Mcid, FfiError> {
+fn to_mcid(bytes: Vec<u8>) -> Result<macula_rust::manifest::Mcid, FfiError> {
     let actual = bytes.len() as u32;
     bytes.try_into().map_err(|_| FfiError::WrongByteLength {
         expected: 34,
@@ -141,7 +141,7 @@ fn to_mcid(bytes: Vec<u8>) -> Result<macula_rust_sdk::manifest::Mcid, FfiError> 
     })
 }
 
-/// A mirror of [`macula_rust_sdk::cbor::Value`], narrowed only where the
+/// A mirror of [`macula_rust::cbor::Value`], narrowed only where the
 /// FFI boundary itself forces it: `Int` is `i64` not `i128` (UniFFI has
 /// no 128-bit integer type; an out-of-range value returns
 /// [`FfiError::UnrepresentableValue`] rather than silently truncating —
@@ -154,7 +154,7 @@ fn to_mcid(bytes: Vec<u8>) -> Result<macula_rust_sdk::manifest::Mcid, FfiError> 
 /// the recursion itself was never the obstacle, only finding time to
 /// wire it up.
 ///
-/// Named `Items`/`Fields` rather than mirroring [`macula_rust_sdk::cbor::Value`]'s own
+/// Named `Items`/`Fields` rather than mirroring [`macula_rust::cbor::Value`]'s own
 /// `List`/`Map` exactly: UniFFI's Kotlin codegen emits an unqualified
 /// `List<T>`/`Map<T>` field type for a `Vec`/dictionary-shaped variant,
 /// and inside `FfiValue`'s own sealed class body that unqualified name
@@ -166,7 +166,7 @@ fn to_mcid(bytes: Vec<u8>) -> Result<macula_rust_sdk::manifest::Mcid, FfiError> 
 /// neither language's collection type names are reused here.
 ///
 /// [`Fields`](FfiValue::Fields) uses [`FfiMapEntry`] rather than
-/// `HashMap<String, FfiValue>`: [`macula_rust_sdk::cbor::Value::Map`]'s own keys are
+/// `HashMap<String, FfiValue>`: [`macula_rust::cbor::Value::Map`]'s own keys are
 /// arbitrary values, not just text (Part 6 §9's integer-keyed sub-maps
 /// are real, not hypothetical — mpong's per-wall game state is one), and
 /// UniFFI's dictionary type requires a hashable, non-recursive key.
@@ -182,7 +182,7 @@ pub enum FfiValue {
 }
 
 /// One key/value pair of an [`FfiValue::Fields`], in insertion order —
-/// mirrors [`macula_rust_sdk::cbor::Value::Map`]'s own `Vec<(Value, Value)>` exactly,
+/// mirrors [`macula_rust::cbor::Value::Map`]'s own `Vec<(Value, Value)>` exactly,
 /// including that canonical key sort happens at encode time, not here.
 #[derive(uniffi::Record, Debug, Clone, PartialEq)]
 pub struct FfiMapEntry {
@@ -190,9 +190,9 @@ pub struct FfiMapEntry {
     pub value: FfiValue,
 }
 
-impl From<FfiValue> for macula_rust_sdk::cbor::Value {
+impl From<FfiValue> for macula_rust::cbor::Value {
     fn from(v: FfiValue) -> Self {
-        use macula_rust_sdk::cbor::Value;
+        use macula_rust::cbor::Value;
         match v {
             FfiValue::Null => Value::Null,
             FfiValue::Int(n) => Value::Int(n as i128),
@@ -210,11 +210,11 @@ impl From<FfiValue> for macula_rust_sdk::cbor::Value {
     }
 }
 
-impl TryFrom<macula_rust_sdk::cbor::Value> for FfiValue {
+impl TryFrom<macula_rust::cbor::Value> for FfiValue {
     type Error = FfiError;
 
-    fn try_from(v: macula_rust_sdk::cbor::Value) -> Result<Self, FfiError> {
-        use macula_rust_sdk::cbor::Value;
+    fn try_from(v: macula_rust::cbor::Value) -> Result<Self, FfiError> {
+        use macula_rust::cbor::Value;
         match v {
             Value::Null => Ok(FfiValue::Null),
             Value::Int(n) => {
@@ -247,7 +247,7 @@ impl TryFrom<macula_rust_sdk::cbor::Value> for FfiValue {
 }
 
 /// The result of a CALL: a mirror of
-/// [`macula_rust_sdk::frame::CallResponse`].
+/// [`macula_rust::frame::CallResponse`].
 #[derive(uniffi::Enum, Debug, Clone)]
 pub enum FfiCallResponse {
     Result {
@@ -262,11 +262,11 @@ pub enum FfiCallResponse {
     },
 }
 
-impl TryFrom<macula_rust_sdk::frame::CallResponse> for FfiCallResponse {
+impl TryFrom<macula_rust::frame::CallResponse> for FfiCallResponse {
     type Error = FfiError;
 
-    fn try_from(r: macula_rust_sdk::frame::CallResponse) -> Result<Self, FfiError> {
-        use macula_rust_sdk::frame::CallResponse;
+    fn try_from(r: macula_rust::frame::CallResponse) -> Result<Self, FfiError> {
+        use macula_rust::frame::CallResponse;
         match r {
             CallResponse::Result {
                 payload,
@@ -291,7 +291,7 @@ impl TryFrom<macula_rust_sdk::frame::CallResponse> for FfiCallResponse {
 }
 
 /// A resolved direct-dial target — a mirror of
-/// [`macula_rust_sdk::direct_dial::Resolved`]: the station's own node id
+/// [`macula_rust::direct_dial::Resolved`]: the station's own node id
 /// (32 bytes) plus its dialable host/port. Returned by
 /// [`FfiSession::resolve_direct`]; [`FfiSession::call_direct`] does this
 /// same resolution internally, so most callers never need this type
@@ -305,8 +305,8 @@ pub struct FfiResolved {
     pub port: u16,
 }
 
-impl From<macula_rust_sdk::direct_dial::Resolved> for FfiResolved {
-    fn from(r: macula_rust_sdk::direct_dial::Resolved) -> Self {
+impl From<macula_rust::direct_dial::Resolved> for FfiResolved {
+    fn from(r: macula_rust::direct_dial::Resolved) -> Self {
         FfiResolved {
             station: r.station.to_vec(),
             host: r.host,
@@ -315,17 +315,17 @@ impl From<macula_rust_sdk::direct_dial::Resolved> for FfiResolved {
     }
 }
 
-impl From<macula_rust_sdk::direct_dial::ResolveError> for FfiError {
-    fn from(e: macula_rust_sdk::direct_dial::ResolveError) -> Self {
+impl From<macula_rust::direct_dial::ResolveError> for FfiError {
+    fn from(e: macula_rust::direct_dial::ResolveError) -> Self {
         FfiError::Resolve {
             reason: e.to_string(),
         }
     }
 }
 
-impl From<macula_rust_sdk::direct_dial::CallError> for FfiError {
-    fn from(e: macula_rust_sdk::direct_dial::CallError) -> Self {
-        use macula_rust_sdk::direct_dial::CallError;
+impl From<macula_rust::direct_dial::CallError> for FfiError {
+    fn from(e: macula_rust::direct_dial::CallError) -> Self {
+        use macula_rust::direct_dial::CallError;
         match e {
             CallError::Resolve(re) => re.into(),
             CallError::TrustViolation { resolved, dialed } => FfiError::DirectDialTrustViolation {
@@ -339,8 +339,8 @@ impl From<macula_rust_sdk::direct_dial::CallError> for FfiError {
     }
 }
 
-impl From<macula_rust_sdk::direct_dial::AdvertiseDirectError> for FfiError {
-    fn from(e: macula_rust_sdk::direct_dial::AdvertiseDirectError) -> Self {
+impl From<macula_rust::direct_dial::AdvertiseDirectError> for FfiError {
+    fn from(e: macula_rust::direct_dial::AdvertiseDirectError) -> Self {
         FfiError::Send {
             reason: e.to_string(),
         }
@@ -348,15 +348,15 @@ impl From<macula_rust_sdk::direct_dial::AdvertiseDirectError> for FfiError {
 }
 
 /// One entry in a UCAN token's capability list — mirrors
-/// [`macula_rust_sdk::ucan::Capability`].
+/// [`macula_rust::ucan::Capability`].
 #[derive(uniffi::Record, Debug, Clone, PartialEq)]
 pub struct FfiCapability {
     pub with: String,
     pub can: String,
 }
 
-impl From<macula_rust_sdk::ucan::Capability> for FfiCapability {
-    fn from(c: macula_rust_sdk::ucan::Capability) -> Self {
+impl From<macula_rust::ucan::Capability> for FfiCapability {
+    fn from(c: macula_rust::ucan::Capability) -> Self {
         FfiCapability {
             with: c.with,
             can: c.can,
@@ -364,9 +364,9 @@ impl From<macula_rust_sdk::ucan::Capability> for FfiCapability {
     }
 }
 
-impl From<FfiCapability> for macula_rust_sdk::ucan::Capability {
+impl From<FfiCapability> for macula_rust::ucan::Capability {
     fn from(c: FfiCapability) -> Self {
-        macula_rust_sdk::ucan::Capability {
+        macula_rust::ucan::Capability {
             with: c.with,
             can: c.can,
         }
@@ -374,7 +374,7 @@ impl From<FfiCapability> for macula_rust_sdk::ucan::Capability {
 }
 
 /// A UCAN token's decoded claims — a mirror of
-/// [`macula_rust_sdk::ucan::Payload`], minus `facts`: the core type's
+/// [`macula_rust::ucan::Payload`], minus `facts`: the core type's
 /// `facts` field is an arbitrary `serde_json::Value` map, which has no
 /// UniFFI-representable shape (unlike [`FfiValue`], which exists
 /// specifically to give CBOR values one) — the same class of narrowing
@@ -392,8 +392,8 @@ pub struct FfiUcanPayload {
     pub proofs: Vec<String>,
 }
 
-impl From<macula_rust_sdk::ucan::Payload> for FfiUcanPayload {
-    fn from(p: macula_rust_sdk::ucan::Payload) -> Self {
+impl From<macula_rust::ucan::Payload> for FfiUcanPayload {
+    fn from(p: macula_rust::ucan::Payload) -> Self {
         FfiUcanPayload {
             issuer: p.issuer,
             audience: p.audience,
@@ -407,7 +407,7 @@ impl From<macula_rust_sdk::ucan::Payload> for FfiUcanPayload {
 }
 
 /// Mints a new UCAN token, self-issued and signed by `identity` — see
-/// [`macula_rust_sdk::ucan::create`]'s own doc for the full contract
+/// [`macula_rust::ucan::create`]'s own doc for the full contract
 /// (`issuer`/`audience` are opaque DID strings, not validated here).
 #[uniffi::export]
 pub fn ucan_create(
@@ -418,12 +418,12 @@ pub fn ucan_create(
     expires_at: Option<i64>,
     not_before: Option<i64>,
 ) -> Result<Vec<u8>, FfiError> {
-    let opts = macula_rust_sdk::ucan::CreateOpts {
+    let opts = macula_rust::ucan::CreateOpts {
         expires_at,
         not_before,
         ..Default::default()
     };
-    macula_rust_sdk::ucan::create(
+    macula_rust::ucan::create(
         &issuer,
         &audience,
         capabilities.into_iter().map(Into::into).collect(),
@@ -435,14 +435,14 @@ pub fn ucan_create(
 
 /// Verifies `token`'s signature against `public_key` (32 bytes) and its
 /// `exp`/`nbf` claims against the current time — see
-/// [`macula_rust_sdk::ucan::verify`]'s own doc, including its check order.
+/// [`macula_rust::ucan::verify`]'s own doc, including its check order.
 /// Only a successful [`ucan_verify`] result should ever back an
 /// authorization decision — [`ucan_decode`] and the `ucan_get_*` getters
 /// below never check the signature.
 #[uniffi::export]
 pub fn ucan_verify(token: Vec<u8>, public_key: Vec<u8>) -> Result<FfiUcanPayload, FfiError> {
     let key = to_32(public_key)?;
-    macula_rust_sdk::ucan::verify(&token, &key)
+    macula_rust::ucan::verify(&token, &key)
         .map(FfiUcanPayload::from)
         .map_err(FfiError::from)
 }
@@ -451,7 +451,7 @@ pub fn ucan_verify(token: Vec<u8>, public_key: Vec<u8>) -> Result<FfiUcanPayload
 /// expiration — see [`ucan_verify`]'s doc for why that distinction matters.
 #[uniffi::export]
 pub fn ucan_decode(token: Vec<u8>) -> Result<FfiUcanPayload, FfiError> {
-    macula_rust_sdk::ucan::decode(&token)
+    macula_rust::ucan::decode(&token)
         .map(FfiUcanPayload::from)
         .map_err(FfiError::from)
 }
@@ -459,19 +459,19 @@ pub fn ucan_decode(token: Vec<u8>) -> Result<FfiUcanPayload, FfiError> {
 /// `token`'s `iss` claim, unverified — see [`ucan_verify`]'s doc.
 #[uniffi::export]
 pub fn ucan_get_issuer(token: Vec<u8>) -> Result<String, FfiError> {
-    macula_rust_sdk::ucan::get_issuer(&token).map_err(FfiError::from)
+    macula_rust::ucan::get_issuer(&token).map_err(FfiError::from)
 }
 
 /// `token`'s `aud` claim, unverified — see [`ucan_verify`]'s doc.
 #[uniffi::export]
 pub fn ucan_get_audience(token: Vec<u8>) -> Result<String, FfiError> {
-    macula_rust_sdk::ucan::get_audience(&token).map_err(FfiError::from)
+    macula_rust::ucan::get_audience(&token).map_err(FfiError::from)
 }
 
 /// `token`'s `cap` claim, unverified — see [`ucan_verify`]'s doc.
 #[uniffi::export]
 pub fn ucan_get_capabilities(token: Vec<u8>) -> Result<Vec<FfiCapability>, FfiError> {
-    macula_rust_sdk::ucan::get_capabilities(&token)
+    macula_rust::ucan::get_capabilities(&token)
         .map(|caps| caps.into_iter().map(Into::into).collect())
         .map_err(FfiError::from)
 }
@@ -479,32 +479,32 @@ pub fn ucan_get_capabilities(token: Vec<u8>) -> Result<Vec<FfiCapability>, FfiEr
 /// `token`'s `exp` claim, unverified — see [`ucan_verify`]'s doc.
 #[uniffi::export]
 pub fn ucan_get_expiration(token: Vec<u8>) -> Result<Option<i64>, FfiError> {
-    macula_rust_sdk::ucan::get_expiration(&token).map_err(FfiError::from)
+    macula_rust::ucan::get_expiration(&token).map_err(FfiError::from)
 }
 
 /// `token`'s `prf` claim, unverified — see [`ucan_verify`]'s doc.
 #[uniffi::export]
 pub fn ucan_get_proofs(token: Vec<u8>) -> Result<Vec<String>, FfiError> {
-    macula_rust_sdk::ucan::get_proofs(&token).map_err(FfiError::from)
+    macula_rust::ucan::get_proofs(&token).map_err(FfiError::from)
 }
 
 /// Whether `token`'s `exp` claim is in the past, unverified — see
 /// [`ucan_verify`]'s doc. A token with no `exp` claim is never expired.
 #[uniffi::export]
 pub fn ucan_is_expired(token: Vec<u8>) -> Result<bool, FfiError> {
-    macula_rust_sdk::ucan::is_expired(&token).map_err(FfiError::from)
+    macula_rust::ucan::is_expired(&token).map_err(FfiError::from)
 }
 
 /// `token`'s content identifier (SHA-256, base64url-no-pad) — used only
 /// for proof-chain references between UCANs. See
-/// [`macula_rust_sdk::ucan::compute_cid`]'s own doc.
+/// [`macula_rust::ucan::compute_cid`]'s own doc.
 #[uniffi::export]
 pub fn ucan_compute_cid(token: Vec<u8>) -> String {
-    macula_rust_sdk::ucan::compute_cid(&token)
+    macula_rust::ucan::compute_cid(&token)
 }
 
 /// What a provider requires to answer one inbound CALL — a mirror of
-/// [`macula_rust_sdk::ucan::Policy`], passed to
+/// [`macula_rust::ucan::Policy`], passed to
 /// [`FfiSession::serve_one_call_gated`]. `Open` is what
 /// [`FfiSession::serve_one_call`] uses internally.
 #[derive(uniffi::Enum, Debug, Clone)]
@@ -513,14 +513,14 @@ pub enum FfiPolicy {
     Required { issuer: Vec<u8> },
 }
 
-impl TryFrom<FfiPolicy> for macula_rust_sdk::ucan::Policy {
+impl TryFrom<FfiPolicy> for macula_rust::ucan::Policy {
     type Error = FfiError;
 
     fn try_from(p: FfiPolicy) -> Result<Self, FfiError> {
         Ok(match p {
-            FfiPolicy::Open => macula_rust_sdk::ucan::Policy::open(),
+            FfiPolicy::Open => macula_rust::ucan::Policy::open(),
             FfiPolicy::Required { issuer } => {
-                macula_rust_sdk::ucan::Policy::required(to_32(issuer)?)
+                macula_rust::ucan::Policy::required(to_32(issuer)?)
             }
         })
     }
@@ -529,7 +529,7 @@ impl TryFrom<FfiPolicy> for macula_rust_sdk::ucan::Policy {
 /// Provider role: implement this trait on the foreign side (Kotlin,
 /// Swift) to serve inbound unary CALLs — see
 /// [`FfiSession::serve_one_call`]. Adapts
-/// [`macula_rust_sdk::connection::CallHandler`] for the FFI boundary:
+/// [`macula_rust::connection::CallHandler`] for the FFI boundary:
 /// `handle` receives the full inbound call (`procedure`/`realm`/
 /// `payload`) rather than being looked up from a table first, since a
 /// UniFFI foreign trait can't be handed a plain Rust closure the way
@@ -566,7 +566,7 @@ pub trait FfiCallHandler: Send + Sync {
 }
 
 /// What a subscriber receives: a mirror of
-/// [`macula_rust_sdk::frame::EventInfo`].
+/// [`macula_rust::frame::EventInfo`].
 #[derive(uniffi::Record, Debug, Clone)]
 pub struct FfiEvent {
     pub topic: String,
@@ -577,10 +577,10 @@ pub struct FfiEvent {
     pub delivered_via: String,
 }
 
-impl TryFrom<macula_rust_sdk::frame::EventInfo> for FfiEvent {
+impl TryFrom<macula_rust::frame::EventInfo> for FfiEvent {
     type Error = FfiError;
 
-    fn try_from(e: macula_rust_sdk::frame::EventInfo) -> Result<Self, FfiError> {
+    fn try_from(e: macula_rust::frame::EventInfo) -> Result<Self, FfiError> {
         Ok(FfiEvent {
             topic: e.topic,
             realm: e.realm.to_vec(),
@@ -592,7 +592,7 @@ impl TryFrom<macula_rust_sdk::frame::EventInfo> for FfiEvent {
     }
 }
 
-/// `mode` on a stream — mirrors [`macula_rust_sdk::frame::StreamMode`].
+/// `mode` on a stream — mirrors [`macula_rust::frame::StreamMode`].
 #[derive(uniffi::Enum, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FfiStreamMode {
     ServerStream,
@@ -600,28 +600,28 @@ pub enum FfiStreamMode {
     Bidi,
 }
 
-impl From<FfiStreamMode> for macula_rust_sdk::frame::StreamMode {
+impl From<FfiStreamMode> for macula_rust::frame::StreamMode {
     fn from(m: FfiStreamMode) -> Self {
         match m {
-            FfiStreamMode::ServerStream => macula_rust_sdk::frame::StreamMode::ServerStream,
-            FfiStreamMode::ClientStream => macula_rust_sdk::frame::StreamMode::ClientStream,
-            FfiStreamMode::Bidi => macula_rust_sdk::frame::StreamMode::Bidi,
+            FfiStreamMode::ServerStream => macula_rust::frame::StreamMode::ServerStream,
+            FfiStreamMode::ClientStream => macula_rust::frame::StreamMode::ClientStream,
+            FfiStreamMode::Bidi => macula_rust::frame::StreamMode::Bidi,
         }
     }
 }
 
-impl From<macula_rust_sdk::frame::StreamMode> for FfiStreamMode {
-    fn from(m: macula_rust_sdk::frame::StreamMode) -> Self {
+impl From<macula_rust::frame::StreamMode> for FfiStreamMode {
+    fn from(m: macula_rust::frame::StreamMode) -> Self {
         match m {
-            macula_rust_sdk::frame::StreamMode::ServerStream => FfiStreamMode::ServerStream,
-            macula_rust_sdk::frame::StreamMode::ClientStream => FfiStreamMode::ClientStream,
-            macula_rust_sdk::frame::StreamMode::Bidi => FfiStreamMode::Bidi,
+            macula_rust::frame::StreamMode::ServerStream => FfiStreamMode::ServerStream,
+            macula_rust::frame::StreamMode::ClientStream => FfiStreamMode::ClientStream,
+            macula_rust::frame::StreamMode::Bidi => FfiStreamMode::Bidi,
         }
     }
 }
 
 /// `encoding` on a stream chunk — mirrors
-/// [`macula_rust_sdk::frame::StreamEncoding`]. A semantic hint, not a
+/// [`macula_rust::frame::StreamEncoding`]. A semantic hint, not a
 /// second wire codec — see that type's own doc.
 #[derive(uniffi::Enum, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FfiStreamEncoding {
@@ -629,26 +629,26 @@ pub enum FfiStreamEncoding {
     Msgpack,
 }
 
-impl From<FfiStreamEncoding> for macula_rust_sdk::frame::StreamEncoding {
+impl From<FfiStreamEncoding> for macula_rust::frame::StreamEncoding {
     fn from(e: FfiStreamEncoding) -> Self {
         match e {
-            FfiStreamEncoding::Raw => macula_rust_sdk::frame::StreamEncoding::Raw,
-            FfiStreamEncoding::Msgpack => macula_rust_sdk::frame::StreamEncoding::Msgpack,
+            FfiStreamEncoding::Raw => macula_rust::frame::StreamEncoding::Raw,
+            FfiStreamEncoding::Msgpack => macula_rust::frame::StreamEncoding::Msgpack,
         }
     }
 }
 
-impl From<macula_rust_sdk::frame::StreamEncoding> for FfiStreamEncoding {
-    fn from(e: macula_rust_sdk::frame::StreamEncoding) -> Self {
+impl From<macula_rust::frame::StreamEncoding> for FfiStreamEncoding {
+    fn from(e: macula_rust::frame::StreamEncoding) -> Self {
         match e {
-            macula_rust_sdk::frame::StreamEncoding::Raw => FfiStreamEncoding::Raw,
-            macula_rust_sdk::frame::StreamEncoding::Msgpack => FfiStreamEncoding::Msgpack,
+            macula_rust::frame::StreamEncoding::Raw => FfiStreamEncoding::Raw,
+            macula_rust::frame::StreamEncoding::Msgpack => FfiStreamEncoding::Msgpack,
         }
     }
 }
 
 /// One item received from a stream: a chunk, or a clean end-of-stream.
-/// Mirrors [`macula_rust_sdk::stream::StreamItem`].
+/// Mirrors [`macula_rust::stream::StreamItem`].
 #[derive(uniffi::Enum, Debug, Clone)]
 pub enum FfiStreamItem {
     Data {
@@ -660,7 +660,7 @@ pub enum FfiStreamItem {
 }
 
 /// The terminal result of a `client_stream`/`bidi` exchange — the pair
-/// [`macula_rust_sdk::stream::StreamHandle::await_reply`] returns.
+/// [`macula_rust::stream::StreamHandle::await_reply`] returns.
 #[derive(uniffi::Record, Debug, Clone)]
 pub struct FfiStreamReply {
     pub payload: FfiValue,
@@ -669,7 +669,7 @@ pub struct FfiStreamReply {
 
 /// Provider role: the fields of an inbound STREAM_OPEN needed to decide
 /// how to handle it (which procedure, whose call, what arguments) —
-/// mirrors [`macula_rust_sdk::frame::StreamOpenInfo`].
+/// mirrors [`macula_rust::frame::StreamOpenInfo`].
 #[derive(uniffi::Record, Debug, Clone)]
 pub struct FfiStreamOpenInfo {
     pub stream_id: Vec<u8>,
@@ -681,10 +681,10 @@ pub struct FfiStreamOpenInfo {
     pub caller: Vec<u8>,
 }
 
-impl TryFrom<macula_rust_sdk::frame::StreamOpenInfo> for FfiStreamOpenInfo {
+impl TryFrom<macula_rust::frame::StreamOpenInfo> for FfiStreamOpenInfo {
     type Error = FfiError;
 
-    fn try_from(o: macula_rust_sdk::frame::StreamOpenInfo) -> Result<Self, FfiError> {
+    fn try_from(o: macula_rust::frame::StreamOpenInfo) -> Result<Self, FfiError> {
         Ok(FfiStreamOpenInfo {
             stream_id: o.stream_id.to_vec(),
             procedure: o.procedure,
@@ -718,7 +718,7 @@ pub struct FfiOpenedDirectStream {
 }
 
 /// How to trust whatever certificate the station presents — mirrors
-/// [`macula_rust_sdk::transport::Trust`], minus `Insecure`.
+/// [`macula_rust::transport::Trust`], minus `Insecure`.
 ///
 /// `Insecure` (skip TLS verification entirely) is deliberately NOT
 /// exposed here: it's a development/diagnostic escape hatch in the core
@@ -742,31 +742,31 @@ pub enum FfiTrust {
     WebPki,
 }
 
-impl TryFrom<FfiTrust> for macula_rust_sdk::transport::Trust {
+impl TryFrom<FfiTrust> for macula_rust::transport::Trust {
     type Error = FfiError;
 
     fn try_from(t: FfiTrust) -> Result<Self, FfiError> {
         match t {
             FfiTrust::Pinned { node_id } => {
-                Ok(macula_rust_sdk::transport::Trust::Pinned(to_32(node_id)?))
+                Ok(macula_rust::transport::Trust::Pinned(to_32(node_id)?))
             }
-            FfiTrust::WebPki => Ok(macula_rust_sdk::transport::Trust::WebPki),
+            FfiTrust::WebPki => Ok(macula_rust::transport::Trust::WebPki),
         }
     }
 }
 
 /// An Ed25519 identity, puzzle-hardened by construction — see
-/// [`macula_rust_sdk::identity::KeyPair::generate_with_default_puzzle`]'s
+/// [`macula_rust::identity::KeyPair::generate_with_default_puzzle`]'s
 /// own doc for why this is always the right default despite its (small,
 /// one-time) CPU cost.
 #[derive(uniffi::Object)]
-pub struct FfiKeyPair(macula_rust_sdk::identity::KeyPair);
+pub struct FfiKeyPair(macula_rust::identity::KeyPair);
 
 #[uniffi::export]
 impl FfiKeyPair {
     #[uniffi::constructor]
     pub fn generate() -> Self {
-        Self(macula_rust_sdk::identity::KeyPair::generate_with_default_puzzle())
+        Self(macula_rust::identity::KeyPair::generate_with_default_puzzle())
     }
 
     /// Reconstruct a keypair from its 32-byte seed (see
@@ -778,7 +778,7 @@ impl FfiKeyPair {
     /// re-checked at reconstruction time.
     #[uniffi::constructor]
     pub fn from_seed_bytes(seed: Vec<u8>) -> Result<Self, FfiError> {
-        Ok(Self(macula_rust_sdk::identity::KeyPair::from_seed_bytes(
+        Ok(Self(macula_rust::identity::KeyPair::from_seed_bytes(
             to_32(seed)?,
         )))
     }
@@ -800,7 +800,7 @@ impl FfiKeyPair {
     /// — Keychain on macOS/iOS, Secret Service on Linux, Credential
     /// Manager on Windows, Keystore on Android — instead of handling the
     /// raw bytes from [`private_bytes`](Self::private_bytes) yourself. See
-    /// `macula_rust_sdk::keystore`'s module doc for the full platform
+    /// `macula_rust::keystore`'s module doc for the full platform
     /// story, including Android's one-time `initializeNdkContext` setup
     /// requirement (unrelated to this method itself — a property of that
     /// platform's Keystore, not something this crate can do for you).
@@ -811,7 +811,7 @@ impl FfiKeyPair {
     /// the underlying store is a shared OS-wide facility, not sandboxed to
     /// this crate.
     pub fn save_to_keystore(&self, service: String, account: String) -> Result<(), FfiError> {
-        let store = macula_rust_sdk::keystore::KeyringStore::new(&service, &account)?;
+        let store = macula_rust::keystore::KeyringStore::new(&service, &account)?;
         self.0.save_to_keystore(&store)?;
         Ok(())
     }
@@ -822,20 +822,20 @@ impl FfiKeyPair {
     /// this `service`/`account` pair.
     #[uniffi::constructor]
     pub fn load_from_keystore(service: String, account: String) -> Result<Self, FfiError> {
-        let store = macula_rust_sdk::keystore::KeyringStore::new(&service, &account)?;
+        let store = macula_rust::keystore::KeyringStore::new(&service, &account)?;
         Ok(Self(
-            macula_rust_sdk::identity::KeyPair::load_from_keystore(&store)?,
+            macula_rust::identity::KeyPair::load_from_keystore(&store)?,
         ))
     }
 }
 
 /// A handshaked connection to a macula-station. Wraps
-/// [`macula_rust_sdk::connection::Session`] behind a mutex — UniFFI
+/// [`macula_rust::connection::Session`] behind a mutex — UniFFI
 /// object methods take `&self`, but the wrapped methods need `&mut
 /// self`, so this crate's only job here is bridging that, not adding
 /// behavior.
 #[derive(uniffi::Object)]
-pub struct FfiSession(tokio::sync::Mutex<Option<macula_rust_sdk::connection::Session>>);
+pub struct FfiSession(tokio::sync::Mutex<Option<macula_rust::connection::Session>>);
 
 #[uniffi::export(async_runtime = "tokio")]
 impl FfiSession {
@@ -850,7 +850,7 @@ impl FfiSession {
         identity: &FfiKeyPair,
     ) -> Result<Self, FfiError> {
         let session =
-            macula_rust_sdk::connection::connect(&host, port, trust.try_into()?, &identity.0)
+            macula_rust::connection::connect(&host, port, trust.try_into()?, &identity.0)
                 .await
                 .map_err(|e| FfiError::Connect {
                     reason: e.to_string(),
@@ -930,7 +930,7 @@ impl FfiSession {
     /// [`FfiPolicy`]. A rejected caller gets a BOLT#4 `unauthorized` error
     /// and never reaches `handler`; `handler` itself never sees the raw
     /// UCAN token either way, matching
-    /// [`macula_rust_sdk::connection::Session::serve_one_call_gated`]'s own
+    /// [`macula_rust::connection::Session::serve_one_call_gated`]'s own
     /// contract exactly.
     pub async fn serve_one_call_gated(
         &self,
@@ -939,7 +939,7 @@ impl FfiSession {
         timeout_ms: u64,
         identity: &FfiKeyPair,
     ) -> Result<(), FfiError> {
-        let policy: macula_rust_sdk::ucan::Policy = policy.try_into()?;
+        let policy: macula_rust::ucan::Policy = policy.try_into()?;
         let mut guard = self.0.lock().await;
         let session = guard.as_mut().ok_or(FfiError::Closed)?;
 
@@ -947,8 +947,8 @@ impl FfiSession {
             let handler = handler.clone();
             let realm = realm.to_vec();
             let procedure = procedure.to_string();
-            let core_handler: macula_rust_sdk::connection::CallHandler =
-                std::sync::Arc::new(move |payload: macula_rust_sdk::cbor::Value| {
+            let core_handler: macula_rust::connection::CallHandler =
+                std::sync::Arc::new(move |payload: macula_rust::cbor::Value| {
                     let handler = handler.clone();
                     let realm = realm.clone();
                     let procedure = procedure.clone();
@@ -958,11 +958,11 @@ impl FfiSession {
                             .handle(procedure, realm, ffi_payload)
                             .await
                             .map_err(|e| e.to_string())?;
-                        Ok(macula_rust_sdk::cbor::Value::from(reply))
+                        Ok(macula_rust::cbor::Value::from(reply))
                     })
-                        as macula_rust_sdk::connection::BoxFuture<
+                        as macula_rust::connection::BoxFuture<
                             'static,
-                            Result<macula_rust_sdk::cbor::Value, String>,
+                            Result<macula_rust::cbor::Value, String>,
                         >
                 });
             Some(core_handler)
@@ -1002,7 +1002,7 @@ impl FfiSession {
         identity: &FfiKeyPair,
     ) -> Result<(), FfiError> {
         let realm = to_32(realm)?;
-        let spec = macula_rust_sdk::frame::PublishSpec::new(
+        let spec = macula_rust::frame::PublishSpec::new(
             topic,
             realm,
             identity.0.node_id(),
@@ -1029,7 +1029,7 @@ impl FfiSession {
         identity: &FfiKeyPair,
     ) -> Result<(), FfiError> {
         let realm = to_32(realm)?;
-        let spec = macula_rust_sdk::frame::SubscribeSpec::new(topic, realm, identity.0.node_id());
+        let spec = macula_rust::frame::SubscribeSpec::new(topic, realm, identity.0.node_id());
         let mut guard = self.0.lock().await;
         let session = guard.as_mut().ok_or(FfiError::Closed)?;
         session
@@ -1048,7 +1048,7 @@ impl FfiSession {
         identity: &FfiKeyPair,
     ) -> Result<(), FfiError> {
         let realm = to_32(realm)?;
-        let spec = macula_rust_sdk::frame::UnsubscribeSpec::new(topic, realm, identity.0.node_id());
+        let spec = macula_rust::frame::UnsubscribeSpec::new(topic, realm, identity.0.node_id());
         let mut guard = self.0.lock().await;
         let session = guard.as_mut().ok_or(FfiError::Closed)?;
         session
@@ -1072,7 +1072,7 @@ impl FfiSession {
     ) -> Result<(), FfiError> {
         let realm = to_32(realm)?;
         let spec =
-            macula_rust_sdk::frame::AdvertiseSpec::new(realm, procedure, identity.0.node_id());
+            macula_rust::frame::AdvertiseSpec::new(realm, procedure, identity.0.node_id());
         let mut guard = self.0.lock().await;
         let session = guard.as_mut().ok_or(FfiError::Closed)?;
         session
@@ -1092,7 +1092,7 @@ impl FfiSession {
     ) -> Result<(), FfiError> {
         let realm = to_32(realm)?;
         let spec =
-            macula_rust_sdk::frame::UnadvertiseSpec::new(realm, procedure, identity.0.node_id());
+            macula_rust::frame::UnadvertiseSpec::new(realm, procedure, identity.0.node_id());
         let mut guard = self.0.lock().await;
         let session = guard.as_mut().ok_or(FfiError::Closed)?;
         session
@@ -1123,14 +1123,14 @@ impl FfiSession {
         let mut guard = self.0.lock().await;
         let session = guard.as_mut().ok_or(FfiError::Closed)?;
         let resolved =
-            macula_rust_sdk::direct_dial::resolve(session, &identity.0, realm, &procedure).await?;
+            macula_rust::direct_dial::resolve(session, &identity.0, realm, &procedure).await?;
         Ok(resolved.into())
     }
 
     /// Resolves `procedure`'s provider via direct-dial (through this
     /// session, used only to query the DHT) and calls it there, in one
     /// hop, in a SEPARATE connection from this session — see
-    /// [`macula_rust_sdk::direct_dial::call`]'s own doc for the full trust
+    /// [`macula_rust::direct_dial::call`]'s own doc for the full trust
     /// model. Use this instead of [`call`](Self::call) when the provider
     /// is reachable only via [`advertise_direct`](Self::advertise_direct)
     /// (e.g. no ordinary advertise-gossip route has propagated between
@@ -1146,7 +1146,7 @@ impl FfiSession {
         let realm = to_32(realm)?;
         let mut guard = self.0.lock().await;
         let session = guard.as_mut().ok_or(FfiError::Closed)?;
-        let response = macula_rust_sdk::direct_dial::call(
+        let response = macula_rust::direct_dial::call(
             session,
             &identity.0,
             realm,
@@ -1186,7 +1186,7 @@ impl FfiSession {
         let realm = to_32(realm)?;
         let mut guard = self.0.lock().await;
         let session = guard.as_mut().ok_or(FfiError::Closed)?;
-        macula_rust_sdk::direct_dial::advertise_direct(
+        macula_rust::direct_dial::advertise_direct(
             session,
             &identity.0,
             realm,
@@ -1232,7 +1232,7 @@ impl FfiSession {
 
     /// The supervised counterpart to the bare [`publish`](Self::publish)
     /// primitive — see
-    /// [`macula_rust_sdk::connection::Session::run_publisher`]'s own doc.
+    /// [`macula_rust::connection::Session::run_publisher`]'s own doc.
     /// `announce` controls whether `pubsub.publish_started_v1`/
     /// `pubsub.publish_completed_v1` facts are published around this
     /// publish (a fact-publish failure never fails the underlying publish
@@ -1249,7 +1249,7 @@ impl FfiSession {
         identity: &FfiKeyPair,
     ) -> Result<(), FfiError> {
         let realm = to_32(realm)?;
-        let spec = macula_rust_sdk::frame::PublishSpec::new(
+        let spec = macula_rust::frame::PublishSpec::new(
             topic,
             realm,
             identity.0.node_id(),
@@ -1283,7 +1283,7 @@ impl FfiSession {
         let realm = to_32(realm)?;
         let mut guard = self.0.lock().await;
         let session = guard.as_mut().ok_or(FfiError::Closed)?;
-        let resolved = macula_rust_sdk::direct_dial::resolve_with_cert_chain(
+        let resolved = macula_rust::direct_dial::resolve_with_cert_chain(
             session,
             &identity.0,
             realm,
@@ -1314,7 +1314,7 @@ impl FfiSession {
         let realm = to_32(realm)?;
         let mut guard = self.0.lock().await;
         let session = guard.as_mut().ok_or(FfiError::Closed)?;
-        let response = macula_rust_sdk::direct_dial::call_with_cert_chain(
+        let response = macula_rust::direct_dial::call_with_cert_chain(
             session,
             &identity.0,
             realm,
@@ -1346,7 +1346,7 @@ impl FfiSession {
         let realm = to_32(realm)?;
         let mut guard = self.0.lock().await;
         let session = guard.as_mut().ok_or(FfiError::Closed)?;
-        macula_rust_sdk::direct_dial::advertise_direct_with_cert_chain(
+        macula_rust::direct_dial::advertise_direct_with_cert_chain(
             session,
             &identity.0,
             realm,
@@ -1382,7 +1382,7 @@ impl FfiSession {
         let deadline_ms = (now_ms() + timeout_ms) as i128;
         let mut guard = self.0.lock().await;
         let session = guard.as_mut().ok_or(FfiError::Closed)?;
-        let (opened_session, handle) = macula_rust_sdk::direct_dial::open_stream_direct(
+        let (opened_session, handle) = macula_rust::direct_dial::open_stream_direct(
             session,
             &identity.0,
             realm,
@@ -1425,7 +1425,7 @@ impl FfiSession {
         let mut guard = self.0.lock().await;
         let session = guard.as_mut().ok_or(FfiError::Closed)?;
         let (opened_session, handle) =
-            macula_rust_sdk::direct_dial::open_stream_direct_with_cert_chain(
+            macula_rust::direct_dial::open_stream_direct_with_cert_chain(
                 session,
                 &identity.0,
                 realm,
@@ -1450,7 +1450,7 @@ impl FfiSession {
     /// Stores `data` at a KNOWN `station` (32 bytes) directly, in one hop,
     /// instead of going through whatever station this session happens to
     /// be connected to — see
-    /// [`macula_rust_sdk::direct_dial::put_direct`]'s own doc, including
+    /// [`macula_rust::direct_dial::put_direct`]'s own doc, including
     /// its identity-collision caveat when this session is already
     /// connected to `station` (use a different identity for this session
     /// than `identity` if so).
@@ -1465,7 +1465,7 @@ impl FfiSession {
         let station = to_32(station)?;
         let mut guard = self.0.lock().await;
         let session = guard.as_mut().ok_or(FfiError::Closed)?;
-        let mcid = macula_rust_sdk::direct_dial::put_direct(
+        let mcid = macula_rust::direct_dial::put_direct(
             session,
             &identity.0,
             station,
@@ -1482,7 +1482,7 @@ impl FfiSession {
 
     /// Fetches the content addressed by `mcid` (34 bytes) directly from
     /// whichever station announced it, resolved via this session's DHT
-    /// query — see [`macula_rust_sdk::direct_dial::get_direct`]'s own doc.
+    /// query — see [`macula_rust::direct_dial::get_direct`]'s own doc.
     /// Unlike [`put_direct`](Self::put_direct), no `station` is needed: a
     /// `content_announcement` names its own announcer.
     pub async fn get_direct(
@@ -1494,7 +1494,7 @@ impl FfiSession {
         let mcid = to_mcid(mcid)?;
         let mut guard = self.0.lock().await;
         let session = guard.as_mut().ok_or(FfiError::Closed)?;
-        macula_rust_sdk::direct_dial::get_direct(
+        macula_rust::direct_dial::get_direct(
             session,
             &identity.0,
             mcid,
@@ -1519,7 +1519,7 @@ impl FfiSession {
     pub async fn accept_stream(&self, timeout_ms: u64) -> Result<FfiAcceptedStream, FfiError> {
         let mut guard = self.0.lock().await;
         let session = guard.as_mut().ok_or(FfiError::Closed)?;
-        let (handle, info) = macula_rust_sdk::stream::StreamHandle::accept(
+        let (handle, info) = macula_rust::stream::StreamHandle::accept(
             session,
             std::time::Duration::from_millis(timeout_ms),
         )
@@ -1535,7 +1535,7 @@ impl FfiSession {
 
     /// Block for the next EVENT delivery, bounded by `timeout_ms`. Any
     /// non-EVENT frame received first is an error, not silently skipped
-    /// — matches [`macula_rust_sdk::connection::Session::recv_event`]'s
+    /// — matches [`macula_rust::connection::Session::recv_event`]'s
     /// own contract.
     pub async fn recv_event(&self, timeout_ms: u64) -> Result<FfiEvent, FfiError> {
         let mut guard = self.0.lock().await;
@@ -1553,7 +1553,7 @@ impl FfiSession {
     /// bytes). `name` is attached to the manifest when `data` is large
     /// enough to be chunked; silently unused for a single block, which
     /// is addressed purely by content hash — see
-    /// [`macula_rust_sdk::content::put`]'s own doc.
+    /// [`macula_rust::content::put`]'s own doc.
     pub async fn content_put(
         &self,
         data: Vec<u8>,
@@ -1562,7 +1562,7 @@ impl FfiSession {
     ) -> Result<Vec<u8>, FfiError> {
         let mut guard = self.0.lock().await;
         let session = guard.as_mut().ok_or(FfiError::Closed)?;
-        let mcid = macula_rust_sdk::content::put(session, &data, name, &identity.0)
+        let mcid = macula_rust::content::put(session, &data, name, &identity.0)
             .await
             .map_err(|e| FfiError::Content {
                 reason: e.to_string(),
@@ -1579,7 +1579,7 @@ impl FfiSession {
         let mcid = to_mcid(mcid)?;
         let mut guard = self.0.lock().await;
         let session = guard.as_mut().ok_or(FfiError::Closed)?;
-        macula_rust_sdk::content::get(session, mcid, &identity.0)
+        macula_rust::content::get(session, mcid, &identity.0)
             .await
             .map_err(|e| FfiError::Content {
                 reason: e.to_string(),
@@ -1604,7 +1604,7 @@ impl FfiSession {
         let deadline_ms = (now_ms() + timeout_ms) as i128;
         let mut guard = self.0.lock().await;
         let session = guard.as_mut().ok_or(FfiError::Closed)?;
-        let handle = macula_rust_sdk::stream::StreamHandle::open(
+        let handle = macula_rust::stream::StreamHandle::open(
             session,
             &procedure,
             realm,
@@ -1630,12 +1630,12 @@ impl FfiSession {
 }
 
 /// A streaming RPC exchange, caller/consumer role — wraps
-/// [`macula_rust_sdk::stream::StreamHandle`] the same way [`FfiSession`]
-/// wraps [`macula_rust_sdk::connection::Session`]: a mutex bridges
+/// [`macula_rust::stream::StreamHandle`] the same way [`FfiSession`]
+/// wraps [`macula_rust::connection::Session`]: a mutex bridges
 /// UniFFI's `&self` methods to the core type's `&mut self` ones. Created
 /// via [`FfiSession::stream_open`].
 #[derive(uniffi::Object)]
-pub struct FfiStream(tokio::sync::Mutex<Option<macula_rust_sdk::stream::StreamHandle>>);
+pub struct FfiStream(tokio::sync::Mutex<Option<macula_rust::stream::StreamHandle>>);
 
 #[uniffi::export(async_runtime = "tokio")]
 impl FfiStream {
@@ -1681,7 +1681,7 @@ impl FfiStream {
                 reason: e.to_string(),
             })?;
         Ok(match item {
-            macula_rust_sdk::stream::StreamItem::Data {
+            macula_rust::stream::StreamItem::Data {
                 seq,
                 encoding,
                 body,
@@ -1690,7 +1690,7 @@ impl FfiStream {
                 encoding: encoding.into(),
                 body: FfiValue::try_from(body)?,
             },
-            macula_rust_sdk::stream::StreamItem::Eof => FfiStreamItem::Eof,
+            macula_rust::stream::StreamItem::Eof => FfiStreamItem::Eof,
         })
     }
 
@@ -1745,7 +1745,7 @@ impl FfiStream {
 #[cfg(test)]
 mod ffi_value_tests {
     use super::{FfiError, FfiMapEntry, FfiValue};
-    use macula_rust_sdk::cbor::Value;
+    use macula_rust::cbor::Value;
 
     fn round_trip(v: FfiValue) -> Result<FfiValue, FfiError> {
         let core: Value = v.into();

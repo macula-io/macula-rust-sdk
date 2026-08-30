@@ -5,7 +5,7 @@
 //! `cargo run --example quickstart`).
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use macula_rust_sdk::{cbor::Value, connection, identity::KeyPair, transport::Trust};
+use macula_rust::{cbor::Value, connection, identity::KeyPair, transport::Trust};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {

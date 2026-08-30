@@ -16,11 +16,11 @@
 
 use std::time::Duration;
 
-use macula_rust_sdk::cert_chain::{verify_advertisement_cert_chain, CertChainError};
-use macula_rust_sdk::connection;
-use macula_rust_sdk::direct_dial;
-use macula_rust_sdk::identity::KeyPair;
-use macula_rust_sdk::transport::Trust;
+use macula_rust::cert_chain::{verify_advertisement_cert_chain, CertChainError};
+use macula_rust::connection;
+use macula_rust::direct_dial;
+use macula_rust::identity::KeyPair;
+use macula_rust::transport::Trust;
 use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair as RcgenKeyPair};
 
 const STATION_HOST: &str = "station-de-frankfurt.macula.io";
@@ -120,7 +120,7 @@ async fn cert_chain_survives_a_real_dht_round_trip() {
 
     let realm: [u8; 32] = rand::random();
     let procedure = format!(
-        "macula_rust_sdk.live_cert_chain_test.{}",
+        "macula_rust.live_cert_chain_test.{}",
         hex::encode(rand::random::<[u8; 8]>())
     );
 
@@ -170,10 +170,10 @@ async fn cert_chain_survives_a_real_dht_round_trip() {
     // byte, via the resolved path -- redundant with resolve_with_cert_chain
     // succeeding above, but pins down that verify_advertisement_cert_chain
     // itself (not just the resolve wrapper) is what's being exercised.
-    let recs = macula_rust_sdk::dht::find_records(
+    let recs = macula_rust::dht::find_records(
         &mut resolver_session,
         &caller_identity,
-        macula_rust_sdk::dht::procedure_key(&macula_rust_sdk::dht::discovery_uri(
+        macula_rust::dht::procedure_key(&macula_rust::dht::discovery_uri(
             realm, &procedure,
         )),
     )

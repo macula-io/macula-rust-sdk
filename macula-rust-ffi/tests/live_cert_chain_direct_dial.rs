@@ -7,9 +7,9 @@
 //!
 //! Not run by default CI — `#[ignore]`d, matching this crate's other live
 //! tests. Run explicitly with:
-//! `cargo test -p macula-rust-sdk-ffi --test live_cert_chain_direct_dial -- --ignored --nocapture`
+//! `cargo test -p macula-rust-ffi --test live_cert_chain_direct_dial -- --ignored --nocapture`
 
-use macula_rust_sdk_ffi::{
+use macula_rust_ffi::{
     FfiCallHandler, FfiCallResponse, FfiError, FfiKeyPair, FfiSession, FfiTrust, FfiValue,
 };
 use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair as RcgenKeyPair};
@@ -168,7 +168,7 @@ async fn cert_chain_direct_dial_round_trip_through_the_ffi_surface() {
     let dial_id = FfiKeyPair::generate();
     let caller_id = FfiKeyPair::generate();
     let procedure = format!(
-        "macula_rust_sdk_ffi.live_test.cert_chain.{}",
+        "macula_rust_ffi.live_test.cert_chain.{}",
         short_hex(&provider_id.node_id())
     );
     let realm = vec![0u8; 32];

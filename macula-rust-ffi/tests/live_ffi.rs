@@ -1,7 +1,7 @@
 //! Integration tests exercising the actual UniFFI-exported surface
 //! (`FfiSession`/`FfiKeyPair`/`FfiValue`/`FfiCallHandler`), not the core
 //! crate directly — this is what a generated Kotlin/Swift binding would
-//! actually call through. `macula-rust-sdk-ffi` had no test harness at
+//! actually call through. `macula-rust-ffi` had no test harness at
 //! all beyond `FfiValue`'s own pure conversion tests before this file;
 //! testing only the core crate (already covered by `../tests/live_station.rs`)
 //! would never catch a bug introduced in THIS crate's own wrapping —
@@ -12,19 +12,19 @@
 //! `../tests/live_station.rs`'s own convention:
 //!
 //! ```text
-//! cargo test -p macula-rust-sdk-ffi --test live_ffi -- --ignored --nocapture
+//! cargo test -p macula-rust-ffi --test live_ffi -- --ignored --nocapture
 //! ```
 //!
 //! No mobile toolchain (Kotlin/Swift compiler + runtime) is available in
 //! this environment, so this cannot exercise the generated bindings
 //! themselves end-to-end — only the Rust-side glue every generated binding
-//! calls into. `cargo run -p macula-rust-sdk-ffi --bin uniffi-bindgen --
+//! calls into. `cargo run -p macula-rust-ffi --bin uniffi-bindgen --
 //! generate --library <cdylib> --language kotlin --out-dir <dir>`
 //! succeeding without error (checked separately, not in this file) is the
 //! remaining piece of confidence that the newly-added types/methods are
 //! actually representable in the generated bindings at all.
 
-use macula_rust_sdk_ffi::{
+use macula_rust_ffi::{
     ucan_create, FfiCallHandler, FfiCallResponse, FfiCapability, FfiError, FfiKeyPair, FfiPolicy,
     FfiSession, FfiStreamMode, FfiTrust, FfiValue,
 };
@@ -127,7 +127,7 @@ async fn serve_until_procedure(
 /// `FfiCallHandler` trait; a separate session/identity resolves and calls
 /// it, and gets back a real RESULT it can inspect via `FfiValue`/
 /// `FfiCallResponse` — not just "reached the call stage" (see this
-/// session's own `macula-go-sdk`/`macula-rust-sdk` history for why that
+/// session's own `macula-go-sdk`/`macula-rust` history for why that
 /// weaker bar isn't good enough: it already hid a real
 /// missing-plain-ADVERTISE bug in `advertise_direct` once).
 #[tokio::test]
@@ -136,7 +136,7 @@ async fn direct_dial_round_trip_through_the_ffi_surface() {
     let provider_id = FfiKeyPair::generate();
     let caller_id = FfiKeyPair::generate();
     let procedure = format!(
-        "macula_rust_sdk_ffi.live_test.echo.{}",
+        "macula_rust_ffi.live_test.echo.{}",
         short_hex(&provider_id.node_id())
     );
     let realm = vec![0u8; 32];
@@ -229,7 +229,7 @@ async fn direct_dial_round_trip_through_the_ffi_surface() {
 async fn resolve_direct_through_the_ffi_surface() {
     let id = FfiKeyPair::generate();
     let procedure = format!(
-        "macula_rust_sdk_ffi.live_test.resolve_only.{}",
+        "macula_rust_ffi.live_test.resolve_only.{}",
         short_hex(&id.node_id())
     );
     let realm = vec![0u8; 32];
@@ -297,7 +297,7 @@ async fn ucan_gated_serve_one_call_through_the_ffi_surface() {
         let provider_id = FfiKeyPair::generate();
         let caller_id = FfiKeyPair::generate();
         let procedure = format!(
-            "macula_rust_sdk_ffi.live_test.ucan_gated.unauthorized.{}",
+            "macula_rust_ffi.live_test.ucan_gated.unauthorized.{}",
             short_hex(&provider_id.node_id())
         );
         let realm = vec![0u8; 32];
@@ -351,7 +351,7 @@ async fn ucan_gated_serve_one_call_through_the_ffi_surface() {
     let provider_id = FfiKeyPair::generate();
     let caller_id = FfiKeyPair::generate();
     let procedure = format!(
-        "macula_rust_sdk_ffi.live_test.ucan_gated.authorized.{}",
+        "macula_rust_ffi.live_test.ucan_gated.authorized.{}",
         short_hex(&provider_id.node_id())
     );
     let realm = vec![0u8; 32];
@@ -468,7 +468,7 @@ async fn run_publisher_facts_through_the_ffi_surface() {
     let publisher_id = FfiKeyPair::generate();
     let watcher_id = FfiKeyPair::generate();
     let topic = format!(
-        "macula_rust_sdk_ffi.live_test.pubsub.{}",
+        "macula_rust_ffi.live_test.pubsub.{}",
         short_hex(&publisher_id.node_id())
     );
     let realm = vec![0u8; 32];
@@ -585,7 +585,7 @@ async fn streaming_and_content_direct_dial_through_the_ffi_surface() {
     let resolver_id = FfiKeyPair::generate();
     let dial_id = FfiKeyPair::generate();
     let procedure = format!(
-        "macula_rust_sdk_ffi.live_test.stream_direct.{}",
+        "macula_rust_ffi.live_test.stream_direct.{}",
         short_hex(&provider_id.node_id())
     );
     let realm = vec![0u8; 32];
@@ -686,7 +686,7 @@ async fn streaming_and_content_direct_dial_through_the_ffi_surface() {
     accepted
         .stream
         .send_data(
-            macula_rust_sdk_ffi::FfiStreamEncoding::Raw,
+            macula_rust_ffi::FfiStreamEncoding::Raw,
             FfiValue::Text("direct stream data".to_string()),
             &provider_id,
         )
@@ -695,7 +695,7 @@ async fn streaming_and_content_direct_dial_through_the_ffi_surface() {
     let recv_result = opened.stream.recv(15_000).await;
     let item = recv_result.expect("recv on direct-dial-opened stream");
     match item {
-        macula_rust_sdk_ffi::FfiStreamItem::Data { body, .. } => {
+        macula_rust_ffi::FfiStreamItem::Data { body, .. } => {
             assert_eq!(body, FfiValue::Text("direct stream data".to_string()));
         }
         other => panic!("expected Data, got {other:?}"),

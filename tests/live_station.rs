@@ -22,11 +22,11 @@
 //! the DNS-repoint gotcha already on file in project memory
 //! (`reference_demo_fleet_boxes`), confirmed still true today.
 
-use macula_rust_sdk::cbor::Value;
-use macula_rust_sdk::cert::ed25519_pubkey_from_cert;
-use macula_rust_sdk::connection;
-use macula_rust_sdk::identity::KeyPair;
-use macula_rust_sdk::transport::{connect, Trust};
+use macula_rust::cbor::Value;
+use macula_rust::cert::ed25519_pubkey_from_cert;
+use macula_rust::connection;
+use macula_rust::identity::KeyPair;
+use macula_rust::transport::{connect, Trust};
 
 const STATION_HOST: &str = "station-de-frankfurt.macula.io";
 const STATION_PORT: u16 = 4433;
@@ -176,7 +176,7 @@ async fn unhardened_identity_against_the_real_fleet_is_observed_not_assumed() {
 }
 
 /// A real end-to-end CALL/RESULT-or-ERROR round trip. Calls a procedure
-/// name that certainly doesn't exist (`macula_rust_sdk.test_probe`,
+/// name that certainly doesn't exist (`macula_rust.test_probe`,
 /// under the content sentinel realm) — the point isn't to exercise any
 /// particular procedure, only to prove the wire round trip itself: a
 /// signed CALL sent, and a signed RESULT or ERROR received back,
@@ -191,9 +191,9 @@ async fn call_round_trip_against_the_real_fleet() {
 
     let response = session
         .call(
-            "macula_rust_sdk.test_probe",
+            "macula_rust.test_probe",
             [0u8; 32], // the content-sentinel realm, reused here as a harmless default
-            macula_rust_sdk::cbor::Value::Null,
+            macula_rust::cbor::Value::Null,
             (now_ms() + 10_000) as i128,
             &identity,
             std::time::Duration::from_secs(10),
@@ -202,13 +202,13 @@ async fn call_round_trip_against_the_real_fleet() {
         .expect("should get SOME response (result or a well-formed error), not a timeout");
 
     match response {
-        macula_rust_sdk::frame::CallResponse::Result {
+        macula_rust::frame::CallResponse::Result {
             payload,
             responded_by,
         } => {
             println!("OBSERVED: got a RESULT (unexpected for a made-up procedure, but valid): payload={payload:?} responded_by={}", hex::encode(responded_by));
         }
-        macula_rust_sdk::frame::CallResponse::Error {
+        macula_rust::frame::CallResponse::Error {
             code,
             name,
             reported_by,
@@ -248,13 +248,13 @@ async fn pubsub_round_trip_against_the_real_fleet() {
     // A realm+topic scratch value nobody else would collide with.
     let realm: [u8; 32] = rand::random();
     let topic = format!(
-        "macula-rust-sdk.test.{}",
+        "macula-rust.test.{}",
         hex::encode(rand::random::<[u8; 8]>())
     );
 
     session
         .subscribe(
-            &macula_rust_sdk::frame::SubscribeSpec::new(topic.clone(), realm, identity.node_id()),
+            &macula_rust::frame::SubscribeSpec::new(topic.clone(), realm, identity.node_id()),
             &identity,
         )
         .await
@@ -262,12 +262,12 @@ async fn pubsub_round_trip_against_the_real_fleet() {
 
     session
         .publish(
-            &macula_rust_sdk::frame::PublishSpec::new(
+            &macula_rust::frame::PublishSpec::new(
                 topic.clone(),
                 realm,
                 identity.node_id(),
                 1,
-                macula_rust_sdk::cbor::Value::text("hello from macula-rust-sdk"),
+                macula_rust::cbor::Value::text("hello from macula-rust"),
                 now_ms(),
             ),
             &identity,
@@ -313,7 +313,7 @@ async fn pubsub_round_trip_against_the_real_fleet() {
 async fn run_subscriber_and_run_publisher_against_the_real_fleet() {
     let realm: [u8; 32] = rand::random();
     let topic = format!(
-        "macula-rust-sdk.test.{}",
+        "macula-rust.test.{}",
         hex::encode(rand::random::<[u8; 8]>())
     );
 
@@ -325,7 +325,7 @@ async fn run_subscriber_and_run_publisher_against_the_real_fleet() {
         .expect("watcher handshake should succeed");
     watcher
         .subscribe(
-            &macula_rust_sdk::frame::SubscribeSpec::new(
+            &macula_rust::frame::SubscribeSpec::new(
                 "pubsub.publish_completed_v1",
                 realm,
                 watcher_id.node_id(),
@@ -343,7 +343,7 @@ async fn run_subscriber_and_run_publisher_against_the_real_fleet() {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let sub_topic = topic.clone();
     let subscribe_task = tokio::spawn(async move {
-        let spec = macula_rust_sdk::frame::SubscribeSpec::new(sub_topic, realm, sub_id.node_id());
+        let spec = macula_rust::frame::SubscribeSpec::new(sub_topic, realm, sub_id.node_id());
         let stop = tokio::time::sleep(std::time::Duration::from_secs(8));
         sub_session
             .run_subscriber(&spec, &sub_id, stop, |evt| {
@@ -359,7 +359,7 @@ async fn run_subscriber_and_run_publisher_against_the_real_fleet() {
     let mut pub_session = connection::connect(STATION_HOST, STATION_PORT, Trust::WebPki, &pub_id)
         .await
         .expect("publisher handshake should succeed");
-    let spec = macula_rust_sdk::frame::PublishSpec::new(
+    let spec = macula_rust::frame::PublishSpec::new(
         topic.clone(),
         realm,
         pub_id.node_id(),
@@ -467,13 +467,13 @@ async fn publish_survives_immediate_close_against_the_real_fleet() {
 
     let realm: [u8; 32] = rand::random();
     let topic = format!(
-        "macula-rust-sdk.test.immediate-close.{}",
+        "macula-rust.test.immediate-close.{}",
         hex::encode(rand::random::<[u8; 8]>())
     );
 
     sub_session
         .subscribe(
-            &macula_rust_sdk::frame::SubscribeSpec::new(
+            &macula_rust::frame::SubscribeSpec::new(
                 topic.clone(),
                 realm,
                 sub_identity.node_id(),
@@ -498,12 +498,12 @@ async fn publish_survives_immediate_close_against_the_real_fleet() {
                 .expect("handshake should succeed (publisher)");
         pub_session
             .publish(
-                &macula_rust_sdk::frame::PublishSpec::new(
+                &macula_rust::frame::PublishSpec::new(
                     topic.clone(),
                     realm,
                     pub_identity.node_id(),
                     1,
-                    macula_rust_sdk::cbor::Value::text(
+                    macula_rust::cbor::Value::text(
                         "hello from the immediate-close regression test",
                     ),
                     now_ms(),
@@ -559,11 +559,11 @@ async fn single_block_put_get_round_trip_against_the_real_fleet() {
         .expect("handshake should succeed");
 
     let data: Vec<u8> = (0..4096).map(|_| rand::random::<u8>()).collect();
-    let mcid = macula_rust_sdk::content::put(&mut session, &data, "test-block", &identity)
+    let mcid = macula_rust::content::put(&mut session, &data, "test-block", &identity)
         .await
         .expect("put should succeed");
     assert!(
-        !macula_rust_sdk::manifest::mcid_is_chunked(&mcid),
+        !macula_rust::manifest::mcid_is_chunked(&mcid),
         "4096 bytes is well under the chunking threshold"
     );
     println!(
@@ -571,7 +571,7 @@ async fn single_block_put_get_round_trip_against_the_real_fleet() {
         hex::encode(mcid)
     );
 
-    let fetched = macula_rust_sdk::content::get(&mut session, mcid, &identity)
+    let fetched = macula_rust::content::get(&mut session, mcid, &identity)
         .await
         .expect("get should succeed for content this session just put");
     assert_eq!(
@@ -599,13 +599,13 @@ async fn chunked_put_get_round_trip_against_the_real_fleet() {
         .await
         .expect("handshake should succeed");
 
-    let size = macula_rust_sdk::manifest::DEFAULT_CHUNK_SIZE * 2 + 12_345;
+    let size = macula_rust::manifest::DEFAULT_CHUNK_SIZE * 2 + 12_345;
     let data: Vec<u8> = (0..size).map(|_| rand::random::<u8>()).collect();
-    let mcid = macula_rust_sdk::content::put(&mut session, &data, "test-chunked", &identity)
+    let mcid = macula_rust::content::put(&mut session, &data, "test-chunked", &identity)
         .await
         .expect("chunked put should succeed");
     assert!(
-        macula_rust_sdk::manifest::mcid_is_chunked(&mcid),
+        macula_rust::manifest::mcid_is_chunked(&mcid),
         "{size} bytes is well over the chunking threshold"
     );
     println!(
@@ -613,7 +613,7 @@ async fn chunked_put_get_round_trip_against_the_real_fleet() {
         hex::encode(mcid)
     );
 
-    let fetched = macula_rust_sdk::content::get(&mut session, mcid, &identity)
+    let fetched = macula_rust::content::get(&mut session, mcid, &identity)
         .await
         .expect("chunked get should succeed for content this session just put");
     assert_eq!(
@@ -638,10 +638,10 @@ async fn get_of_an_unknown_block_reports_not_found_against_the_real_fleet() {
         .expect("handshake should succeed");
 
     let random_hash: [u8; 32] = rand::random();
-    let mcid = macula_rust_sdk::manifest::block_mcid(&random_hash);
+    let mcid = macula_rust::manifest::block_mcid(&random_hash);
 
-    match macula_rust_sdk::content::get(&mut session, mcid, &identity).await {
-        Err(macula_rust_sdk::content::GetError::NotFound) => {
+    match macula_rust::content::get(&mut session, mcid, &identity).await {
+        Err(macula_rust::content::GetError::NotFound) => {
             println!("OBSERVED: not_found reported correctly for an unknown mcid");
         }
         other => panic!("expected GetError::NotFound, got {other:?}"),
@@ -681,12 +681,12 @@ async fn stream_open_round_trip_against_the_real_fleet() {
         .await
         .expect("handshake should succeed");
 
-    let mut handle = macula_rust_sdk::stream::StreamHandle::open(
+    let mut handle = macula_rust::stream::StreamHandle::open(
         &mut session,
-        "macula_rust_sdk.test_stream",
+        "macula_rust.test_stream",
         [0u8; 32],
-        macula_rust_sdk::frame::StreamMode::ClientStream,
-        macula_rust_sdk::cbor::Value::Null,
+        macula_rust::frame::StreamMode::ClientStream,
+        macula_rust::cbor::Value::Null,
         (now_ms() + 10_000) as i128,
         &identity,
     )
@@ -695,8 +695,8 @@ async fn stream_open_round_trip_against_the_real_fleet() {
 
     handle
         .send_data(
-            macula_rust_sdk::frame::StreamEncoding::Raw,
-            macula_rust_sdk::cbor::Value::Bytes(b"hello from macula-rust-sdk".to_vec()),
+            macula_rust::frame::StreamEncoding::Raw,
+            macula_rust::cbor::Value::Bytes(b"hello from macula-rust".to_vec()),
             &identity,
         )
         .await
@@ -760,11 +760,11 @@ async fn streaming_provider_round_trip_against_the_real_fleet() {
 
     let realm: [u8; 32] = rand::random();
     let procedure = format!(
-        "macula_rust_sdk.test_provider.{}",
+        "macula_rust.test_provider.{}",
         hex::encode(rand::random::<[u8; 8]>())
     );
 
-    let advertise_spec = macula_rust_sdk::frame::AdvertiseSpec::new(
+    let advertise_spec = macula_rust::frame::AdvertiseSpec::new(
         realm,
         procedure.clone(),
         provider_identity.node_id(),
@@ -779,7 +779,7 @@ async fn streaming_provider_round_trip_against_the_real_fleet() {
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
     let accept_task = tokio::spawn(async move {
-        let result = macula_rust_sdk::stream::StreamHandle::accept(
+        let result = macula_rust::stream::StreamHandle::accept(
             &mut provider_session,
             std::time::Duration::from_secs(10),
         )
@@ -787,12 +787,12 @@ async fn streaming_provider_round_trip_against_the_real_fleet() {
         (result, provider_session)
     });
 
-    let mut caller_handle = macula_rust_sdk::stream::StreamHandle::open(
+    let mut caller_handle = macula_rust::stream::StreamHandle::open(
         &mut caller_session,
         &procedure,
         realm,
-        macula_rust_sdk::frame::StreamMode::ServerStream,
-        macula_rust_sdk::cbor::Value::Null,
+        macula_rust::frame::StreamMode::ServerStream,
+        macula_rust::cbor::Value::Null,
         (now_ms() + 10_000) as i128,
         &caller_identity,
     )
@@ -811,13 +811,13 @@ async fn streaming_provider_round_trip_against_the_real_fleet() {
     assert_eq!(open_info.procedure, procedure);
     assert_eq!(
         open_info.mode,
-        macula_rust_sdk::frame::StreamMode::ServerStream
+        macula_rust::frame::StreamMode::ServerStream
     );
 
     provider_handle
         .send_data(
-            macula_rust_sdk::frame::StreamEncoding::Raw,
-            macula_rust_sdk::cbor::Value::Bytes(b"hello from the provider".to_vec()),
+            macula_rust::frame::StreamEncoding::Raw,
+            macula_rust::cbor::Value::Bytes(b"hello from the provider".to_vec()),
             &provider_identity,
         )
         .await
@@ -832,10 +832,10 @@ async fn streaming_provider_round_trip_against_the_real_fleet() {
         .await
         .expect("caller should receive the pushed chunk")
     {
-        macula_rust_sdk::stream::StreamItem::Data { body, .. } => {
+        macula_rust::stream::StreamItem::Data { body, .. } => {
             assert_eq!(
                 body,
-                macula_rust_sdk::cbor::Value::Bytes(b"hello from the provider".to_vec())
+                macula_rust::cbor::Value::Bytes(b"hello from the provider".to_vec())
             );
         }
         other => panic!("expected Data, got {other:?}"),
@@ -845,7 +845,7 @@ async fn streaming_provider_round_trip_against_the_real_fleet() {
         .await
         .expect("caller should see end-of-stream")
     {
-        macula_rust_sdk::stream::StreamItem::Eof => {}
+        macula_rust::stream::StreamItem::Eof => {}
         other => panic!("expected Eof, got {other:?}"),
     }
 
@@ -887,11 +887,11 @@ async fn unary_call_provider_round_trip_against_the_real_fleet() {
 
     let realm: [u8; 32] = rand::random();
     let procedure = format!(
-        "macula_rust_sdk.test_add.{}",
+        "macula_rust.test_add.{}",
         hex::encode(rand::random::<[u8; 8]>())
     );
 
-    let advertise_spec = macula_rust_sdk::frame::AdvertiseSpec::new(
+    let advertise_spec = macula_rust::frame::AdvertiseSpec::new(
         realm,
         procedure.clone(),
         provider_identity.node_id(),
@@ -958,7 +958,7 @@ async fn unary_call_provider_round_trip_against_the_real_fleet() {
     serve_result.expect("provider should serve the inbound CALL");
 
     match response {
-        macula_rust_sdk::frame::CallResponse::Result { payload, .. } => {
+        macula_rust::frame::CallResponse::Result { payload, .. } => {
             assert_eq!(payload, Value::Int(7), "3 + 4 should reply with RESULT 7");
         }
         other => panic!("expected a RESULT, got {other:?}"),
@@ -1000,7 +1000,7 @@ async fn rpc_telemetry_facts_against_the_real_fleet() {
 
     let realm: [u8; 32] = rand::random();
     let procedure = format!(
-        "macula_rust_sdk.test_rpc_facts.{}",
+        "macula_rust.test_rpc_facts.{}",
         hex::encode(rand::random::<[u8; 8]>())
     );
 
@@ -1018,7 +1018,7 @@ async fn rpc_telemetry_facts_against_the_real_fleet() {
     ] {
         watcher
             .subscribe(
-                &macula_rust_sdk::frame::SubscribeSpec::new(
+                &macula_rust::frame::SubscribeSpec::new(
                     topic,
                     realm,
                     watcher_identity.node_id(),
@@ -1042,7 +1042,7 @@ async fn rpc_telemetry_facts_against_the_real_fleet() {
             .await
             .expect("caller handshake should succeed");
 
-    let advertise_spec = macula_rust_sdk::frame::AdvertiseSpec::new(
+    let advertise_spec = macula_rust::frame::AdvertiseSpec::new(
         realm,
         procedure.clone(),
         provider_identity.node_id(),
@@ -1109,7 +1109,7 @@ async fn rpc_telemetry_facts_against_the_real_fleet() {
     assert!(
         matches!(
             response,
-            macula_rust_sdk::frame::CallResponse::Result { .. }
+            macula_rust::frame::CallResponse::Result { .. }
         ),
         "expected a RESULT, got {response:?}"
     );
@@ -1130,7 +1130,7 @@ async fn rpc_telemetry_facts_against_the_real_fleet() {
             continue;
         };
         let Ok(evt) =
-            macula_rust_sdk::frame::parse_event(&value.expect("recv_frame should not error"))
+            macula_rust::frame::parse_event(&value.expect("recv_frame should not error"))
         else {
             continue;
         };
@@ -1186,11 +1186,11 @@ async fn unary_call_provider_reports_unknown_next_peer_on_lookup_miss_against_th
 
     let realm: [u8; 32] = rand::random();
     let procedure = format!(
-        "macula_rust_sdk.test_miss.{}",
+        "macula_rust.test_miss.{}",
         hex::encode(rand::random::<[u8; 8]>())
     );
 
-    let advertise_spec = macula_rust_sdk::frame::AdvertiseSpec::new(
+    let advertise_spec = macula_rust::frame::AdvertiseSpec::new(
         realm,
         procedure.clone(),
         provider_identity.node_id(),
@@ -1230,8 +1230,8 @@ async fn unary_call_provider_reports_unknown_next_peer_on_lookup_miss_against_th
     serve_result.expect("provider should serve the inbound CALL (with an error reply)");
 
     match response {
-        macula_rust_sdk::frame::CallResponse::Error { code, name, .. } => {
-            assert_eq!(code, macula_rust_sdk::bolt4::Code::UnknownNextPeer.as_u8());
+        macula_rust::frame::CallResponse::Error { code, name, .. } => {
+            assert_eq!(code, macula_rust::bolt4::Code::UnknownNextPeer.as_u8());
             println!("OBSERVED: lookup miss correctly reported as ERROR code={code} name={name}");
         }
         other => panic!("expected an ERROR, got {other:?}"),
@@ -1358,11 +1358,11 @@ async fn cross_station_streaming_round_trip_frankfurt_provider_milan_caller() {
 
     let realm: [u8; 32] = rand::random();
     let procedure = format!(
-        "macula_rust_sdk.test_call.{}",
+        "macula_rust.test_call.{}",
         hex::encode(rand::random::<[u8; 8]>())
     );
 
-    let advertise_spec = macula_rust_sdk::frame::AdvertiseSpec::new(
+    let advertise_spec = macula_rust::frame::AdvertiseSpec::new(
         realm,
         procedure.clone(),
         provider_identity.node_id(),
@@ -1378,7 +1378,7 @@ async fn cross_station_streaming_round_trip_frankfurt_provider_milan_caller() {
     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
 
     let accept_task = tokio::spawn(async move {
-        let result = macula_rust_sdk::stream::StreamHandle::accept(
+        let result = macula_rust::stream::StreamHandle::accept(
             &mut provider_session,
             std::time::Duration::from_secs(15),
         )
@@ -1386,12 +1386,12 @@ async fn cross_station_streaming_round_trip_frankfurt_provider_milan_caller() {
         (result, provider_session)
     });
 
-    let open_result = macula_rust_sdk::stream::StreamHandle::open(
+    let open_result = macula_rust::stream::StreamHandle::open(
         &mut caller_session,
         &procedure,
         realm,
-        macula_rust_sdk::frame::StreamMode::Bidi,
-        macula_rust_sdk::cbor::Value::Null,
+        macula_rust::frame::StreamMode::Bidi,
+        macula_rust::cbor::Value::Null,
         (now_ms() + 10_000) as i128,
         &caller_identity,
     )
@@ -1417,7 +1417,7 @@ async fn cross_station_streaming_round_trip_frankfurt_provider_milan_caller() {
     let (mut provider_handle, open_info) =
         accept_result.expect("provider should accept the inbound STREAM_OPEN");
     assert_eq!(open_info.procedure, procedure);
-    assert_eq!(open_info.mode, macula_rust_sdk::frame::StreamMode::Bidi);
+    assert_eq!(open_info.mode, macula_rust::frame::StreamMode::Bidi);
 
     // Send both frames, then DRAIN both (recv the Data) before either side
     // closes its send half -- closing before the peer has drained the data
@@ -1427,16 +1427,16 @@ async fn cross_station_streaming_round_trip_frankfurt_provider_milan_caller() {
     // half-closed before either had received the other's frame.
     caller_handle
         .send_data(
-            macula_rust_sdk::frame::StreamEncoding::Raw,
-            macula_rust_sdk::cbor::Value::Bytes(b"audio frame from phone2 (milan)".to_vec()),
+            macula_rust::frame::StreamEncoding::Raw,
+            macula_rust::cbor::Value::Bytes(b"audio frame from phone2 (milan)".to_vec()),
             &caller_identity,
         )
         .await
         .expect("caller should push a frame");
     provider_handle
         .send_data(
-            macula_rust_sdk::frame::StreamEncoding::Raw,
-            macula_rust_sdk::cbor::Value::Bytes(b"audio frame from phone1 (frankfurt)".to_vec()),
+            macula_rust::frame::StreamEncoding::Raw,
+            macula_rust::cbor::Value::Bytes(b"audio frame from phone1 (frankfurt)".to_vec()),
             &provider_identity,
         )
         .await
@@ -1449,10 +1449,10 @@ async fn cross_station_streaming_round_trip_frankfurt_provider_milan_caller() {
             "provider should receive the caller's frame -- see this test's doc comment, \
                  fixed 2026-08-29 by stamping `signer` on stream data frames",
         ) {
-        macula_rust_sdk::stream::StreamItem::Data { body, .. } => {
+        macula_rust::stream::StreamItem::Data { body, .. } => {
             assert_eq!(
                 body,
-                macula_rust_sdk::cbor::Value::Bytes(b"audio frame from phone2 (milan)".to_vec())
+                macula_rust::cbor::Value::Bytes(b"audio frame from phone2 (milan)".to_vec())
             );
             println!("OBSERVED: provider (Frankfurt) received phone2's frame from Milan");
         }
@@ -1463,10 +1463,10 @@ async fn cross_station_streaming_round_trip_frankfurt_provider_milan_caller() {
         .await
         .expect("caller should receive the provider's frame")
     {
-        macula_rust_sdk::stream::StreamItem::Data { body, .. } => {
+        macula_rust::stream::StreamItem::Data { body, .. } => {
             assert_eq!(
                 body,
-                macula_rust_sdk::cbor::Value::Bytes(
+                macula_rust::cbor::Value::Bytes(
                     b"audio frame from phone1 (frankfurt)".to_vec()
                 )
             );
@@ -1543,11 +1543,11 @@ async fn cross_station_unary_call_round_trip_frankfurt_provider_milan_caller() {
 
     let realm: [u8; 32] = rand::random();
     let procedure = format!(
-        "macula_rust_sdk.test_signal.{}",
+        "macula_rust.test_signal.{}",
         hex::encode(rand::random::<[u8; 8]>())
     );
 
-    let advertise_spec = macula_rust_sdk::frame::AdvertiseSpec::new(
+    let advertise_spec = macula_rust::frame::AdvertiseSpec::new(
         realm,
         procedure.clone(),
         provider_identity.node_id(),
@@ -1604,7 +1604,7 @@ async fn cross_station_unary_call_round_trip_frankfurt_provider_milan_caller() {
         serve_task.await.expect("serve task should not panic");
 
     match (response, serve_result) {
-        (Ok(macula_rust_sdk::frame::CallResponse::Result { payload, .. }), Ok(())) => {
+        (Ok(macula_rust::frame::CallResponse::Result { payload, .. }), Ok(())) => {
             let matches = payload == Value::text("answer from phone1 (frankfurt)");
             println!(
                 "OBSERVED: cross-station CALL/RESULT succeeded -- Milan's CALL reached \
@@ -1672,11 +1672,11 @@ async fn direct_dial_advertise_resolve_and_call_round_trip_against_the_real_flee
 
     let realm: [u8; 32] = rand::random();
     let procedure = format!(
-        "macula_rust_sdk.test_direct_dial.{}",
+        "macula_rust.test_direct_dial.{}",
         hex::encode(rand::random::<[u8; 8]>())
     );
 
-    macula_rust_sdk::direct_dial::advertise_direct(
+    macula_rust::direct_dial::advertise_direct(
         &mut provider_session,
         &provider_identity,
         realm,
@@ -1715,7 +1715,7 @@ async fn direct_dial_advertise_resolve_and_call_round_trip_against_the_real_flee
     });
 
     let payload = Value::Map(vec![(Value::text("n"), Value::Int(21))]);
-    let response = macula_rust_sdk::direct_dial::call(
+    let response = macula_rust::direct_dial::call(
         &mut resolve_session,
         &caller_identity,
         realm,
@@ -1731,7 +1731,7 @@ async fn direct_dial_advertise_resolve_and_call_round_trip_against_the_real_flee
     serve_result.expect("provider should serve the direct-dialed inbound CALL");
 
     match response {
-        macula_rust_sdk::frame::CallResponse::Result { payload, .. } => {
+        macula_rust::frame::CallResponse::Result { payload, .. } => {
             assert_eq!(
                 payload,
                 Value::Int(42),
@@ -1788,16 +1788,16 @@ async fn keep_advertised_direct_republishes_against_the_real_fleet() {
 
     let realm: [u8; 32] = rand::random();
     let procedure = format!(
-        "macula_rust_sdk.test_keep_advertised.{}",
+        "macula_rust.test_keep_advertised.{}",
         hex::encode(rand::random::<[u8; 8]>())
     );
-    let uri = macula_rust_sdk::dht::discovery_uri(realm, &procedure);
-    let key = macula_rust_sdk::dht::procedure_key(&uri);
+    let uri = macula_rust::dht::discovery_uri(realm, &procedure);
+    let key = macula_rust::dht::procedure_key(&uri);
 
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
     let loop_procedure = procedure.clone();
     let loop_task = tokio::spawn(async move {
-        macula_rust_sdk::direct_dial::keep_advertised_direct(
+        macula_rust::direct_dial::keep_advertised_direct(
             &mut loop_session,
             &publisher_identity,
             realm,
@@ -1815,14 +1815,14 @@ async fn keep_advertised_direct_republishes_against_the_real_fleet() {
 
     // Give the first (immediate) tick time to land, then read it back.
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-    let first = macula_rust_sdk::dht::find_record(&mut reader_session, &reader_identity, key)
+    let first = macula_rust::dht::find_record(&mut reader_session, &reader_identity, key)
         .await
         .expect("first tick should already be visible");
 
     // Wait past a second tick and confirm the record genuinely changed --
     // not a stale read of the same one.
     tokio::time::sleep(std::time::Duration::from_millis(700)).await;
-    let second = macula_rust_sdk::dht::find_record(&mut reader_session, &reader_identity, key)
+    let second = macula_rust::dht::find_record(&mut reader_session, &reader_identity, key)
         .await
         .expect("second tick should be visible");
     assert!(

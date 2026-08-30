@@ -1,6 +1,6 @@
-# macula-rust-sdk
+# macula-rust
 
-[![CI](https://img.shields.io/github/actions/workflow/status/macula-io/macula-rust-sdk/ci.yml?branch=master&label=CI)](https://github.com/macula-io/macula-rust-sdk/actions/workflows/ci.yml)
+[![CI](https://img.shields.io/github/actions/workflow/status/macula-io/macula-rust/ci.yml?branch=master&label=CI)](https://github.com/macula-io/macula-rust/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-Apache--2.0%20OR%20MIT-blue.svg)](#license)
 [![Rust](https://img.shields.io/badge/rust-1.85%2B-orange?logo=rust)](https://www.rust-lang.org)
 [![unsafe forbidden](https://img.shields.io/badge/unsafe-forbidden-success.svg)](https://github.com/rust-secure-code/safety-dance/)
@@ -83,7 +83,7 @@ Also lives as a runnable example — `cargo run --example quickstart`:
 
 ```rust
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use macula_rust_sdk::{cbor::Value, connection, identity::KeyPair, transport::Trust};
+use macula_rust::{cbor::Value, connection, identity::KeyPair, transport::Trust};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -118,7 +118,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ## Mobile bindings (UniFFI)
 
-`macula-rust-sdk-ffi` is a separate crate — not code bolted onto the
+`macula-rust-ffi` is a separate crate — not code bolted onto the
 core one — wrapping every application primitive (`FfiSession::connect`/
 `call`/`serve_one_call`/`publish`/`subscribe`/`content_put`/
 `content_get`/`stream_open`/`advertise`/`accept_stream`) for Kotlin and
@@ -151,9 +151,9 @@ handler needing a structured payload should encode it as `Bytes`
 today.)
 
 ```bash
-cargo build -p macula-rust-sdk-ffi --release
-cargo run -p macula-rust-sdk-ffi --release --bin uniffi-bindgen -- generate \
-    --library target/release/libmacula_rust_sdk_ffi.so \
+cargo build -p macula-rust-ffi --release
+cargo run -p macula-rust-ffi --release --bin uniffi-bindgen -- generate \
+    --library target/release/libmacula_rust_ffi.so \
     --language kotlin --out-dir bindings-kotlin
 ```
 
@@ -342,7 +342,7 @@ traced directly to the Erlang SDK's source.
   300ms after the last reply, matching the identical fix already applied
   there. Confirmed with 5 consecutive clean passes (was failing reliably
   before). No SDK defect — the cert-chain mechanism itself was never
-  broken. See `macula-rust-sdk-ffi/tests/live_cert_chain_direct_dial.rs`'s
+  broken. See `macula-rust-ffi/tests/live_cert_chain_direct_dial.rs`'s
   own comments for the ruled-out theories from the earlier rounds.
 - The demo fleet's `station_endpoint` DHT records carry a short TTL and
   are not always freshly republished — a direct-dial resolve can

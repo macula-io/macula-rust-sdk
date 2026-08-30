@@ -1,12 +1,12 @@
 [package]
-name = "macula-rust-sdk-ffi"
+name = "macula-rust-ffi"
 version = "0.3.0"
 edition = "2021"
 rust-version = "1.85"
 authors = ["Macula <raf.lefever@erlef.org>"]
-description = "UniFFI mobile (Kotlin/Swift) bindings for macula-rust-sdk. Wraps the core crate; adds nothing to it."
+description = "UniFFI mobile (Kotlin/Swift) bindings for macula-rust. Wraps the core crate; adds nothing to it."
 license = "Apache-2.0 OR MIT"
-repository = "https://github.com/macula-io/macula-rust-sdk"
+repository = "https://github.com/macula-io/macula-rust"
 publish = false
 
 [lints.rust]
@@ -16,7 +16,7 @@ unsafe_code = "forbid"
 all = { level = "deny", priority = -1 }
 
 [lib]
-name = "macula_rust_sdk_ffi"
+name = "macula_rust_ffi"
 crate-type = ["staticlib", "cdylib", "lib"]
 
 [[bin]]
@@ -24,7 +24,7 @@ name = "uniffi-bindgen"
 path = "uniffi-bindgen.rs"
 
 [dependencies]
-macula-rust-sdk = { path = ".." }
+macula-rust = { path = ".." }
 uniffi = { version = "0.32", features = ["cli", "tokio"] }
 tokio = { version = "1", features = ["full"] }
 thiserror = "2"

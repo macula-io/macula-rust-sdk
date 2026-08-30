@@ -2,7 +2,7 @@
 
 **Status:** Reference spec, extracted from source. Not a build plan yet.
 **Created:** 2026-08-28
-**Repo renamed 2026-08-28:** `macula-mobile` → `macula-rust-sdk`. This is a
+**Repo renamed 2026-08-28:** `macula-mobile` → `macula-rust`. This is a
 Rust port of macula's *SDK* half (the client/leaf side — see
 `macula/CLAUDE.md`'s own SDK-vs-Relay split), not the relay/station. Mobile
 (iOS/Android via UniFFI) is the flagship, driving consumer and the reason
@@ -117,7 +117,7 @@ the 7-box demo fleet) presents a **3-certificate RSA chain** (SPKI OID
 `1.2.840.113549.1.1.1`), not a self-signed Ed25519 identity cert. That's
 macula's *other* documented trust mode (`verify => webpki`, "public-IP
 path with Let's Encrypt-anchored certs"), confirmed working end-to-end
-from `macula-rust-sdk` (`tests/live_station.rs`): full QUIC/TLS handshake
+from `macula-rust` (`tests/live_station.rs`): full QUIC/TLS handshake
 completes, ALPN negotiates as `"macula"` exactly per spec, CA-chain
 validation against `webpki-roots` succeeds. Pubkey-pinned trust is fully
 implemented and unit-tested (`src/cert.rs`, against a synthetic cert —
@@ -345,10 +345,10 @@ skipping it fails silently.** From `macula_identity.erl` (177 lines) and
   bury the identity-generation step where a future implementer might
   reach for the cheap `generate()` instead of `generate(#{puzzle=>true})`.
 - **Empirical caveat, 2026-08-28 — tested directly, not assumed.** Against
-  the live `macula-station-frankfurt` (`macula-rust-sdk`'s
+  the live `macula-station-frankfurt` (`macula-rust`'s
   `tests/live_station.rs`), an **unhardened** identity was accepted
   (`accepted = true`), not rejected — contradicting the incident above.
-  `macula-rust-sdk`'s own puzzle-evidence computation is independently
+  `macula-rust`'s own puzzle-evidence computation is independently
   verified byte-for-byte against real Erlang `crypto:hash/2` output, so
   this isn't a client-side computation bug; it means either this
   particular dev-fleet station has enforcement disabled/lenient (it's
@@ -427,13 +427,13 @@ term), `deadline_ms`, `caller` (32-byte pubkey), optional
 `binary()` on the wire — a raw byte string (CBOR major 2), NOT text
 (major 3).** Easy to get backwards, since most other string-ish fields
 (`frame_type`, `reason`, `delivered_via`) really are atoms and do encode
-as text. Caught by `macula-rust-sdk`'s own differential-vector tests: a
+as text. Caught by `macula-rust`'s own differential-vector tests: a
 hand-built CALL frame using text encoding for `procedure` produced a
 completely different (still validly-formed, silently wrong) signature
 from the reference — see that crate's `src/frame.rs` for the fix and the
 byte-level trace that found it.
 
-**Live-verified, 2026-08-28** (`macula-rust-sdk`'s
+**Live-verified, 2026-08-28** (`macula-rust`'s
 `tests/live_station.rs`): a full CALL/RESULT-or-ERROR round trip against
 `macula-station-frankfurt` — signed CALL out, signed ERROR back
 (`unknown_next_peer`, correctly correlated by `call_id`) for a
@@ -472,7 +472,7 @@ plus `delivered_via` ∈ `plumtree|dht|direct`. A relay station copies
 receiving mobile client can verify authenticity against the *original
 publisher*, independent of which station relayed it.
 
-**Live-verified, 2026-08-28** (`macula-rust-sdk`'s
+**Live-verified, 2026-08-28** (`macula-rust`'s
 `tests/live_station.rs`): SUBSCRIBE → PUBLISH → EVENT against
 `macula-station-frankfurt`, answering a question the spec had left open
 — **yes, a subscriber receives its own publish** (`delivered_via =
@@ -544,7 +544,7 @@ as CALL's `payload`. `encoding` is purely a semantic hint for the
 receiver; **no second codec, no `rmp-serde` dependency needed.**
 Confirmed at the crate level too:
 `stream_data_msgpack_frame_matches_the_reference_byte_for_byte` (Rust
-crate `macula-rust-sdk`, `src/frame.rs`) matches the reference's
+crate `macula-rust`, `src/frame.rs`) matches the reference's
 signature byte-for-byte with exactly this shape.
 
 ### 6.11 Content transfer (`want`, `have`, `block`, `manifest_req`,
@@ -737,7 +737,7 @@ streaming RPC (§7), not the control stream.
 | `_content.get_manifest` | `#{mcid}` | the manifest map \| `not_found` |
 
 **Implemented + live-verified 2026-08-28** (`src/manifest.rs`, `src/content.rs`,
-Rust crate `macula-rust-sdk`). Two things worth recording that weren't obvious
+Rust crate `macula-rust`). Two things worth recording that weren't obvious
 from reading the Erlang alone:
 
 - **`name`'s wire representation depends on which computation you're in.**
@@ -994,8 +994,8 @@ protocol-level rework. A seam, not a feature.
 
 ## 14. UniFFI mobile bindings — crate architecture, started 2026-08-28
 
-**Every application primitive wrapped, same day.** A separate crate, `macula-rust-sdk-ffi`,
-depending on the core `macula-rust-sdk` crate via a path dependency —
+**Every application primitive wrapped, same day.** A separate crate, `macula-rust-ffi`,
+depending on the core `macula-rust` crate via a path dependency —
 structurally identical to `iroh-ffi`'s relationship to `iroh`, confirmed
 by reading the live `n0-computer/iroh-ffi` repo directly rather than
 assuming: same crate separation, same modern UniFFI proc-macro style
@@ -1007,7 +1007,7 @@ rewrite needed since this crate is already tokio-based throughout), same
 target for codegen.
 
 **Why a separate crate, not code inside the core one:** this is what
-keeps `macula-rust-sdk` itself exactly as usable from plain Rust, a CLI,
+keeps `macula-rust` itself exactly as usable from plain Rust, a CLI,
 or WASM as it was before — zero UniFFI dependency, zero FFI-shaped types,
 in the core crate. The doc comment at the top of `src/lib.rs`
 ("Mobile... is the flagship consumer driving this work, not the ceiling

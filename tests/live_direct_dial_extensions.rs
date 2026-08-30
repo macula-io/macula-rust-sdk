@@ -15,12 +15,12 @@
 
 use std::time::Duration;
 
-use macula_rust_sdk::cbor::Value;
-use macula_rust_sdk::connection;
-use macula_rust_sdk::direct_dial;
-use macula_rust_sdk::frame::StreamMode;
-use macula_rust_sdk::identity::KeyPair;
-use macula_rust_sdk::transport::Trust;
+use macula_rust::cbor::Value;
+use macula_rust::connection;
+use macula_rust::direct_dial;
+use macula_rust::frame::StreamMode;
+use macula_rust::identity::KeyPair;
+use macula_rust::transport::Trust;
 
 const STATION_HOST: &str = "station-fi-helsinki.macula.io";
 const STATION_PORT: u16 = 4433;
@@ -76,7 +76,7 @@ async fn open_stream_direct_round_trip_against_the_real_fleet() {
     // implicit drop tore the connection down before the already-sent
     // frame had necessarily been fully processed peer-side.
     let accept_task = tokio::spawn(async move {
-        let result = macula_rust_sdk::stream::StreamHandle::accept(
+        let result = macula_rust::stream::StreamHandle::accept(
             &mut provider_session,
             Duration::from_secs(15),
         )
@@ -121,7 +121,7 @@ async fn open_stream_direct_round_trip_against_the_real_fleet() {
 
     provider_handle
         .send_data(
-            macula_rust_sdk::frame::StreamEncoding::Raw,
+            macula_rust::frame::StreamEncoding::Raw,
             Value::Bytes(b"hello via direct-dial stream".to_vec()),
             &provider_id,
         )
@@ -137,7 +137,7 @@ async fn open_stream_direct_round_trip_against_the_real_fleet() {
         .await
         .expect("caller should receive the pushed chunk")
     {
-        macula_rust_sdk::stream::StreamItem::Data {
+        macula_rust::stream::StreamItem::Data {
             body: Value::Bytes(got),
             ..
         } => {
@@ -154,7 +154,7 @@ async fn open_stream_direct_round_trip_against_the_real_fleet() {
         .await
         .expect("caller should see end-of-stream")
     {
-        macula_rust_sdk::stream::StreamItem::Eof => {}
+        macula_rust::stream::StreamItem::Eof => {}
         other => panic!("expected Eof, got {other:?}"),
     }
 
@@ -225,14 +225,14 @@ async fn put_and_get_direct_round_trip_against_the_real_fleet() {
             .await
             .expect("announcer handshake should succeed");
     let endpoint = format!("https://{STATION_HOST}:{STATION_PORT}");
-    let rec = macula_rust_sdk::dht::new_content_announcement(
+    let rec = macula_rust::dht::new_content_announcement(
         announcer_id.node_id(),
         mcid,
         endpoint,
         Duration::from_secs(3600),
     );
-    let rec = macula_rust_sdk::dht::sign(rec, &announcer_id);
-    macula_rust_sdk::dht::put_record(&mut announcer_session, &announcer_id, &rec)
+    let rec = macula_rust::dht::sign(rec, &announcer_id);
+    macula_rust::dht::put_record(&mut announcer_session, &announcer_id, &rec)
         .await
         .expect("publishing the content_announcement should succeed");
 

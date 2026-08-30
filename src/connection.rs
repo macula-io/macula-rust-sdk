@@ -694,7 +694,7 @@ impl Session {
     ///
     /// ```no_run
     /// # use std::time::Duration;
-    /// # async fn example(session: &mut macula_rust_sdk::connection::Session, identity: &macula_rust_sdk::identity::KeyPair, lookup: impl Fn(&[u8; 32], &str) -> Option<macula_rust_sdk::connection::CallHandler>) {
+    /// # async fn example(session: &mut macula_rust::connection::Session, identity: &macula_rust::identity::KeyPair, lookup: impl Fn(&[u8; 32], &str) -> Option<macula_rust::connection::CallHandler>) {
     /// loop {
     ///     if let Err(e) = session.serve_one_call(&lookup, identity, Duration::from_secs(30)).await {
     ///         // ServeCallError::Timeout just means nothing arrived -- keep looping.

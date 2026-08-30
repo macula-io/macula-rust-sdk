@@ -2159,7 +2159,7 @@ mod tests {
     // (macula-io/macula, src/peering/macula_frame.erl:sign_publisher/2),
     // live in a rebar3 shell against the same fixed identity every other
     // vector test in this file uses. First publisher_sig implementation
-    // in any repo as of 2026-08-29 (macula-go-sdk, macula-rust-sdk,
+    // in any repo as of 2026-08-29 (macula-go-sdk, macula-rust,
     // macula-dotnet-sdk all lacked it) -- no prior port existed to
     // cross-check against instead, so this is checked straight against
     // the Erlang source of truth.

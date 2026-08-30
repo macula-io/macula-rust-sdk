@@ -10,12 +10,12 @@
 //! no `Drop` impl, so dropping it immediately can close the underlying
 //! QUIC connection before the just-sent reply frame actually reaches the
 //! peer (the same class of race already documented on
-//! [`macula_rust_sdk::connection::Session::close`]). See this file's own
+//! [`macula_rust::connection::Session::close`]). See this file's own
 //! git history / README for the investigation that found this.
 use std::sync::Arc;
 use std::time::Duration;
 
-use macula_rust_sdk::{
+use macula_rust::{
     cbor::Value, connection, connection::CallHandler, identity::KeyPair, transport::Trust, ucan,
 };
 
@@ -32,9 +32,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut caller = connection::connect(HOST, PORT, Trust::WebPki, &caller_id).await?;
 
     let realm = [0u8; 32];
-    let procedure = "macula_rust_sdk.examples.ucan_gated";
+    let procedure = "macula_rust.examples.ucan_gated";
     let advertise_spec =
-        macula_rust_sdk::frame::AdvertiseSpec::new(realm, procedure, provider_id.node_id());
+        macula_rust::frame::AdvertiseSpec::new(realm, procedure, provider_id.node_id());
     provider.advertise(&advertise_spec, &provider_id).await?;
     tokio::time::sleep(Duration::from_millis(1200)).await;
 

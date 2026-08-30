@@ -1,0 +1,6 @@
+[bindings.kotlin]
+package_name = "io.macula.sdk"
+cdylib_name = "macula_rust_ffi"
+
+[bindings.swift]
+cdylib_name = "macula_rust_ffi"
