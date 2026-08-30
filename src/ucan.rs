@@ -116,7 +116,7 @@ struct WirePayload {
 }
 
 /// A UCAN token's decoded claims — the Rust-idiomatic counterpart to
-/// [`WirePayload`], returned from [`decode`]/[`verify`].
+/// `WirePayload`, returned from [`decode`]/[`verify`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct Payload {
     pub issuer: String,

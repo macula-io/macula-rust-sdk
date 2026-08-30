@@ -489,7 +489,7 @@ impl Session {
     /// Send a signed CALL on the control stream and wait for the
     /// matching RESULT or ERROR — see [`FrameStream::call`]. Announces
     /// `rpc.sent_v1`/`rpc.completed_v1` around the call — see
-    /// [`announce_rpc_sent`] for why these are always on.
+    /// `announce_rpc_sent` for why these are always on.
     pub async fn call(
         &mut self,
         procedure: &str,

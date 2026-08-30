@@ -766,7 +766,7 @@ impl std::error::Error for PutDirectError {}
 /// directly rather than resolving one via a `procedure_advertisement`:
 /// content has no "procedure" to advertise, so there is nothing to
 /// resolve here beyond the station's own `station_endpoint`
-/// ([`resolve_station_endpoint`]). `resolve_via` is used only to query the
+/// (`resolve_station_endpoint`). `resolve_via` is used only to query the
 /// DHT for `station`'s `station_endpoint`; it does not need to already be
 /// connected to `station`.
 ///

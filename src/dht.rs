@@ -13,7 +13,7 @@
 //!
 //! **This is a thin RPC client, not a DHT participant.** Every function
 //! here just issues an ordinary signed CALL (`_dht.put_record` etc.) to
-//! whichever station the given [`Session`](crate::connection::Session) is
+//! whichever station the given [`Session`] is
 //! already connected to — real Kademlia routing, replication, and k-bucket
 //! maintenance stay entirely on the relay side (`macula-station`). Nothing
 //! in this module talks DHT protocol directly.
