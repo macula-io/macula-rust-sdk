@@ -293,7 +293,7 @@ pub fn content_key(mcid: crate::manifest::Mcid) -> [u8; 32] {
 pub fn discovery_uri(realm: [u8; 32], procedure: &str) -> String {
     let mut hex_realm = String::with_capacity(64);
     for b in realm {
-        hex_realm.push_str(&format!("{b:02x}"));
+        hex_realm.push_str(&format!("{b:02X}"));
     }
     format!("{hex_realm}/{procedure}")
 }
