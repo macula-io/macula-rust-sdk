@@ -4,7 +4,7 @@
 [![License](https://img.shields.io/badge/license-Apache--2.0%20OR%20MIT-blue.svg)](#license)
 [![Rust](https://img.shields.io/badge/rust-1.85%2B-orange?logo=rust)](https://www.rust-lang.org)
 [![unsafe forbidden](https://img.shields.io/badge/unsafe-forbidden-success.svg)](https://github.com/rust-secure-code/safety-dance/)
-[![Buy Me A Coffee](https://img.shields.io/badge/Buy%20Me%20A%20Coffee-support-yellow.svg)](https://buymeacoffee.com/rlefever)
+[![GitHub Sponsors](https://img.shields.io/badge/GitHub%20Sponsors-support-ea4aaa.svg?logo=githubsponsors&logoColor=white)](https://github.com/sponsors/rgfaber)
 
 <p align="center">
   <picture>
@@ -398,5 +398,5 @@ additional terms or conditions.
 ---
 
 <p align="center">
-  <sub>Built with the BEAM's protocol, ported to Rust — <a href="https://buymeacoffee.com/rlefever">buy me a coffee</a> if this saved you some time</sub>
+  <sub>Built with the BEAM's protocol, ported to Rust — <a href="https://github.com/sponsors/rgfaber">sponsor the work</a> if this saved you some time</sub>
 </p>
