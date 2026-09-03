@@ -364,6 +364,52 @@ pub async fn call(
     result
 }
 
+/// [`call`], presenting `ucan_token` to a provider gated with
+/// `{ucan_required, Issuer}`. Every hecate-om capability is advertised via
+/// [`advertise_direct`], so this is the only way a UCAN-gated capability
+/// is reachable through this crate at all -- [`call`] itself has no token
+/// parameter, and [`Session::call_with_ucan`] is the plain, non-direct
+/// path, which cannot resolve a direct-dial-only advertisement to begin
+/// with.
+pub async fn call_with_ucan(
+    resolve_via: &mut Session,
+    id: &KeyPair,
+    realm: [u8; 32],
+    procedure: &str,
+    payload: Value,
+    timeout: Duration,
+    ucan_token: Vec<u8>,
+) -> Result<CallResponse, CallError> {
+    let resolved = resolve(resolve_via, id, realm, procedure)
+        .await
+        .map_err(CallError::Resolve)?;
+
+    let mut target = tokio::time::timeout(
+        timeout,
+        connection::connect(&resolved.host, resolved.port, Trust::Insecure, id),
+    )
+    .await
+    .unwrap_or(Err(connection::HandshakeError::Timeout))
+    .map_err(CallError::Dial)?;
+
+    if target.station.node_id != resolved.station {
+        let dialed = target.station.node_id;
+        target.close("trust_violation", None, id).await;
+        return Err(CallError::TrustViolation {
+            resolved: resolved.station,
+            dialed,
+        });
+    }
+
+    let deadline_ms = now_ms() + timeout.as_millis() as i128;
+    let result = target
+        .call_with_ucan(procedure, realm, payload, deadline_ms, id, timeout, ucan_token)
+        .await
+        .map_err(CallError::Call);
+    target.close("normal", None, id).await;
+    result
+}
+
 /// [`call`], resolved via [`resolve_with_cert_chain`] instead of
 /// [`resolve`] — see both for the full contract. Opt-in managed-realm
 /// authorization; [`call`] itself is unaffected.
