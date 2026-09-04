@@ -8,7 +8,7 @@ edition = "2021"
 rust-version = "1.85"
 authors = ["Macula <raf.lefever@erlef.org>"]
 description = "Rust port of macula's SDK (client/leaf) wire protocol — mobile first, not mobile-only. See plans/PLAN_WIRE_PROTOCOL.md."
-license = "Apache-2.0 OR MIT"
+license = "Apache-2.0"
 repository = "https://github.com/macula-io/macula-rust"
 
 [lints.rust]
