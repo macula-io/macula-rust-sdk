@@ -969,7 +969,7 @@ property.
 ### 13.4 Forward-compatibility note: live/unbounded streaming (2026-08-28)
 
 **Confirmed gap, out of scope here, but worth designing around.** A
-concrete real-world case (`hecate-tube` / macula-realm's "Macula TV") was
+concrete real-world case (`hecate-tube` / macula-portal's "Macula TV") was
 checked directly: its ingest path is plain HTTP upload to a conventional
 web server (mesh not involved at all — confirmed in
 `maybe_upload_video_clip.erl`), and its *playback* path is `server_stream`
