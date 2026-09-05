@@ -380,18 +380,6 @@ traced directly to the Erlang SDK's source.
 
 ## Known limitations
 
-- **`ClientStream` mode's reply path (`SendReply`/`AwaitReply`) is
-  correct on this SDK's side but currently blocked by a `macula-station`
-  bug**, not something fixable here. The caller and provider each hold a
-  separate dedicated QUIC stream to the station, bridged by the
-  station's own relay logic; the provider receives the caller's data and
-  end-of-stream correctly and its own reply send returns no error, but
-  the caller never sees it — the station appears to close the
-  caller-facing leg's write side as soon as it relays the caller's
-  end-of-stream, before the reply can flow back the other way. Same root
-  cause, same finding, as [`macula-go`](https://github.com/macula-io/macula-go#known-limitations)'s
-  own `TestLiveClientStreamReplyRoundTrip` (identical wire protocol,
-  identical relay).
 - **`direct_dial::get_direct` can only resolve a `content_announcement`
   that something has actually published** — and nothing in this
   ecosystem currently does, since only a station/relay can legitimately

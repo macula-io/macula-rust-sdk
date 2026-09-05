@@ -648,74 +648,171 @@ async fn get_of_an_unknown_block_reports_not_found_against_the_real_fleet() {
         .await;
 }
 
-/// A real STREAM_OPEN round trip against a deliberately nonexistent
-/// procedure — same spirit as `call_round_trip_against_the_real_fleet`:
-/// there's no known streaming procedure registered anywhere on this
-/// fleet to exercise a genuine data exchange against (streaming
-/// consumers like hecate-tube are separate app-level services, not part
-/// of macula-station itself — see `plans/PLAN_WIRE_PROTOCOL.md` §13.4),
-/// so this proves the wire mechanics — opening a dedicated stream,
-/// sending a signed STREAM_OPEN, a chunk, a half-close, and awaiting
-/// whatever the station does with an unknown procedure — rather than a
-/// specific procedure's behavior.
+/// Proves the exact bug class `macula-station`'s mode-aware half-close
+/// fix (commit `07db0d8`) addresses: a `client_stream` caller that
+/// pushes its data, half-closes its own send side with `close_send`,
+/// and then awaits the provider's reply. Before that fix, the relay
+/// tore down the ENTIRE bidirectional stream route on the caller's
+/// STREAM_END regardless of the wire's `role` field, so the provider's
+/// `send_reply` returned no error locally while the caller's
+/// `await_reply` timed out — this crate's SDK-side code was already
+/// correct, the bug lived entirely in the station's relay.
 ///
-/// **Empirical finding, 2026-08-28:** the station DOES actively validate
-/// streaming procedures, symmetric to CALL. It replied with a real
-/// STREAM_ERROR — `unknown_next_peer` / "procedure not advertised" —
-/// which `StreamHandle::await_reply` correctly surfaced as
-/// `RecvStreamError::PeerAborted`, round-tripping through
-/// `frame::parse_stream_event`'s STREAM_ERROR branch on the very first
-/// live run. Still printed as OBSERVED rather than asserted: this test
-/// exists to prove the wire mechanics work at all, not to pin the
-/// station's procedure-validation behavior as a contract this crate
-/// depends on.
+/// This deliberately does NOT reuse the shape the previous version of
+/// this test had (a lone caller against a made-up, unregistered
+/// procedure with no real provider): that only ever proved wire
+/// mechanics, never actually exercised `send_reply`/`await_reply`
+/// against a real counterpart, and a hand-written mock provider here
+/// could too easily bake the old (buggy) relay behavior in as
+/// "correct" without anyone noticing. Two independent connections to
+/// the SAME real, live station — one provider, one caller — same
+/// pattern as `streaming_provider_round_trip_against_the_real_fleet`
+/// above, with the roles matched to `ClientStream`'s actual wire shape
+/// instead of `ServerStream`'s: the CALLER pushes data and closes its
+/// own send side, the PROVIDER drains with `recv` and finishes with
+/// `send_reply`, and the caller's `await_reply` is what's actually
+/// being proven. Matches `macula-go`'s own
+/// `TestLiveClientStreamReplyRoundTrip` (`stream/live_test.go`), the
+/// SDK that already had this shape right, including asserting the
+/// actual reply payload and `responded_by` rather than just logging
+/// whichever of the two possible outcomes happened to occur.
 #[tokio::test]
 #[ignore = "requires network access to a live macula-station"]
-async fn stream_open_round_trip_against_the_real_fleet() {
-    let identity = KeyPair::generate_with_default_puzzle();
-    let mut session = connection::connect(STATION_HOST, STATION_PORT, Trust::WebPki, &identity)
-        .await
-        .expect("handshake should succeed");
+async fn client_stream_reply_round_trip_against_the_real_fleet() {
+    let provider_identity = KeyPair::generate_with_default_puzzle();
+    let caller_identity = KeyPair::generate_with_default_puzzle();
 
-    let mut handle = macula_rust::stream::StreamHandle::open(
-        &mut session,
-        "macula_rust.test_stream",
-        [0u8; 32],
+    let mut provider_session = connection::connect(
+        STATION_HOST,
+        STATION_PORT,
+        Trust::WebPki,
+        &provider_identity,
+    )
+    .await
+    .expect("provider handshake should succeed");
+    let mut caller_session =
+        connection::connect(STATION_HOST, STATION_PORT, Trust::WebPki, &caller_identity)
+            .await
+            .expect("caller handshake should succeed");
+
+    let realm: [u8; 32] = rand::random();
+    let procedure = format!(
+        "macula_rust.test_client_stream.{}",
+        hex::encode(rand::random::<[u8; 8]>())
+    );
+
+    let advertise_spec = macula_rust::frame::AdvertiseSpec::new(
+        realm,
+        procedure.clone(),
+        provider_identity.node_id(),
+    );
+    provider_session
+        .advertise(&advertise_spec, &provider_identity)
+        .await
+        .expect("advertise should send");
+
+    // Give the station a moment to register the advertisement before
+    // the caller dials in against it.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    let accept_task = tokio::spawn(async move {
+        let result = macula_rust::stream::StreamHandle::accept(
+            &mut provider_session,
+            std::time::Duration::from_secs(10),
+        )
+        .await;
+        (result, provider_session)
+    });
+
+    let mut caller_handle = macula_rust::stream::StreamHandle::open(
+        &mut caller_session,
+        &procedure,
+        realm,
         macula_rust::frame::StreamMode::ClientStream,
         macula_rust::cbor::Value::Null,
         (now_ms() + 10_000) as i128,
-        &identity,
+        &caller_identity,
     )
     .await
-    .expect("opening a dedicated stream and sending STREAM_OPEN should succeed");
+    .expect("caller should open a stream");
 
-    handle
+    let (accept_result, provider_session) =
+        accept_task.await.expect("accept task should not panic");
+    let (mut provider_handle, open_info) =
+        accept_result.expect("provider should accept the inbound STREAM_OPEN");
+
+    println!(
+        "OBSERVED: provider accepted stream_open for procedure={} mode={:?}",
+        open_info.procedure, open_info.mode
+    );
+    assert_eq!(open_info.procedure, procedure);
+    assert_eq!(open_info.mode, macula_rust::frame::StreamMode::ClientStream);
+
+    caller_handle
         .send_data(
             macula_rust::frame::StreamEncoding::Raw,
-            macula_rust::cbor::Value::Bytes(b"hello from macula-rust".to_vec()),
-            &identity,
+            macula_rust::cbor::Value::Bytes(b"hello from the caller".to_vec()),
+            &caller_identity,
         )
         .await
-        .expect("sending a chunk should succeed");
-    handle
-        .close_send(&identity)
+        .expect("caller should push a chunk");
+    caller_handle
+        .close_send(&caller_identity)
         .await
-        .expect("half-closing should succeed");
+        .expect("caller should close its send side");
 
-    match handle.await_reply(std::time::Duration::from_secs(5)).await {
-        Ok((payload, responded_by)) => {
-            println!(
-                "OBSERVED: got a STREAM_REPLY (unexpected for a made-up procedure, but valid): payload={payload:?} responded_by={}",
-                hex::encode(responded_by)
+    match provider_handle
+        .recv(std::time::Duration::from_secs(5))
+        .await
+        .expect("provider should receive the pushed chunk")
+    {
+        macula_rust::stream::StreamItem::Data { body, .. } => {
+            assert_eq!(
+                body,
+                macula_rust::cbor::Value::Bytes(b"hello from the caller".to_vec())
             );
         }
-        Err(e) => {
-            println!("OBSERVED: no reply within 5s, as: {e}");
-        }
+        other => panic!("expected Data, got {other:?}"),
+    }
+    match provider_handle
+        .recv(std::time::Duration::from_secs(5))
+        .await
+        .expect("provider should see end-of-stream")
+    {
+        macula_rust::stream::StreamItem::Eof => {}
+        other => panic!("expected Eof, got {other:?}"),
     }
 
-    session
-        .close("normal", Some("stream test done"), &identity)
+    provider_handle
+        .send_reply(
+            macula_rust::cbor::Value::Text("processed: hello from the caller".to_string()),
+            &provider_identity,
+        )
+        .await
+        .expect("provider should send a reply");
+
+    let (payload, responded_by) = caller_handle
+        .await_reply(std::time::Duration::from_secs(5))
+        .await
+        .expect(
+            "caller should receive the reply -- if this times out, macula-station's \
+             mode-aware half-close fix (commit 07db0d8) is not live on this station",
+        );
+    assert_eq!(
+        payload,
+        macula_rust::cbor::Value::Text("processed: hello from the caller".to_string())
+    );
+    assert_eq!(responded_by, provider_identity.node_id());
+    println!(
+        "OBSERVED: caller received a real STREAM_REPLY through ClientStream mode: payload={payload:?} responded_by={}",
+        hex::encode(responded_by)
+    );
+
+    provider_session
+        .close("normal", Some("provider test done"), &provider_identity)
+        .await;
+    caller_session
+        .close("normal", Some("caller test done"), &caller_identity)
         .await;
 }
 

@@ -81,6 +81,28 @@ usually touches both, but their version numbers don't move in lockstep.
   `Trust` value over a link's lifetime. All three variants are plain data
   with no invariant broken by permitting duplication.
 
+#### Fixed
+
+- **`tests/live_station.rs`'s `client_stream` test was vacuous — replaced
+  with a real, asserted round trip.** The old
+  `stream_open_round_trip_against_the_real_fleet` targeted a made-up,
+  unregistered procedure with no real provider, and just `println!`'d
+  whichever of the two possible outcomes occurred instead of asserting
+  either — `send_reply`/`await_reply` had never actually been exercised
+  against a real counterpart anywhere in this crate's test suite. Now
+  `client_stream_reply_round_trip_against_the_real_fleet`: two independent
+  connections to the same live station (one provider, one caller, same
+  pattern as `streaming_provider_round_trip_against_the_real_fleet`), the
+  caller pushes data and half-closes, the provider drains and sends a real
+  `send_reply`, and the caller's `await_reply` is asserted against the
+  actual payload and `responded_by`. This is also the regression proof for
+  `macula-station`'s mode-aware half-close fix (commit `07db0d8`, same
+  day): before that fix, a `client_stream` half-close tore down the whole
+  relay route before the reply could flow back; this test now passes
+  live against the real fleet, confirming the fix is deployed. The
+  "Known limitations" entry this used to justify is removed from the
+  README — it's fixed, not a documented gap anymore.
+
 ### [0.2.4] - 2026-09-05
 
 #### Fixed
