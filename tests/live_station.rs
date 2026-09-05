@@ -972,6 +972,134 @@ async fn unary_call_provider_round_trip_against_the_real_fleet() {
         .await;
 }
 
+/// Regression test for a real bug found and root-caused 2026-09-05
+/// building the quickstart example: identical to
+/// `unary_call_provider_round_trip_against_the_real_fleet` above, EXCEPT
+/// `#[tokio::test]`'s default flavor there is single-threaded
+/// (`current_thread`) -- this test forces the MULTI-threaded flavor
+/// `#[tokio::main]` itself defaults to, which is what any real
+/// consumer's `main` actually runs under.
+///
+/// Root cause, confirmed by instrumenting `FrameStream::send_frame`/
+/// `recv_frame` with thread-id and frame-content logging against the
+/// real fleet: it is NOT fundamentally about multi-threading. It's
+/// [`Session`]'s own documented "always call `close` before this goes
+/// out of scope" contract (see that type's own doc, and
+/// [`Session::serve_one_call`]'s) -- a bare drop tears down the
+/// connection with no guarantee the last write reached the peer, and a
+/// `tokio::spawn`ed task with nothing after the `served_one_call().await`
+/// drops its `Session` the instant the task completes. Under a
+/// multi-threaded runtime that spawned task can run to completion (and
+/// drop the session) within microseconds of the write -- deterministically,
+/// every run in this environment -- while a single-threaded runtime's own
+/// cooperative scheduling happens to leave enough incidental delay before
+/// the drop for quinn's send-scheduling to flush first. This test
+/// deliberately closes `provider_session` explicitly before the task
+/// ends, exactly like `unary_call_provider_round_trip_against_the_real_fleet`
+/// above already does (returning the session out of the spawned task and
+/// closing it afterward is equally correct) -- with that discipline
+/// applied, the round trip is exactly as reliable under multi-thread as
+/// under current_thread.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires network access to a live macula-station"]
+async fn unary_call_provider_round_trip_multi_thread_runtime() {
+    let provider_identity = KeyPair::generate_with_default_puzzle();
+    let caller_identity = KeyPair::generate_with_default_puzzle();
+
+    let mut provider_session = connection::connect(
+        STATION_HOST,
+        STATION_PORT,
+        Trust::WebPki,
+        &provider_identity,
+    )
+    .await
+    .expect("provider handshake should succeed");
+    let mut caller_session =
+        connection::connect(STATION_HOST, STATION_PORT, Trust::WebPki, &caller_identity)
+            .await
+            .expect("caller handshake should succeed");
+
+    let realm: [u8; 32] = rand::random();
+    let procedure = format!(
+        "macula_rust.test_multithread.{}",
+        hex::encode(rand::random::<[u8; 8]>())
+    );
+
+    let advertise_spec = macula_rust::frame::AdvertiseSpec::new(
+        realm,
+        procedure.clone(),
+        provider_identity.node_id(),
+    );
+    provider_session
+        .advertise(&advertise_spec, &provider_identity)
+        .await
+        .expect("advertise should send");
+
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    let target_procedure = procedure.clone();
+    let lookup = move |_realm: &[u8; 32], proc: &str| -> Option<connection::CallHandler> {
+        if proc != target_procedure {
+            return None;
+        }
+        let handler: connection::CallHandler = std::sync::Arc::new(|payload: Value| {
+            Box::pin(async move { Ok(payload) })
+                as connection::BoxFuture<'static, Result<Value, String>>
+        });
+        Some(handler)
+    };
+
+    let serve_task = tokio::spawn(async move {
+        let result = provider_session
+            .serve_one_call(
+                lookup,
+                &provider_identity,
+                std::time::Duration::from_secs(15),
+            )
+            .await;
+        // The fix: close explicitly instead of letting provider_session
+        // drop when this task ends -- see this test's own doc comment.
+        provider_session
+            .close(
+                "normal",
+                Some("multi-thread provider test done"),
+                &provider_identity,
+            )
+            .await;
+        result
+    });
+
+    let response = caller_session
+        .call(
+            &procedure,
+            realm,
+            Value::text("hello"),
+            (now_ms() + 10_000) as i128,
+            &caller_identity,
+            std::time::Duration::from_secs(10),
+        )
+        .await
+        .expect("call should succeed");
+
+    let serve_result = serve_task.await.expect("serve task should not panic");
+    serve_result.expect("provider should serve the inbound CALL");
+
+    match response {
+        macula_rust::frame::CallResponse::Result { payload, .. } => {
+            assert_eq!(payload, Value::text("hello"));
+        }
+        other => panic!("expected a RESULT, got {other:?}"),
+    }
+
+    caller_session
+        .close(
+            "normal",
+            Some("multi-thread caller test done"),
+            &caller_identity,
+        )
+        .await;
+}
+
 /// Proves `call`/`serve_one_call` genuinely auto-publish `rpc.sent_v1`/
 /// `rpc.completed_v1` (caller) and `rpc.received_v1`/`rpc.replied_v1`
 /// (provider) — confirmed by an INDEPENDENT watcher session, not the

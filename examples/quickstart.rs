@@ -15,19 +15,18 @@
 //! fleet service, so this example never depends on anything else being
 //! deployed.
 //!
-//! The provider and caller futures are run via `tokio::join!`, not
-//! `tokio::spawn` -- found live 2026-09-05: spawning the provider's
-//! `serve_one_call` onto a separate task under `#[tokio::main]`'s
-//! default MULTI-THREADED runtime reproduced a genuine timeout on the
-//! caller side (`Recv(Timeout)`) despite the provider itself reporting
-//! `serve_one_call` succeeded (`Ok(())`) -- the RESULT frame it sent
-//! never reached the caller. `tokio::join!` (both futures polled
-//! cooperatively on the one task, no cross-thread handoff) reproduces
-//! cleanly every time. This crate's own live tests use `#[tokio::test]`,
-//! which defaults to the single-threaded `current_thread` runtime
-//! flavor, unlike `#[tokio::main]`'s default -- which is almost
-//! certainly why this hasn't surfaced there. Flagged upstream; this
-//! example works around it rather than assuming it away.
+//! The provider `Session` is moved back OUT of its `tokio::spawn` task
+//! and closed explicitly, rather than let it drop when the task ends --
+//! see [`macula_rust::connection::Session`]'s own doc for why: there is
+//! no `Drop` impl, so a bare drop gives quinn's send-scheduling no
+//! guarantee the RESULT this example just sent actually reached the
+//! peer before the connection is torn down. Confirmed live 2026-09-05:
+//! under `#[tokio::main]`'s default multi-threaded runtime, a spawned
+//! task with nothing after `serve_one_call().await` can complete (and
+//! drop the session) within microseconds of the write, losing the reply
+//! deterministically -- `tests/live_station.rs`'s own
+//! `unary_call_provider_round_trip_multi_thread_runtime` reproduces this
+//! and confirms the fix.
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use macula_rust::{
@@ -86,22 +85,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(handler)
     };
 
-    let serve_future =
-        provider_session.serve_one_call(lookup, &provider_identity, Duration::from_secs(10));
+    let serve_task = tokio::spawn(async move {
+        let result = provider_session
+            .serve_one_call(lookup, &provider_identity, Duration::from_secs(10))
+            .await;
+        // Close explicitly instead of letting provider_session drop when
+        // this task ends -- see this file's own doc comment.
+        provider_session
+            .close(
+                "normal",
+                Some("quickstart provider done"),
+                &provider_identity,
+            )
+            .await;
+        result
+    });
 
     let now_ms = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as i128;
-    let call_future = caller_session.call(
-        &procedure,
-        realm,
-        Value::Text("hello".into()),
-        now_ms + 5_000, // deadline_ms
-        &caller_identity,
-        Duration::from_secs(5),
-    );
+    let response = caller_session
+        .call(
+            &procedure,
+            realm,
+            Value::Text("hello".into()),
+            now_ms + 5_000, // deadline_ms
+            &caller_identity,
+            Duration::from_secs(5),
+        )
+        .await?;
 
-    let (serve_result, call_result) = tokio::join!(serve_future, call_future);
-    serve_result?;
-    let response = call_result?;
+    serve_task.await??;
+    caller_session
+        .close("normal", Some("quickstart caller done"), &caller_identity)
+        .await;
+
     println!("{response:?}");
     Ok(())
 }

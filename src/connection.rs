@@ -279,6 +279,17 @@ impl FrameStream {
 /// A completed, handshaked connection to a macula-station. Holds the
 /// open control stream (CONNECT/HELLO already exchanged) and the
 /// station's identity as verified by the HELLO frame's own signature.
+///
+/// **Always call [`close`](Self::close) before this goes out of scope,
+/// not just after your own logic is done with it -- especially right
+/// after a send-then-return call like [`publish`](Self::publish) or
+/// [`serve_one_call`](Self::serve_one_call).** There is deliberately no
+/// `Drop` impl (flushing outstanding QUIC stream data needs `.await`,
+/// which `Drop` can't do), so a bare drop tears down the connection
+/// immediately with no guarantee the last write actually reached the
+/// peer -- see [`close`](Self::close)'s own doc for the mechanism, and
+/// [`serve_one_call`](Self::serve_one_call)'s for the specific,
+/// confirmed-live way this bites a spawned provider task.
 pub struct Session {
     connection: quinn::Connection,
     control: FrameStream,
@@ -703,6 +714,25 @@ impl Session {
     /// }
     /// # }
     /// ```
+    ///
+    /// **Do not let this `Session` drop right after this call returns --
+    /// call [`close`](Self::close) on it explicitly first.** This is the
+    /// single most common way to lose the RESULT/ERROR you just sent:
+    /// `serve_one_call` returning `Ok(())` only means the reply was
+    /// handed to quinn's own send-scheduling machinery, exactly like
+    /// [`close`](Self::close)'s own doc explains for `write_all`/`finish`
+    /// -- a bare `Drop` (this type intentionally has none) does nothing
+    /// to wait for that to actually reach the peer before the underlying
+    /// resources are torn down, while `close` has a deliberate bounded
+    /// drain for precisely this. Confirmed live 2026-09-05 with the
+    /// single most natural-looking way to hit it: spawning this session
+    /// into its own `tokio::spawn` task with nothing following the
+    /// `.await` -- the task (and this `Session` with it) can complete
+    /// and drop within microseconds of the write, deterministically
+    /// under a multi-threaded runtime, losing the reply every time. Move
+    /// the session back out of the task and close it explicitly instead,
+    /// same as this crate's own `tests/live_station.rs` does for every
+    /// spawned provider role.
     pub async fn serve_one_call<L>(
         &mut self,
         lookup: L,

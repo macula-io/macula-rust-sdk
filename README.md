@@ -143,27 +143,42 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(handler)
     };
 
-    // Run concurrently via tokio::join!, not tokio::spawn — spawning the
-    // provider's serve_one_call onto a separate task under this
-    // function's default MULTI-THREADED runtime reproduced a genuine
-    // cross-thread timeout on the caller side; join! (both futures
-    // polled cooperatively on this one task) does not.
-    let serve_future =
-        provider_session.serve_one_call(lookup, &provider_identity, Duration::from_secs(10));
+    let serve_task = tokio::spawn(async move {
+        let result = provider_session
+            .serve_one_call(lookup, &provider_identity, Duration::from_secs(10))
+            .await;
+        // Close explicitly instead of letting provider_session drop when
+        // this task ends — see Session's own doc for why: there is no
+        // Drop impl, so a bare drop gives quinn's send-scheduling no
+        // guarantee the RESULT just sent actually reached the peer
+        // before the connection is torn down.
+        provider_session
+            .close(
+                "normal",
+                Some("quickstart provider done"),
+                &provider_identity,
+            )
+            .await;
+        result
+    });
 
     let now_ms = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as i128;
-    let call_future = caller_session.call(
-        &procedure,
-        realm,
-        Value::Text("hello".into()),
-        now_ms + 5_000, // deadline_ms
-        &caller_identity,
-        Duration::from_secs(5),
-    );
+    let response = caller_session
+        .call(
+            &procedure,
+            realm,
+            Value::Text("hello".into()),
+            now_ms + 5_000, // deadline_ms
+            &caller_identity,
+            Duration::from_secs(5),
+        )
+        .await?;
 
-    let (serve_result, call_result) = tokio::join!(serve_future, call_future);
-    serve_result?;
-    let response = call_result?;
+    serve_task.await??;
+    caller_session
+        .close("normal", Some("quickstart caller done"), &caller_identity)
+        .await;
+
     println!("{response:?}");
     Ok(())
 }
