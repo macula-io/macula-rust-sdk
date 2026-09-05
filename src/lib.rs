@@ -18,6 +18,7 @@ pub mod frame;
 pub mod identity;
 pub mod keystore;
 pub mod manifest;
+pub mod pool;
 pub mod stream;
 pub mod transport;
 pub mod ucan;

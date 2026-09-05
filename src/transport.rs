@@ -30,6 +30,13 @@ pub const DEFAULT_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(15);
 /// How to trust whatever certificate the station presents. Mirrors the
 /// three modes `macula_quic`'s own `build_client_config` supports — see
 /// `plans/PLAN_WIRE_PROTOCOL.md` §2.
+///
+/// `Clone, Copy`: every variant is plain data (a bare `[u8; 32]` or
+/// nothing at all), and `pool.rs` needs to redial a link — possibly
+/// under a DIFFERENT per-link trust than the pool's own configured
+/// default, see `pool::PooledLink`'s own doc — more than once over a
+/// link's lifetime (initial dial, every respawn).
+#[derive(Clone, Copy)]
 pub enum Trust {
     /// Pin the station's known Ed25519 pubkey (its macula NodeId). The
     /// right mode once a station's identity is known — DHT-resolved, or

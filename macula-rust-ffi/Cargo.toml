@@ -27,7 +27,7 @@ name = "uniffi-bindgen"
 path = "uniffi-bindgen.rs"
 
 [dependencies]
-macula-rust = { path = "..", version = "0.2" }
+macula-rust = { path = "..", version = "0.3" }
 uniffi = { version = "0.32", features = ["cli", "tokio"] }
 tokio = { version = "1", features = ["full"] }
 thiserror = "2"

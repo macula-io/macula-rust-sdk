@@ -13,6 +13,74 @@ usually touches both, but their version numbers don't move in lockstep.
 
 ## macula-rust
 
+### [0.3.0] - 2026-09-05
+
+#### Added
+
+- **`pool` module: opt-in multi-station connection pool.** This crate had no
+  concept of holding more than one connection at a time before this —
+  `Pool::connect(seeds, trust, identity, options)` now dials several
+  `Session`s concurrently and gives `Pool::call`/`Pool::publish` a choice of
+  which connected one to use. Same station-discovery/link-rotation design
+  already shipped in `macula-go` (v0.7.0) and `macula-dotnet` (v0.4.0), built
+  from scratch here rather than ported, since no pool existed to extend:
+  - `LinkSelection` (`Auto`/`FirstSuccess`/`Random`) orders `call`/`publish`'s
+    connected-links list before their own first-match/`replication_factor`
+    logic runs. `Auto` (the default) resolves to `FirstSuccess` when
+    discovery is off (zero behavior change for any existing single-`Session`
+    usage of this crate) or `Random` when it's on.
+  - `StationDiscoveryOptions` (opt-in, off by default): resolves
+    `hecate_stations.list_stations`'s realm via a DHT lookup and additively
+    adds links for what it finds, capped at `max_links`, no removal path for
+    a station simply missing from a later refresh. A discovery-added link
+    (never a bootstrap seed) that fails to dial 5 times in a row gives up
+    and frees its own slot for a different candidate at the next refresh —
+    an exception go's and dotnet's ports don't have.
+  - **Call/Publish only — Subscribe is deliberately not pooled.** `Session`'s
+    control stream can't safely serve an in-flight Call's response-wait and
+    an ongoing Subscribe EVENT loop at once; a caller needing Subscribe
+    still uses the existing bare `Session::subscribe`/`run_subscriber`
+    directly, unpooled, exactly as before this module existed.
+  - Per-link trust selection: a discovered station with no `hostname` (only
+    a bare-IP `host_advertised`) but a `node_id` dials under
+    `Trust::Pinned(node_id)` instead of being skipped outright, closing a
+    real gap the go/dotnet ports still carry (they skip every hostname-less
+    row under `WebPki`, which can never validate a bare IP). `hostname`
+    still wins unconditionally whenever present, so a normal
+    Let's-Encrypt-backed station always dials `WebPki` regardless of
+    whether it also has a `node_id` — checked explicitly against a live-
+    verified precedent (`macula-cam2me`'s Android client) that got this
+    priority order wrong for the common case before this crate's own design
+    was finalized.
+  - Verified against the real production mesh fleet, not just unit tests:
+    single-seed connect+call, discovery finding and connecting additional
+    real stations, `Random` selection actually spreading calls across two
+    independently-dialed stations.
+  - Two rounds of adversarial review against the full diff found and fixed:
+    a `StationDiscoveryOptions::max_links` accounting bug that counted
+    bootstrap seeds against the discovery budget (silently disabling
+    discovery forever for any pool started with `>= max_links` bootstrap
+    seeds — a realistic shape given this workspace's own 3-seed-minimum
+    convention); a race where two concurrent `call`/`publish` failures on
+    the same dead link could each independently spawn a redial task,
+    leaking a connection and double-counting the give-up failure counter
+    (fixed with a compare-exchange claim guard, its correctness verified to
+    depend on `tokio::sync::Mutex`'s FIFO ordering — now documented
+    explicitly); and a shutdown-ordering gap where a task mid-dial (no
+    cooperation point inside `connection::connect`, whose own handshake
+    timeout is up to 30s) could complete after `Pool::close()` already
+    drained and closed everything, leaking a live session or resurrecting a
+    link post-close (fixed with a `JoinSet` that hard-aborts and awaits
+    every background task before the drain runs).
+
+#### Changed
+
+- `transport::Trust` now derives `Clone, Copy` (previously move-only) — a
+  pool link may redial under a per-link trust that differs from the pool's
+  own configured default (see above), which needs more than one dial per
+  `Trust` value over a link's lifetime. All three variants are plain data
+  with no invariant broken by permitting duplication.
+
 ### [0.2.4] - 2026-09-05
 
 #### Fixed
