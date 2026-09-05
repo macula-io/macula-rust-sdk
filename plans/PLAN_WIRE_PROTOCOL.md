@@ -640,7 +640,16 @@ policies; everything else means "retry, differently."
 
 ## 10. Rust crate reuse — what's already there vs. what needs writing
 
-Confirmed from the NIF `Cargo.toml`s in `native/*`:
+Confirmed from the NIF `Cargo.toml`s in `native/*`, as observed at this
+project's inception (2026-08-28) — this table describes `macula-io/macula`'s
+own native NIFs, not this crate. `macula-rust`'s own `Cargo.toml` is the only
+authoritative source for its current dependency versions, and has since
+diverged from some of the rows below via its own dependency-refresh passes
+(e.g. `ed25519-dalek` 3.0, `rcgen` 0.14 as a dev-only dependency here vs.
+`native/macula_quic`'s still-current production `rcgen 0.13` pin) — nothing
+wrong with that divergence (this crate's `rcgen` only ever generates
+synthetic test certs, never anything the Erlang side parses or verifies),
+just don't read this table as this crate's current manifest.
 
 | Concern | Existing Rust crate (already a macula dependency) | Reuse directly? |
 |---|---|---|

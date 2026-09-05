@@ -81,7 +81,7 @@ async fn serve_until_procedure(
     Ok(())
 }
 
-fn self_issued_realm_ca() -> (Vec<u8>, rcgen::Certificate, RcgenKeyPair) {
+fn self_issued_realm_ca() -> (Vec<u8>, rcgen::Issuer<'static, RcgenKeyPair>) {
     let key_pair = RcgenKeyPair::generate_for(&rcgen::PKCS_ED25519).expect("ca keygen");
     let mut params = CertificateParams::new(Vec::<String>::new()).expect("ca params");
     let mut dn = DistinguishedName::new();
@@ -93,7 +93,7 @@ fn self_issued_realm_ca() -> (Vec<u8>, rcgen::Certificate, RcgenKeyPair) {
     params.not_after = time::OffsetDateTime::now_utc() + time::Duration::hours(1);
     let cert = params.self_signed(&key_pair).expect("ca self-sign");
     let pem = cert.pem().into_bytes();
-    (pem, cert, key_pair)
+    (pem, rcgen::Issuer::new(params, key_pair))
 }
 
 /// RFC 8410 SubjectPublicKeyInfo DER for a raw 32-byte Ed25519 pubkey —
@@ -109,8 +109,7 @@ fn ed25519_spki_der(pubkey: [u8; 32]) -> Vec<u8> {
 }
 
 fn issue_leaf(
-    ca: &rcgen::Certificate,
-    ca_key: &RcgenKeyPair,
+    ca_issuer: &rcgen::Issuer<'static, RcgenKeyPair>,
     advertiser_pub: [u8; 32],
     org: &str,
 ) -> Vec<u8> {
@@ -124,7 +123,7 @@ fn issue_leaf(
     params.not_before = time::OffsetDateTime::now_utc() - time::Duration::hours(1);
     params.not_after = time::OffsetDateTime::now_utc() + time::Duration::hours(1);
     let cert = params
-        .signed_by(&subject_spki, ca, ca_key)
+        .signed_by(&subject_spki, ca_issuer)
         .expect("leaf signed_by");
     cert.der().to_vec()
 }
@@ -154,7 +153,7 @@ fn pem_bundle(ders: &[Vec<u8>]) -> Vec<u8> {
 #[tokio::test]
 #[ignore = "requires network access to a live macula-station"]
 async fn cert_chain_direct_dial_round_trip_through_the_ffi_surface() {
-    let (ca_pem, ca_cert, ca_key) = self_issued_realm_ca();
+    let (ca_pem, ca_issuer) = self_issued_realm_ca();
 
     let provider_id = FfiKeyPair::generate();
     // Distinct from caller_id -- call_direct_with_cert_chain dials the
@@ -174,12 +173,7 @@ async fn cert_chain_direct_dial_round_trip_through_the_ffi_surface() {
     let realm = vec![0u8; 32];
     let org = "live-ffi-test-org";
 
-    let leaf_der = issue_leaf(
-        &ca_cert,
-        &ca_key,
-        provider_id.node_id().try_into().unwrap(),
-        org,
-    );
+    let leaf_der = issue_leaf(&ca_issuer, provider_id.node_id().try_into().unwrap(), org);
     let cert_chain_pem = pem_bundle(&[leaf_der]);
 
     let provider = FfiSession::connect(

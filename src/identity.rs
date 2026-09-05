@@ -1,15 +1,17 @@
 //! Ed25519 identity and the S/Kademlia crypto puzzle, matching macula's
 //! own `macula_identity.erl` (`macula-io/macula`).
 //!
-//! Uses `ed25519-dalek` 2.1 with the `rand_core` feature — the exact same
-//! crate and version macula's own `macula_crypto_nif` Rust NIF already
-//! wraps in production, not a separate crypto implementation. Every
-//! keypair/sign/verify test in this module is checked against fixtures
-//! captured directly from the real `crypto:generate_key/2` and
-//! `crypto:sign/4` in `macula-io/macula`'s own `rebar3 shell`, not just
-//! hand-derived expectations — Ed25519 signing is deterministic per
-//! RFC 8032, so the same seed and message must produce byte-identical
-//! signatures across implementations if both are correct.
+//! Uses `ed25519-dalek` (with the `rand_core` feature) — the same crate
+//! macula's own `macula_crypto_nif` Rust NIF already wraps in production,
+//! not a separate crypto implementation, though the two are not required
+//! to track the same `ed25519-dalek` version: Ed25519 signing is
+//! deterministic per RFC 8032, so a byte-identical seed/message pair must
+//! produce a byte-identical signature across any correct implementation,
+//! any version. Every keypair/sign/verify test in this module is checked
+//! against fixtures captured directly from the real `crypto:generate_key/2`
+//! and `crypto:sign/4` in `macula-io/macula`'s own `rebar3 shell`, not just
+//! hand-derived expectations — which is exactly what lets this crate move
+//! ahead of the NIF's own `ed25519-dalek` pin without losing that proof.
 //!
 //! A macula NodeId **is** an Ed25519 public key (32 bytes) — there is no
 //! separate account/identity layer underneath it. Identities are
@@ -36,7 +38,6 @@ use std::io;
 use std::path::Path;
 
 use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
-use rand::rngs::OsRng;
 use sha2::{Digest, Sha256};
 
 use crate::keystore::{KeyStore, KeyStoreError};
@@ -59,8 +60,23 @@ impl KeyPair {
     /// Prefer [`generate_with_puzzle`](Self::generate_with_puzzle) unless
     /// you specifically need an unhardened identity (e.g. a unit test
     /// that never dials a real station).
+    ///
+    /// Seeded directly from the OS RNG (`rand::rngs::SysRng`), unwrapped
+    /// via [`rand::rand_core::UnwrapErr`] to make it panic rather than
+    /// return a `Result` on the rare case the OS entropy syscall itself
+    /// fails — the exact same fail-fast behavior `rand` 0.8's `OsRng` had
+    /// implicitly, since `rand` 0.9 split `SysRng` into a fallible-only
+    /// type that no longer satisfies `SigningKey::generate`'s infallible
+    /// `CryptoRng` bound on its own. This is the pattern
+    /// `ed25519-dalek` 3.0's own docs use for this exact call
+    /// (`ed25519_dalek::SigningKey::generate`'s doc example), not
+    /// `rand::rng()`/`ThreadRng` — a userspace CSPRNG that, since rand
+    /// 0.9, is explicitly documented as **not** reseeding on `fork()`,
+    /// which would be a real (if narrow) identity-collision risk for a
+    /// long-lived process that forks after generating a key. Direct OS
+    /// randomness has no such state to reuse across a fork.
     pub fn generate() -> Self {
-        let signing_key = SigningKey::generate(&mut OsRng);
+        let signing_key = SigningKey::generate(&mut rand::rand_core::UnwrapErr(rand::rngs::SysRng));
         Self { signing_key }
     }
 

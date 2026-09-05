@@ -3,7 +3,7 @@ members = ["macula-rust-ffi"]
 
 [package]
 name = "macula-rust"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 rust-version = "1.85"
 authors = ["Macula <raf.lefever@erlef.org>"]
@@ -18,13 +18,13 @@ unsafe_code = "forbid"
 all = { level = "deny", priority = -1 }
 
 [dependencies]
-ed25519-dalek = { version = "2.1", features = ["rand_core"] }
-rand = "0.8"
-sha2 = "0.10"
+ed25519-dalek = { version = "3.0", features = ["rand_core"] }
+rand = "0.10"
+sha2 = "0.11"
 quinn = "0.11"
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
-webpki-roots = "0.26"
-x509-parser = "0.16"
+webpki-roots = "1.0"
+x509-parser = "0.18"
 # cert_chain.rs: pure X.509 path validation (no hostname/SAN check, unlike
 # rustls's own ServerCertVerifier machinery in cert.rs) to a caller-supplied
 # realm CA — already transitively pulled in by rustls, declared directly
@@ -38,7 +38,7 @@ blake3 = "1.5"
 # UCAN-spec crate either, only these same generic primitives).
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-base64 = "0.22"
+base64 = "0.23"
 # keystore.rs: platform-native secure storage for a persisted seed
 # (Keychain via Security.framework on macOS/iOS, Secret Service via D-Bus
 # on Linux, Credential Manager on Windows, Keystore via JNI on Android —
@@ -74,7 +74,7 @@ tempfile = "3"
 # constructed from a raw advertiser Ed25519 pubkey rather than a freshly
 # rcgen-generated one (the leaf must bind the SAME key that signed the
 # advertisement) — SubjectPublicKeyInfo::from_der needs this feature.
-rcgen = { version = "0.13", default-features = false, features = ["pem", "ring", "x509-parser"] }
+rcgen = { version = "0.14", default-features = false, features = ["pem", "ring", "x509-parser"] }
 # Test-only, cert_chain.rs's own tests: rcgen's CertificateParams
 # not_before/not_after fields take this crate's OffsetDateTime directly;
 # not re-exported by rcgen, so declared explicitly (already transitively

@@ -202,7 +202,7 @@ mod tests {
     use crate::dht;
     use crate::identity::KeyPair;
 
-    fn test_ca() -> (Vec<u8>, rcgen::Certificate, RcgenKeyPair) {
+    fn test_ca() -> (Vec<u8>, rcgen::Issuer<'static, RcgenKeyPair>) {
         let key_pair = RcgenKeyPair::generate_for(&rcgen::PKCS_ED25519).expect("ca keygen");
         let mut params = CertificateParams::new(Vec::<String>::new()).expect("ca params");
         let mut dn = DistinguishedName::new();
@@ -214,12 +214,11 @@ mod tests {
         params.not_after = time::OffsetDateTime::now_utc() + time::Duration::hours(24);
         let cert = params.self_signed(&key_pair).expect("ca self-sign");
         let pem = cert.pem().into_bytes();
-        (pem, cert, key_pair)
+        (pem, rcgen::Issuer::new(params, key_pair))
     }
 
     fn test_leaf(
-        ca: &rcgen::Certificate,
-        ca_key: &RcgenKeyPair,
+        ca_issuer: &rcgen::Issuer<'static, RcgenKeyPair>,
         advertiser_pub: [u8; 32],
         org: &str,
         not_after: time::OffsetDateTime,
@@ -234,7 +233,7 @@ mod tests {
         params.not_before = time::OffsetDateTime::now_utc() - time::Duration::hours(1);
         params.not_after = not_after;
         let cert = params
-            .signed_by(&subject_spki, ca, ca_key)
+            .signed_by(&subject_spki, ca_issuer)
             .expect("leaf signed_by");
         cert.der().to_vec()
     }
@@ -280,11 +279,10 @@ mod tests {
 
     #[test]
     fn valid_chain_verifies_and_authorizes() {
-        let (ca_pem, ca_cert, ca_key) = test_ca();
+        let (ca_pem, ca_issuer) = test_ca();
         let (advertiser, station) = advertiser_and_station();
         let leaf_der = test_leaf(
-            &ca_cert,
-            &ca_key,
+            &ca_issuer,
             advertiser.node_id(),
             "acme-corp",
             time::OffsetDateTime::now_utc() + time::Duration::hours(1),
@@ -315,7 +313,7 @@ mod tests {
             Duration::from_secs(3600),
         );
         let rec = dht::sign(rec, &advertiser);
-        let (ca_pem, _, _) = test_ca();
+        let (ca_pem, _) = test_ca();
 
         assert_eq!(
             verify_advertisement_cert_chain(&ca_pem, &rec, "acme-corp"),
@@ -325,11 +323,10 @@ mod tests {
 
     #[test]
     fn bad_envelope_signature_is_checked_before_the_chain() {
-        let (ca_pem, ca_cert, ca_key) = test_ca();
+        let (ca_pem, ca_issuer) = test_ca();
         let (advertiser, station) = advertiser_and_station();
         let leaf_der = test_leaf(
-            &ca_cert,
-            &ca_key,
+            &ca_issuer,
             advertiser.node_id(),
             "acme-corp",
             time::OffsetDateTime::now_utc() + time::Duration::hours(1),
@@ -352,14 +349,13 @@ mod tests {
 
     #[test]
     fn leaf_key_not_matching_the_signer_is_rejected() {
-        let (ca_pem, ca_cert, ca_key) = test_ca();
+        let (ca_pem, ca_issuer) = test_ca();
         let (advertiser, station) = advertiser_and_station();
         let other = KeyPair::generate();
         // Leaf binds `other`'s key, but the advertisement is signed by
         // `advertiser` -- the chain does not belong to this record's signer.
         let leaf_der = test_leaf(
-            &ca_cert,
-            &ca_key,
+            &ca_issuer,
             other.node_id(),
             "acme-corp",
             time::OffsetDateTime::now_utc() + time::Duration::hours(1),
@@ -381,11 +377,10 @@ mod tests {
 
     #[test]
     fn wrong_org_is_rejected_after_a_valid_chain() {
-        let (ca_pem, ca_cert, ca_key) = test_ca();
+        let (ca_pem, ca_issuer) = test_ca();
         let (advertiser, station) = advertiser_and_station();
         let leaf_der = test_leaf(
-            &ca_cert,
-            &ca_key,
+            &ca_issuer,
             advertiser.node_id(),
             "acme-corp",
             time::OffsetDateTime::now_utc() + time::Duration::hours(1),
@@ -407,11 +402,10 @@ mod tests {
 
     #[test]
     fn expired_leaf_is_untrusted() {
-        let (ca_pem, ca_cert, ca_key) = test_ca();
+        let (ca_pem, ca_issuer) = test_ca();
         let (advertiser, station) = advertiser_and_station();
         let leaf_der = test_leaf(
-            &ca_cert,
-            &ca_key,
+            &ca_issuer,
             advertiser.node_id(),
             "acme-corp",
             time::OffsetDateTime::now_utc() - time::Duration::hours(1),
@@ -433,12 +427,11 @@ mod tests {
 
     #[test]
     fn chain_signed_by_a_different_ca_is_untrusted() {
-        let (_, ca_cert, ca_key) = test_ca();
-        let (other_ca_pem, _, _) = test_ca();
+        let (_, ca_issuer) = test_ca();
+        let (other_ca_pem, _) = test_ca();
         let (advertiser, station) = advertiser_and_station();
         let leaf_der = test_leaf(
-            &ca_cert,
-            &ca_key,
+            &ca_issuer,
             advertiser.node_id(),
             "acme-corp",
             time::OffsetDateTime::now_utc() + time::Duration::hours(1),
@@ -460,7 +453,7 @@ mod tests {
 
     #[test]
     fn undecodable_chain_is_reported_distinctly() {
-        let (ca_pem, _, _) = test_ca();
+        let (ca_pem, _) = test_ca();
         let (advertiser, station) = advertiser_and_station();
         let rec = dht::new_procedure_advertisement_with_cert_chain(
             advertiser.node_id(),
