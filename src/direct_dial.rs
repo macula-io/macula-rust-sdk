@@ -403,7 +403,15 @@ pub async fn call_with_ucan(
 
     let deadline_ms = now_ms() + timeout.as_millis() as i128;
     let result = target
-        .call_with_ucan(procedure, realm, payload, deadline_ms, id, timeout, ucan_token)
+        .call_with_ucan(
+            procedure,
+            realm,
+            payload,
+            deadline_ms,
+            id,
+            timeout,
+            ucan_token,
+        )
         .await
         .map_err(CallError::Call);
     target.close("normal", None, id).await;

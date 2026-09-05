@@ -83,9 +83,15 @@ async fn ucan_gated_capability_reachable_only_through_call_with_ucan() {
     let mut provider = connection::connect(STATION_HOST, STATION_PORT, Trust::WebPki, &provider_id)
         .await
         .expect("provider handshake should succeed");
-    direct_dial::advertise_direct(&mut provider, &provider_id, realm, &procedure, Duration::from_secs(3600))
-        .await
-        .expect("advertise_direct should succeed");
+    direct_dial::advertise_direct(
+        &mut provider,
+        &provider_id,
+        realm,
+        &procedure,
+        Duration::from_secs(3600),
+    )
+    .await
+    .expect("advertise_direct should succeed");
 
     let required_policy = ucan::Policy::required(issuer_id.node_id());
     let echo: CallHandler = std::sync::Arc::new(|payload: Value| {
@@ -157,7 +163,9 @@ async fn ucan_gated_capability_reachable_only_through_call_with_ucan() {
     .expect("plain call should get a BOLT#4 response, not a transport error");
     match resp {
         CallResponse::Error { .. } => {}
-        CallResponse::Result { .. } => panic!("plain call against a gated procedure unexpectedly SUCCEEDED"),
+        CallResponse::Result { .. } => {
+            panic!("plain call against a gated procedure unexpectedly SUCCEEDED")
+        }
     }
     println!("OBSERVED: plain call against a gated procedure was refused, as expected");
     let mut provider = serve1
@@ -192,9 +200,13 @@ async fn ucan_gated_capability_reachable_only_through_call_with_ucan() {
     .expect("call_with_ucan (wrong issuer) should get a BOLT#4 response, not a transport error");
     match resp {
         CallResponse::Error { .. } => {}
-        CallResponse::Result { .. } => panic!("call_with_ucan with a wrong-issuer token unexpectedly SUCCEEDED"),
+        CallResponse::Result { .. } => {
+            panic!("call_with_ucan with a wrong-issuer token unexpectedly SUCCEEDED")
+        }
     }
-    println!("OBSERVED: call_with_ucan with a token from the wrong issuer was refused, as expected");
+    println!(
+        "OBSERVED: call_with_ucan with a token from the wrong issuer was refused, as expected"
+    );
     let mut provider = serve2
         .await
         .expect("serve task #2 should not panic")
@@ -222,10 +234,13 @@ async fn ucan_gated_capability_reachable_only_through_call_with_ucan() {
         valid_token,
     );
     let (call_result, serve_result) = tokio::join!(call_fut, serve3);
-    let resp = call_result.expect("call_with_ucan (authorized) should succeed -- this is the fix under test");
+    let resp = call_result
+        .expect("call_with_ucan (authorized) should succeed -- this is the fix under test");
     match resp {
         CallResponse::Result { payload, .. } => {
-            let echoed = payload.get("echo").expect("reply payload missing echo field");
+            let echoed = payload
+                .get("echo")
+                .expect("reply payload missing echo field");
             assert_eq!(*echoed, Value::text("hello gated direct-dial"));
         }
         CallResponse::Error { code, name, .. } => {
