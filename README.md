@@ -148,7 +148,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // function's default MULTI-THREADED runtime reproduced a genuine
     // cross-thread timeout on the caller side; join! (both futures
     // polled cooperatively on this one task) does not.
-    let serve_future = provider_session.serve_one_call(lookup, &provider_identity, Duration::from_secs(10));
+    let serve_future =
+        provider_session.serve_one_call(lookup, &provider_identity, Duration::from_secs(10));
 
     let now_ms = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as i128;
     let call_future = caller_session.call(

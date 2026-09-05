@@ -86,7 +86,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(handler)
     };
 
-    let serve_future = provider_session.serve_one_call(lookup, &provider_identity, Duration::from_secs(10));
+    let serve_future =
+        provider_session.serve_one_call(lookup, &provider_identity, Duration::from_secs(10));
 
     let now_ms = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as i128;
     let call_future = caller_session.call(
