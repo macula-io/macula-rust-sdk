@@ -3,13 +3,17 @@ members = ["macula-rust-ffi"]
 
 [package]
 name = "macula-rust"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2021"
 rust-version = "1.85"
 authors = ["Macula <raf.lefever@erlef.org>"]
 description = "Rust port of macula's SDK (client/leaf) wire protocol — mobile first, not mobile-only. See plans/PLAN_WIRE_PROTOCOL.md."
 license = "Apache-2.0"
 repository = "https://github.com/macula-io/macula-rust"
+homepage = "https://github.com/macula-io/macula-rust"
+readme = "README.md"
+keywords = ["mesh-network", "quic", "p2p", "ed25519", "decentralized"]
+categories = ["network-programming", "cryptography"]
 
 [lints.rust]
 unsafe_code = "forbid"
