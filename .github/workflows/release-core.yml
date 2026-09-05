@@ -53,10 +53,11 @@ jobs:
       # exists there. A static token is the only mechanism that can
       # actually perform that first release from CI at all.
       #
-      # Once macula-rust has a v0.2.x (or later) release published this
-      # way: add a Trusted Publisher for macula-io/macula-rust + this
-      # workflow file in the crate's crates.io settings, replace this
-      # step with `rust-lang/crates-io-auth-action@v1` (permissions:
+      # macula-rust v0.2.3 published this way 2026-09-05 -- the migration
+      # path once someone wants to spend the time on it: add a Trusted
+      # Publisher for macula-io/macula-rust + this workflow file in the
+      # crate's crates.io settings, replace this step with
+      # `rust-lang/crates-io-auth-action@v1` (permissions:
       # id-token: write) feeding its `token` output to
       # CARGO_REGISTRY_TOKEN the same way, then delete the CRATES_IO_TOKEN
       # repo secret -- no code reason to keep a long-lived token around

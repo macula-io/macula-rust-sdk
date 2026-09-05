@@ -1,13 +1,16 @@
 [package]
 name = "macula-rust-ffi"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
 rust-version = "1.85"
 authors = ["Macula <raf.lefever@erlef.org>"]
 description = "UniFFI mobile (Kotlin/Swift) bindings for macula-rust. Wraps the core crate; adds nothing to it."
 license = "Apache-2.0"
 repository = "https://github.com/macula-io/macula-rust"
-publish = false
+homepage = "https://github.com/macula-io/macula-rust"
+readme = "../README.md"
+keywords = ["uniffi", "mobile", "mesh-network", "quic", "ffi"]
+categories = ["network-programming", "cryptography"]
 
 [lints.rust]
 unsafe_code = "forbid"
@@ -24,7 +27,7 @@ name = "uniffi-bindgen"
 path = "uniffi-bindgen.rs"
 
 [dependencies]
-macula-rust = { path = ".." }
+macula-rust = { path = "..", version = "0.2" }
 uniffi = { version = "0.32", features = ["cli", "tokio"] }
 tokio = { version = "1", features = ["full"] }
 thiserror = "2"

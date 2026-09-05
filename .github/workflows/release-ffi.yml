@@ -1,0 +1,58 @@
+name: Release macula-rust-ffi to crates.io
+
+# Distinct tag prefix from release-core.yml's plain "v*" (macula-rust and
+# macula-rust-ffi are independently versioned -- see CHANGELOG.md's own
+# note on this -- so one tag namespace can't unambiguously say which
+# package's version it's naming).
+on:
+  push:
+    tags: ["ffi-v*"]
+
+jobs:
+  publish:
+    name: publish to crates.io
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Extract version from tag
+        id: version
+        run: echo "VERSION=${GITHUB_REF_NAME#ffi-v}" >> "$GITHUB_OUTPUT"
+
+      - name: Validate version matches macula-rust-ffi/Cargo.toml
+        run: |
+          PACKAGE_VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' macula-rust-ffi/Cargo.toml | head -1)
+          if [ "$PACKAGE_VERSION" != "${{ steps.version.outputs.VERSION }}" ]; then
+            echo "::error::Tag version (${{ steps.version.outputs.VERSION }}) doesn't match macula-rust-ffi/Cargo.toml version ($PACKAGE_VERSION)"
+            exit 1
+          fi
+
+      # Same reasoning as release-core.yml: rebuild+retest from scratch
+      # (a tag push is a separate event from the branch push ci.yml
+      # already validated), no --locked anywhere (no committed Cargo.lock
+      # in this repo).
+      - run: cargo build --workspace --all-targets
+      - run: cargo test --workspace --all-features
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - run: cargo fmt --all -- --check
+
+      # Dry-run needs no registry auth -- it only verifies metadata,
+      # compresses the package, and checks the result, never uploads.
+      # This is also the step that proves macula-rust-ffi's `macula-rust
+      # = { path = "..", version = "0.2" }` dependency actually resolves
+      # against the REAL published macula-rust on crates.io, not just the
+      # local workspace path -- `cargo publish` downloads and rebuilds
+      # against the registry version during verification, confirmed
+      # locally before this workflow existed.
+      - name: Dry-run publish (catches packaging issues before the real one)
+        run: cargo publish --dry-run -p macula-rust-ffi
+
+      # Same CRATES_IO_TOKEN as release-core.yml (one secret, both
+      # workflows) -- see that workflow's own comment for why this is a
+      # static token rather than OIDC Trusted Publishing, and the
+      # migration path once both crates exist on crates.io.
+      - name: Publish to crates.io
+        run: cargo publish -p macula-rust-ffi
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}

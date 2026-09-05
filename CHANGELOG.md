@@ -1,18 +1,25 @@
 # Changelog
 
-All notable changes to `macula-rust` are documented here. Format loosely
-follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this crate
-does not yet promise strict [SemVer](https://semver.org/) stability
+All notable changes to this workspace's two published crates —
+[`macula-rust`](https://crates.io/crates/macula-rust) (the core SDK) and
+[`macula-rust-ffi`](https://crates.io/crates/macula-rust-ffi) (its UniFFI
+Kotlin/Swift bindings) — are documented here, in two sections below. Format
+loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
+neither crate yet promises strict [SemVer](https://semver.org/) stability
 (pre-1.0), so a minor version bump may include a small breaking change where
-one was the right call.
+one was the right call. The two crates are versioned independently (they
+always have been, even before either was published) — a given date's work
+usually touches both, but their version numbers don't move in lockstep.
 
-## [0.2.3] - 2026-09-05
+## macula-rust
+
+### [0.2.3] - 2026-09-05
 
 A full adversarial security/correctness sweep of the whole crate, requested
 independent of the dependency refresh above — every fix here closes a way a
 malicious or malformed peer could crash or hang a node, not a feature change.
 
-### Fixed
+#### Fixed
 
 - **CBOR decoder: unbounded recursion.** `cbor::decode` had no nesting-depth
   limit; a single crafted frame well under the 16 MiB wire-frame cap could
@@ -42,20 +49,20 @@ malicious or malformed peer could crash or hang a node, not a feature change.
   (`FromWireError::ZeroChunkSize` /
   `FromWireError::InconsistentChunkCount`).
 
-### Added
+#### Added
 
 - `cbor::DecodeError::NestingTooDeep`, `cbor::MAX_NESTING_DEPTH` (`pub`).
 - `manifest::FromWireError::ZeroChunkSize`,
   `manifest::FromWireError::InconsistentChunkCount`.
 
-## [0.2.2] - 2026-09-05
+### [0.2.2] - 2026-09-05
 
-### Added
+#### Added
 
 - `direct_dial::call_with_ucan` — direct-dial calls can now carry a UCAN,
   matching the gated-serving support `serve_one_call_gated` already had.
 
-### Changed
+#### Changed
 
 - Full dependency refresh: every dependency bumped to its latest release,
   including 7 across a semver-major line (`ed25519-dalek` 2→3, `rand`
@@ -70,19 +77,19 @@ malicious or malformed peer could crash or hang a node, not a feature change.
   convention — a consuming project's own lock governs what actually
   builds).
 
-### Fixed
+#### Fixed
 
 - `direct_dial::discovery_uri` now uses uppercase hex to match the live
   fleet's own DHT record encoding.
 
-## [0.2.0] - 2026-08-30
+### [0.2.0] - 2026-08-30
 
 Renamed from `macula-rust-sdk`/`macula-rust-sdk-ffi` to `macula-rust`/
 `macula-rust-ffi`. Major feature push: direct-dial as a first-class path
 alongside the advertise-gossip one, UCAN authorization, and org/realm
 cert-chain verification.
 
-### Added
+#### Added
 
 - Direct-dial: `direct_dial::{resolve,call,advertise_direct}` — reach a
   service without depending on advertise-gossip propagation, plus
@@ -106,7 +113,7 @@ cert-chain verification.
 - FFI coverage extended to match: direct-dial, UCAN, cert-chain,
   streaming/content direct-dial, `KeyStore`.
 
-### Fixed
+#### Fixed
 
 - `publisher_sig` now implemented correctly; a `Session::close` data-loss
   race fixed.
@@ -116,7 +123,7 @@ cert-chain verification.
   traced to the same premature-`Session`-drop race in the test harness (not
   an SDK defect).
 
-## [0.1.0] - 2026-08-28
+### [0.1.0] - 2026-08-28
 
 Initial implementation, built and live-verified against a real production
 macula-station in a single day. Every wire primitive listed here was
@@ -124,7 +131,7 @@ confirmed against the real fleet, not just unit-tested — see each module's
 own differential test fixtures (captured directly from the Erlang reference
 via `rebar3 shell`).
 
-### Added
+#### Added
 
 - Deterministic CBOR codec (`cbor`) — a from-scratch transcription of
   macula's own canonical wire codec, verified byte-for-byte against the
@@ -152,3 +159,66 @@ via `rebar3 shell`).
 [0.2.2]: https://github.com/macula-io/macula-rust/compare/v0.2.1...v0.2.2
 [0.2.0]: https://github.com/macula-io/macula-rust/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/macula-io/macula-rust/releases/tag/v0.1.0
+
+## macula-rust-ffi
+
+UniFFI (Kotlin + Swift) bindings over `macula-rust`. Wraps the core crate;
+adds no wire-protocol logic of its own — every dated entry below tracks
+this crate's own FFI-surface coverage of whatever `macula-rust` shipped the
+same day, not a separate feature set. Independently versioned from the core
+crate since day one (this crate started at 0.1.0 the same day the core crate
+did, but the two have moved at different paces ever since).
+
+### [ffi-0.3.1] - 2026-09-05
+
+First publish to crates.io, alongside `macula-rust` v0.2.3 (whose security
+fixes this crate's compiled output includes, being a normal dependent).
+
+#### Changed
+
+- Dev-dependency `rcgen` 0.13 → 0.14 (test-only cert fixtures in
+  `tests/live_cert_chain_direct_dial.rs`; no change to this crate's own
+  public API).
+- `macula-rust` dependency now expressed as a real crates.io version
+  requirement (`"0.2"`) alongside its workspace path, rather than a bare
+  path — required to be publishable at all.
+
+### [ffi-0.3.0] - 2026-08-30
+
+Renamed from `macula-rust-sdk-ffi` to `macula-rust-ffi`, alongside the core
+crate's own rename. FFI coverage extended to match the core crate's biggest
+feature push (see `macula-rust`'s own 0.2.0 entry above): direct-dial, UCAN,
+cert-chain, streaming/content direct-dial, the supervised pubsub pair, and
+the overridable `KeyStore`.
+
+#### Added
+
+- `FfiSession` gained `resolveDirect`/`callDirect`/`advertiseDirect` (plus
+  cert-chain-authorized variants) and streaming/content direct-dial.
+- UCAN support: `FfiSession.callWithUcan`/`serveOneCallGated`.
+- Cert-chain verification exposed at the FFI boundary.
+- Supervised pubsub pair (`runPublisher`/`runSubscriber`).
+- `KeyStore` trait exposed: `FfiKeyPair.saveToKeystore`/`loadFromKeystore`.
+
+### [ffi-0.2.0] - 2026-08-29
+
+#### Added
+
+- `FfiValue` gained `List`/`Map` variants (as `Items`/`Fields`), closing a
+  deferred recursive-enum gap — the mobile bindings can now round-trip any
+  shape the core crate's own `cbor::Value` can, not just scalars.
+
+### [ffi-0.1.0] - 2026-08-28
+
+Initial UniFFI bindings, built the same day as the core crate. Covers every
+primitive the core crate had by end of day: `FfiSession.connect`/`call`/
+`serveOneCall` (unary RPC, provider role via `FfiCallHandler` — a
+foreign-implemented async trait, not a closure), `publish`/`subscribe`,
+`contentPut`/`contentGet`, `streamOpen`/`FfiStream`/`acceptStream`
+(streaming RPC, both roles), and pubkey-pinned (`FfiTrust.Pinned`) plus
+WebPKI trust.
+
+[ffi-0.3.1]: https://github.com/macula-io/macula-rust/compare/ffi-v0.3.0...ffi-v0.3.1
+[ffi-0.3.0]: https://github.com/macula-io/macula-rust/compare/ffi-v0.2.0...ffi-v0.3.0
+[ffi-0.2.0]: https://github.com/macula-io/macula-rust/compare/ffi-v0.1.0...ffi-v0.2.0
+[ffi-0.1.0]: https://github.com/macula-io/macula-rust/releases/tag/ffi-v0.1.0
