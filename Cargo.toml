@@ -3,7 +3,7 @@ members = ["macula-rust-ffi"]
 
 [package]
 name = "macula-rust"
-version = "0.2.3"
+version = "0.2.4"
 edition = "2021"
 rust-version = "1.85"
 authors = ["Macula <raf.lefever@erlef.org>"]
@@ -48,8 +48,16 @@ base64 = "0.23"
 # on Linux, Credential Manager on Windows, Keystore via JNI on Android —
 # each selected automatically per target by keyring's own Cargo.toml
 # target-cfg blocks, not by any feature switching we do here). `v1`
-# (default) already covers macOS/iOS/Windows/Linux; `android-native-keyring-store`
-# is added explicitly since it is NOT part of `v1`'s default set.
+# (default) covers macOS/Windows/Linux, but NOT iOS despite its own docs
+# implying otherwise -- `v1` only forwards apple-native-keyring-store's
+# `keychain` feature, and that backend is explicitly "Ignored on iOS" per
+# apple-native-keyring-store's own module docs (iOS has only the
+# "protected data" store, no legacy keychain at all); building for iOS
+# without `protected` hits apple-native-keyring-store's own
+# compile_error!("The `protected` feature is required on iOS"). Verified
+# 2026-09-05 against real iOS CI (macula-cam2me's ios.yml), not assumed.
+# `android-native-keyring-store` is added explicitly since it is NOT part
+# of `v1`'s default set either.
 keyring = { version = "4", features = ["android-native-keyring-store"] }
 # keystore.rs's LinuxKeyutilsStore: a second, independently-selectable
 # KeyStore backend demonstrating the trait is genuinely overridable, not
@@ -64,6 +72,15 @@ keyring = { version = "4", features = ["android-native-keyring-store"] }
 [target.'cfg(target_os = "linux")'.dependencies]
 keyring-core = "1"
 linux-keyutils-keyring-store = "1"
+
+# Unifies apple-native-keyring-store's `protected` feature into the same
+# optional dependency keyring (v1, above) already pulls in for
+# cfg(any(macos, ios)) -- see the comment on the main `keyring` line.
+# Version constraint ("1") deliberately matches keyring 4.2.0's own exactly
+# so Cargo resolves both to the SAME crate instance and unifies features,
+# rather than risking two separate resolved versions.
+[target.'cfg(target_os = "ios")'.dependencies]
+apple-native-keyring-store = { version = "1", features = ["protected"] }
 
 [dev-dependencies]
 hex = "0.4"

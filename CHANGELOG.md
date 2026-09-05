@@ -13,6 +13,26 @@ usually touches both, but their version numbers don't move in lockstep.
 
 ## macula-rust
 
+### [0.2.4] - 2026-09-05
+
+#### Fixed
+
+- **`keyring` dependency didn't actually build for iOS**, despite this
+  crate's own Cargo.toml comment claiming `v1` covered it. `v1` only
+  forwards `apple-native-keyring-store`'s `keychain` feature, and that
+  backend is explicitly "Ignored on iOS" per its own docs — iOS has only
+  the "protected data" store, no legacy keychain. Any consumer building
+  this crate (or `macula-rust-ffi`) for an iOS target hit
+  `apple-native-keyring-store`'s own
+  `compile_error!("The \`protected\` feature is required on iOS")`.
+  Surfaced by real iOS CI (macula-cam2me's `ios.yml`) the first time
+  anything actually cross-compiled this crate for iOS since keyring 4 was
+  adopted — no source change needed, keystore.rs is already backend-
+  agnostic; fixed by unifying `apple-native-keyring-store`'s `protected`
+  feature in via a matching `[target.'cfg(target_os = "ios")'.dependencies]`
+  entry, the same pattern this crate already used for its Linux-only
+  keyutils backend.
+
 ### [0.2.3] - 2026-09-05
 
 A full adversarial security/correctness sweep of the whole crate, requested
