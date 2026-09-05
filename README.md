@@ -79,38 +79,90 @@ here.
 
 ## Quick start
 
-Also lives as a runnable example — `cargo run --example quickstart`:
+Also lives as a runnable example — `cargo run --example quickstart`.
+Advertises and calls its own trivial echo procedure (two identities, a
+provider and a caller, since a station kicks a connection the instant a
+second one arrives under the same identity) rather than depending on any
+particular procedure already being advertised on the fleet:
 
 ```rust
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use macula_rust::{cbor::Value, connection, identity::KeyPair, transport::Trust};
+use macula_rust::{
+    cbor::Value,
+    connection::{self, BoxFuture, CallHandler},
+    frame::AdvertiseSpec,
+    identity::KeyPair,
+    transport::Trust,
+};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Puzzle-hardened identity — required. An unhardened identity fails
+    // Puzzle-hardened identities — required. An unhardened identity fails
     // the handshake silently (QUIC/TLS looks healthy, HELLO never accepts).
-    let identity = KeyPair::generate_with_default_puzzle();
+    let provider_identity = KeyPair::generate_with_default_puzzle();
+    let caller_identity = KeyPair::generate_with_default_puzzle();
 
-    let mut session = connection::connect(
+    let mut provider_session = connection::connect(
         "station-de-frankfurt.macula.io",
         4433,
         Trust::WebPki,
-        &identity,
+        &provider_identity,
+    )
+    .await?;
+    let mut caller_session = connection::connect(
+        "station-de-frankfurt.macula.io",
+        4433,
+        Trust::WebPki,
+        &caller_identity,
     )
     .await?;
 
-    let now_ms = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as i128;
-    let response = session
-        .call(
-            "io.macula.echo",
-            [0u8; 32], // realm id
-            Value::Text("hello".into()),
-            now_ms + 5_000, // deadline_ms
-            &identity,
-            Duration::from_secs(5),
-        )
-        .await?;
+    let realm = [0u8; 32];
+    // Unique per run — reusing a fixed procedure name across rapid
+    // repeated runs can hit stale DHT routing state from the prior run's
+    // now-dead advertiser.
+    let procedure = format!(
+        "macula_rust.quickstart_echo.{}",
+        SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
+    );
 
+    let advertise_spec = AdvertiseSpec::new(realm, procedure.clone(), provider_identity.node_id());
+    provider_session
+        .advertise(&advertise_spec, &provider_identity)
+        .await?;
+    tokio::time::sleep(Duration::from_millis(500)).await; // ADVERTISE is fire-and-forget; give it a moment to land
+
+    let target_procedure = procedure.clone();
+    let lookup = move |_realm: &[u8; 32], proc: &str| -> Option<CallHandler> {
+        if proc != target_procedure {
+            return None;
+        }
+        let handler: CallHandler = std::sync::Arc::new(|payload: Value| {
+            Box::pin(async move { Ok(payload) }) as BoxFuture<'static, Result<Value, String>>
+        });
+        Some(handler)
+    };
+
+    // Run concurrently via tokio::join!, not tokio::spawn — spawning the
+    // provider's serve_one_call onto a separate task under this
+    // function's default MULTI-THREADED runtime reproduced a genuine
+    // cross-thread timeout on the caller side; join! (both futures
+    // polled cooperatively on this one task) does not.
+    let serve_future = provider_session.serve_one_call(lookup, &provider_identity, Duration::from_secs(10));
+
+    let now_ms = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as i128;
+    let call_future = caller_session.call(
+        &procedure,
+        realm,
+        Value::Text("hello".into()),
+        now_ms + 5_000, // deadline_ms
+        &caller_identity,
+        Duration::from_secs(5),
+    );
+
+    let (serve_result, call_result) = tokio::join!(serve_future, call_future);
+    serve_result?;
+    let response = call_result?;
     println!("{response:?}");
     Ok(())
 }
@@ -159,18 +211,18 @@ cargo run -p macula-rust-ffi --release --bin uniffi-bindgen -- generate \
 
 ### Connecting and a basic call
 
-Signatures cross-checked against real generated bindings (`uniffi-bindgen generate`, both languages), not guessed — `call` takes no separate deadline, only a timeout:
+Signatures cross-checked against real generated bindings (`uniffi-bindgen generate`, both languages), not guessed — `call` takes no separate deadline, only a timeout. Calls `math.double`, the procedure the [`Doubler`](#mobile-bindings-uniffi) example above this one advertises and serves — this SDK's own, not a fleet-wide service, so it only resolves while that example (or an equivalent provider) is actually running:
 
 ```kotlin
 val identity = FfiKeyPair.generate()
 val session = FfiSession.connect("station-de-frankfurt.macula.io", 4433.toUShort(), FfiTrust.WebPki, identity)
-val response = session.call("io.macula.echo", realm, FfiValue.Text("hello"), 5_000uL, identity)
+val response = session.call("math.double", realm, FfiValue.Int(21), 5_000uL, identity)
 ```
 
 ```swift
 let identity = FfiKeyPair.generate()
 let session = try await FfiSession.connect(host: "station-de-frankfurt.macula.io", port: 4433, trust: .webPki, identity: identity)
-let response = try await session.call(procedure: "io.macula.echo", realm: realm, payload: .text("hello"), timeoutMs: 5_000, identity: identity)
+let response = try await session.call(procedure: "math.double", realm: realm, payload: .int(21), timeoutMs: 5_000, identity: identity)
 ```
 
 ### Persisting identity via platform secure storage
