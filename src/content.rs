@@ -186,7 +186,16 @@ pub async fn get(
     }
 
     let manifest = get_manifest(&mut stream, &mcid, identity).await?;
-    let mut data = Vec::with_capacity(manifest.size as usize);
+    // Deliberately NOT `Vec::with_capacity(manifest.size as usize)`:
+    // `manifest.size` is a bare claim from whichever peer served this
+    // manifest, unverified until every chunk is in hand and
+    // `manifest::verify` runs below — a single small malicious manifest
+    // could otherwise claim an enormous size and trigger an immediate,
+    // unbounded allocation attempt before a single byte of real content
+    // has been fetched. Growing the buffer as genuinely-received,
+    // individually-hash-verified chunks arrive bounds memory use to
+    // what has actually, legitimately come off the wire.
+    let mut data = Vec::new();
     for index in 0..manifest.chunk_count {
         let chunk_mcid = manifest::chunk_mcid(&manifest, index)
             .expect("index < manifest.chunk_count, so manifest.chunks[index] exists");

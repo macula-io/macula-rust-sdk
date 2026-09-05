@@ -352,6 +352,20 @@ fn chunk_info_to_wire(info: &ChunkInfo) -> Value {
 pub enum FromWireError {
     MissingField(&'static str),
     WrongFieldType(&'static str),
+    /// `chunk_size` is 0. Never produced by [`create`] (its own doc
+    /// comment already requires a non-zero `chunk_size`), so this only
+    /// ever rejects a malicious/malformed wire manifest — accepting it
+    /// would panic downstream: `[T]::chunks(0)` (called from
+    /// [`verify`]'s own `do_chunk`) panics unconditionally on a zero
+    /// chunk size, even for empty content.
+    ZeroChunkSize,
+    /// `chunk_count` doesn't match the actual number of entries in the
+    /// `chunks` list. Never produced by [`create`] (`chunk_count` is
+    /// always `chunk_infos.len()`), so this only ever rejects a
+    /// malicious/malformed wire manifest — accepting it would let a
+    /// caller iterate `0..chunk_count` past the real end of `chunks`
+    /// and panic on the resulting `None` from [`chunk_mcid`].
+    InconsistentChunkCount,
 }
 
 impl std::fmt::Display for FromWireError {
@@ -359,6 +373,13 @@ impl std::fmt::Display for FromWireError {
         match self {
             FromWireError::MissingField(name) => write!(f, "missing required field {name:?}"),
             FromWireError::WrongFieldType(name) => write!(f, "field {name:?} has the wrong type"),
+            FromWireError::ZeroChunkSize => write!(f, "chunk_size is 0"),
+            FromWireError::InconsistentChunkCount => {
+                write!(
+                    f,
+                    "chunk_count does not match the number of entries in chunks"
+                )
+            }
         }
     }
 }
@@ -384,6 +405,12 @@ pub fn from_wire(value: &Value) -> Result<Manifest, FromWireError> {
         Some(_) => return Err(FromWireError::WrongFieldType("chunks")),
         None => return Err(FromWireError::MissingField("chunks")),
     };
+    if chunk_size == 0 {
+        return Err(FromWireError::ZeroChunkSize);
+    }
+    if chunks.len() != chunk_count {
+        return Err(FromWireError::InconsistentChunkCount);
+    }
     Ok(Manifest {
         mcid,
         version,
@@ -587,6 +614,36 @@ mod tests {
         assert_eq!(
             from_wire(&value),
             Err(FromWireError::MissingField("version"))
+        );
+    }
+
+    /// A malicious/malformed manifest claiming `chunk_size: 0` must be
+    /// rejected at parse time, not accepted and left to panic later:
+    /// `verify`'s own `do_chunk` calls `[T]::chunks(manifest.chunk_size)`,
+    /// which panics unconditionally when its argument is 0.
+    #[test]
+    fn from_wire_rejects_zero_chunk_size() {
+        let (manifest, _) = create_with_created(b"AAAABBBBCCCC", &CreateOptions::default(), 0);
+        let tampered = to_wire(&manifest).with_field("chunk_size", Value::Int(0));
+        assert_eq!(from_wire(&tampered), Err(FromWireError::ZeroChunkSize));
+    }
+
+    /// A malicious/malformed manifest whose `chunk_count` doesn't match
+    /// the actual number of entries in `chunks` must be rejected at
+    /// parse time: a caller iterating `0..chunk_count` (see
+    /// `content::get`) would otherwise index past the real end of
+    /// `chunks` and panic on the resulting `None`.
+    #[test]
+    fn from_wire_rejects_inconsistent_chunk_count() {
+        let opts = CreateOptions {
+            chunk_size: 4,
+            ..CreateOptions::default()
+        };
+        let (manifest, _) = create_with_created(b"AAAABBBBCCCC", &opts, 0);
+        let tampered = to_wire(&manifest).with_field("chunk_count", Value::Int(1000));
+        assert_eq!(
+            from_wire(&tampered),
+            Err(FromWireError::InconsistentChunkCount)
         );
     }
 

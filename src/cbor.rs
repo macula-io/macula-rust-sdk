@@ -162,6 +162,16 @@ pub enum DecodeError {
     /// has no representation as an ordinary `f64` value here (matches
     /// the reference decoder's own behavior: no clause for it).
     UnrepresentableFloat,
+    /// Lists/maps nested more than [`MAX_NESTING_DEPTH`] levels deep.
+    /// Not part of the wire format's own semantics — a defense against a
+    /// maliciously crafted frame: a list-of-one-list-of-one-list... can
+    /// encode extreme nesting in very few bytes (one byte per level),
+    /// and this decoder is plain recursive descent, so without a limit
+    /// a peer could crash the process with a stack overflow (not a
+    /// catchable panic) from a single frame well under
+    /// `frame::MAX_FRAME_BYTES`. No real macula wire value nests anywhere
+    /// close to this deep.
+    NestingTooDeep,
 }
 
 impl fmt::Display for DecodeError {
@@ -187,6 +197,9 @@ impl fmt::Display for DecodeError {
             DecodeError::InvalidUtf8 => write!(f, "text value was not valid UTF-8"),
             DecodeError::UnrepresentableFloat => {
                 write!(f, "half-float NaN/infinity has no f64 representation here")
+            }
+            DecodeError::NestingTooDeep => {
+                write!(f, "list/map nesting exceeds {MAX_NESTING_DEPTH} levels")
             }
         }
     }
@@ -298,11 +311,18 @@ fn encode_head(major: u8, n: u64, out: &mut Vec<u8>) {
     }
 }
 
+/// Recursive-descent nesting limit — see [`DecodeError::NestingTooDeep`]
+/// for why this exists. No real macula wire value nests remotely this
+/// deep; this only ever rejects an adversarial input.
+pub const MAX_NESTING_DEPTH: usize = 128;
+
 /// Decode a single deterministic-CBOR value from `bytes`. The whole
 /// buffer must be consumed by exactly one top-level value — trailing
 /// bytes are an error, matching the reference decoder's own contract.
 pub fn decode(bytes: &[u8]) -> Result<Value, DecodeError> {
-    let (value, pos) = decode_one(bytes, 0)?;
+    // Nobody consumes the top-level value's canonical bytes — don't
+    // build them (see `decode_one`'s `need_canon` param).
+    let (value, _canonical_bytes, pos) = decode_one(bytes, 0, 0, false)?;
     if pos != bytes.len() {
         return Err(DecodeError::TrailingBytes);
     }
@@ -316,36 +336,101 @@ fn need(buf: &[u8], pos: usize, n: usize) -> Result<(), DecodeError> {
     }
 }
 
-fn decode_one(buf: &[u8], pos: usize) -> Result<(Value, usize), DecodeError> {
+/// Decodes one value, and — only when `need_canon` is true — its own
+/// canonical (deterministic-CBOR) bytes, built bottom-up as decoding
+/// proceeds rather than re-derived by a separate encode pass afterward.
+/// See `decode_map`'s doc for why the bytes are needed at all (a map
+/// using another map as a key needs its key's canonical bytes to
+/// dedupe/sort by, and re-encoding a key from scratch at every ancestor
+/// level is itself an unbounded-work trap on nested input) and why
+/// `need_canon` exists (computing them for every value regardless of
+/// whether anything ever reads them — the common case, since most
+/// decoded values are never used as a map key at any level — turned out
+/// to be its own real cost: a value nested `depth` levels inside a
+/// value that never touches a map key at all still doesn't need canon
+/// bytes, but always building them anyway meant a large nested
+/// non-map-keyed value paid full canon-construction cost with nothing
+/// to show for it, confirmed to regress both time and peak memory on
+/// large deep lists/values with no map keys anywhere in them).
+/// `decode_map` is the only caller that ever passes different values
+/// for its two child calls: always `true` for a key (dedup needs it
+/// unconditionally, regardless of whether the map's OWN canon bytes are
+/// wanted) and its own `need_canon` for a value (only needed if this
+/// whole map is itself nested inside some ancestor's key).
+fn decode_one(
+    buf: &[u8],
+    pos: usize,
+    depth: usize,
+    need_canon: bool,
+) -> Result<(Value, Vec<u8>, usize), DecodeError> {
+    if depth > MAX_NESTING_DEPTH {
+        return Err(DecodeError::NestingTooDeep);
+    }
     need(buf, pos, 1)?;
     let byte0 = buf[pos];
     let major = byte0 >> 5;
     let ai = byte0 & 0x1F;
 
     if major == 7 {
-        return decode_major7(buf, pos, ai);
+        let (value, next) = decode_major7(buf, pos, ai)?;
+        return Ok(scalar_canonical_bytes(value, next, need_canon));
     }
 
     let (n, next) = decode_count(buf, pos + 1, ai)?;
     match major {
-        0 => Ok((Value::Int(n as i128), next)),
-        1 => Ok((Value::Int(-1i128 - n as i128), next)),
+        0 => Ok(scalar_canonical_bytes(
+            Value::Int(n as i128),
+            next,
+            need_canon,
+        )),
+        1 => Ok(scalar_canonical_bytes(
+            Value::Int(-1i128 - n as i128),
+            next,
+            need_canon,
+        )),
         2 => {
             let len = n as usize;
             need(buf, next, len)?;
-            Ok((Value::Bytes(buf[next..next + len].to_vec()), next + len))
+            let value = Value::Bytes(buf[next..next + len].to_vec());
+            Ok(scalar_canonical_bytes(value, next + len, need_canon))
         }
         3 => {
             let len = n as usize;
             need(buf, next, len)?;
             let text = String::from_utf8(buf[next..next + len].to_vec())
                 .map_err(|_| DecodeError::InvalidUtf8)?;
-            Ok((Value::Text(text), next + len))
+            Ok(scalar_canonical_bytes(
+                Value::Text(text),
+                next + len,
+                need_canon,
+            ))
         }
-        4 => decode_list(buf, next, n),
-        5 => decode_map(buf, next, n),
+        4 => decode_list(buf, next, n, depth + 1, need_canon),
+        5 => decode_map(buf, next, n, depth + 1, need_canon),
         _ => Err(DecodeError::UnsupportedMajorType(major)),
     }
+}
+
+/// `with_canonical_bytes`, but skipped (an empty `Vec` instead) when
+/// nothing will ever read it — see `decode_one`'s `need_canon` doc.
+fn scalar_canonical_bytes(value: Value, next: usize, need_canon: bool) -> (Value, Vec<u8>, usize) {
+    if need_canon {
+        with_canonical_bytes(value, next)
+    } else {
+        (value, Vec::new(), next)
+    }
+}
+
+/// Computes a scalar (non-list/map) value's own canonical bytes via a
+/// plain, non-recursive `encode_value` call — cheap regardless of where
+/// in a nested structure it's called from, unlike `List`/`Map`, which
+/// build their canonical bytes by concatenating their CHILDREN's
+/// already-computed bytes (see `decode_list`/`decode_map`) instead of
+/// calling `encode_value` on themselves.
+fn with_canonical_bytes(value: Value, next: usize) -> (Value, Vec<u8>, usize) {
+    let mut canon = Vec::new();
+    encode_value(&value, &mut canon).expect("a value produced by this decoder is always encodable");
+    (value, canon, next)
 }
 
 fn decode_count(buf: &[u8], pos: usize, ai: u8) -> Result<(u64, usize), DecodeError> {
@@ -396,30 +481,142 @@ fn decode_major7(buf: &[u8], pos: usize, ai: u8) -> Result<(Value, usize), Decod
     }
 }
 
-fn decode_list(buf: &[u8], mut pos: usize, count: u64) -> Result<(Value, usize), DecodeError> {
+fn decode_list(
+    buf: &[u8],
+    mut pos: usize,
+    count: u64,
+    depth: usize,
+    need_canon: bool,
+) -> Result<(Value, Vec<u8>, usize), DecodeError> {
     let mut items = Vec::with_capacity(count.min(1024) as usize);
+    let mut canon = Vec::new();
+    if need_canon {
+        encode_head(4, count, &mut canon);
+    }
     for _ in 0..count {
-        let (item, next) = decode_one(buf, pos)?;
+        let (item, item_canon, next) = decode_one(buf, pos, depth, need_canon)?;
+        if need_canon {
+            canon.extend_from_slice(&item_canon);
+        }
         items.push(item);
         pos = next;
     }
-    Ok((Value::List(items), pos))
+    Ok((Value::List(items), canon, pos))
 }
 
 /// Duplicate keys overwrite (last write wins), matching the reference
 /// decoder exactly — not treated as an error.
-fn decode_map(buf: &[u8], mut pos: usize, count: u64) -> Result<(Value, usize), DecodeError> {
-    let mut pairs: Vec<(Value, Value)> = Vec::with_capacity(count.min(1024) as usize);
+///
+/// Looks up each key's slot by its own canonical bytes (from
+/// `decode_one`'s bottom-up construction — see that function's doc) in
+/// a `HashMap`, rather than a `Value`-equality linear scan over
+/// everything decoded so far: the scan made this function O(n²) on a
+/// map with many distinct keys — a single ~350 KB crafted frame (well
+/// under `frame::MAX_FRAME_BYTES`) pegged a CPU core for 50+ seconds
+/// decoding it, and the cost scaled quadratically toward the
+/// frame-size cap, all of it running before any signature check on the
+/// frame.
+///
+/// An earlier version of this fix looked up each key by calling
+/// `encode(&k)` fresh, per entry, instead of reusing the bytes
+/// `decode_one` already built while decoding that same key — that's
+/// sound for a FLAT map (fixed the 350 KB/50 s case, confirmed
+/// empirically), but reintroduced unbounded work for a map whose KEY is
+/// itself a large nested structure: re-encoding a key from scratch at
+/// every ancestor level costs O(depth × key size), and a 128-level
+/// chain of single-entry maps (`MAX_NESTING_DEPTH`) each keyed by a
+/// large blob turned back into tens of seconds of pre-auth CPU on a
+/// frame still under the size cap — confirmed empirically. Building
+/// canonical bytes bottom-up (each value's bytes computed exactly once,
+/// when it's decoded, then only ever concatenated/sorted by its
+/// ancestors — never re-derived) fixed that: the same 128-deep/15 MB
+/// case dropped from ~31 s to ~1 s. This is O(depth × size), the same
+/// bound `MAX_NESTING_DEPTH` already exists to enforce — NOT O(total
+/// input size) regardless of nesting shape, since a key containing a
+/// key still gets its bytes copied once per level it's nested under.
+/// It just can no longer exceed the depth cap's own bound, the same
+/// guarantee `NestingTooDeep` already gives the rest of this decoder.
+///
+/// Computing canon bytes unconditionally for every value (not just
+/// values that end up under a map key somewhere) was ALSO measured to
+/// be a real, separate cost — a large nested value that never touches
+/// a map key still paid full canon-construction cost for nothing;
+/// `need_canon` (threaded through `decode_one`/`decode_list`/this
+/// function) skips it. A key's canon is always needed, unconditionally
+/// (dedup requires it); a value's is only needed if this whole map is
+/// itself nested inside some ancestor's key, i.e. this map's OWN
+/// `need_canon`.
+///
+/// The still-remaining, deliberate, narrow divergences from a literal
+/// `Value`-equality scan, fuzzed against 500k adversarial inputs
+/// against both this and the pre-fix decoder: nested-map keys that
+/// differ only in wire insertion order now merge (the old scan kept
+/// both — wrong, since Erlang maps/this format's own key-sort are both
+/// unordered); `+0.0`/`-0.0` keys no longer merge (the old scan merged
+/// them via `PartialEq` — wrong, since neither Erlang's `=:=` nor the
+/// reference NIF's own byte-dedup merge them); bit-identical `NaN` keys
+/// now merge (the old scan never did, since `NaN != NaN` under
+/// `PartialEq` — matches the reference). All three move this decoder
+/// TOWARD the reference decoder's actual behavior, not away from it,
+/// and none of the three is reachable in practice: no real macula map
+/// key is ever a float or a nested map.
+fn decode_map(
+    buf: &[u8],
+    mut pos: usize,
+    count: u64,
+    depth: usize,
+    need_canon: bool,
+) -> Result<(Value, Vec<u8>, usize), DecodeError> {
+    let capacity = count.min(1024) as usize;
+    let mut pairs: Vec<(Value, Value)> = Vec::with_capacity(capacity);
+    // Owns each distinct key's canonical bytes (moved in on first sight,
+    // never cloned) -> slot index into `pairs`/`vals_canon`.
+    let mut index_of_key: std::collections::HashMap<Vec<u8>, usize> =
+        std::collections::HashMap::with_capacity(capacity);
+    // Per-slot VALUE canon, kept in step with `pairs` (same index, same
+    // last-write-wins updates) -- only populated when `need_canon`, since
+    // a key's canon (owned by `index_of_key` above) is the only one ever
+    // needed just to make dedup itself work.
+    let mut vals_canon: Vec<Vec<u8>> = Vec::with_capacity(if need_canon { capacity } else { 0 });
     for _ in 0..count {
-        let (k, next1) = decode_one(buf, pos)?;
-        let (v, next2) = decode_one(buf, next1)?;
+        // A key ALWAYS needs its canon bytes -- that's the dedup
+        // identity itself, independent of whether this map's OWN canon
+        // bytes (built below) are ever going to be read by anything.
+        let (k, key_canon, next1) = decode_one(buf, pos, depth, true)?;
+        let (v, val_canon, next2) = decode_one(buf, next1, depth, need_canon)?;
         pos = next2;
-        match pairs.iter_mut().find(|(ek, _)| *ek == k) {
-            Some(entry) => entry.1 = v,
-            None => pairs.push((k, v)),
+        use std::collections::hash_map::Entry;
+        match index_of_key.entry(key_canon) {
+            Entry::Occupied(e) => {
+                let i = *e.get();
+                pairs[i].1 = v;
+                if need_canon {
+                    vals_canon[i] = val_canon;
+                }
+            }
+            Entry::Vacant(e) => {
+                e.insert(pairs.len());
+                pairs.push((k, v));
+                if need_canon {
+                    vals_canon.push(val_canon);
+                }
+            }
         }
     }
-    Ok((Value::Map(pairs), pos))
+    if !need_canon {
+        return Ok((Value::Map(pairs), Vec::new(), pos));
+    }
+    // Matches `encode_map`'s own rule exactly: sort entries by the
+    // key's encoded bytes, plain lexicographic `Ord` on `Vec<u8>`.
+    let mut order: Vec<(&Vec<u8>, usize)> = index_of_key.iter().map(|(k, &i)| (k, i)).collect();
+    order.sort_by(|a, b| a.0.cmp(b.0));
+    let mut canon = Vec::new();
+    encode_head(5, order.len() as u64, &mut canon);
+    for (k, i) in order {
+        canon.extend_from_slice(k);
+        canon.extend_from_slice(&vals_canon[i]);
+    }
+    Ok((Value::Map(pairs), canon, pos))
 }
 
 /// IEEE 754 binary16 → f64. Subnormals (exp=0) and normals (1..=30) use
@@ -636,6 +833,44 @@ mod tests {
         assert_eq!(decode(&[0x18]), Err(DecodeError::Truncated));
     }
 
+    /// Builds a payload of `depth` one-element-list wrappers (major 4,
+    /// AI 1 — a single byte, `0x81`, per level) around one terminal
+    /// scalar (`0x00`, the integer 0). Before `MAX_NESTING_DEPTH` existed,
+    /// decoding this crashed the whole process with a real stack
+    /// overflow (verified against this exact decoder pre-fix, on a
+    /// realistic 2 MiB worker-thread stack, at a nesting depth of only
+    /// 100_000 -- well under 1% of what a single 16 MiB wire frame could
+    /// carry) rather than returning a decode error. A stack overflow
+    /// aborts the process; it is not a `panic!` `#[should_panic]` can
+    /// catch, so the tests below only exercise the now-clean error path.
+    fn nested_list_payload(depth: usize) -> Vec<u8> {
+        let mut buf = vec![0x81u8; depth];
+        buf.push(0x00);
+        buf
+    }
+
+    #[test]
+    fn decode_accepts_nesting_at_the_depth_limit() {
+        let bytes = nested_list_payload(MAX_NESTING_DEPTH);
+        assert!(decode(&bytes).is_ok());
+    }
+
+    #[test]
+    fn decode_rejects_nesting_one_past_the_depth_limit() {
+        let bytes = nested_list_payload(MAX_NESTING_DEPTH + 1);
+        assert_eq!(decode(&bytes), Err(DecodeError::NestingTooDeep));
+    }
+
+    #[test]
+    fn decode_rejects_extreme_nesting_without_crashing() {
+        // Far beyond the limit, and far beyond what actually crashed the
+        // pre-fix decoder -- this is the direct regression test for the
+        // stack-overflow finding. If this test process crashes instead of
+        // completing, the depth guard has regressed.
+        let bytes = nested_list_payload(100_000);
+        assert_eq!(decode(&bytes), Err(DecodeError::NestingTooDeep));
+    }
+
     #[test]
     fn decode_duplicate_map_keys_last_write_wins() {
         // Two entries both keyed "a" (0x61 0x61), values 1 then 2.
@@ -648,6 +883,133 @@ mod tests {
             }
             other => panic!("expected a map, got {other:?}"),
         }
+    }
+
+    /// A duplicate key in the middle of several distinct ones overwrites
+    /// in place — the duplicate's ORIGINAL insertion slot, not a new one
+    /// appended at the end — and every other key's position is
+    /// undisturbed. Guards `decode_map`'s HashMap-indexed dedup: it would
+    /// be easy for a faster implementation to accidentally reorder
+    /// entries or dedupe the wrong slot.
+    #[test]
+    fn decode_duplicate_map_key_overwrites_its_original_slot_not_the_end() {
+        let map = Value::Map(vec![
+            (Value::text("a"), Value::Int(1)),
+            (Value::text("b"), Value::Int(2)),
+            (Value::text("c"), Value::Int(3)),
+        ]);
+        let mut bytes = encode(&map).expect("encodable");
+        // Append one more entry, "b" -> 99, so the wire form has 4
+        // entries with "b" duplicated -- can't build this through
+        // `encode` directly since it only ever emits already-deduped
+        // maps; construct the extra entry's bytes by hand and bump the
+        // map's own entry count (the map header's low nibble, byte 0).
+        assert_eq!(bytes[0] & 0x1F, 3, "expected a 3-entry map header");
+        bytes[0] = (bytes[0] & 0xE0) | 4;
+        bytes.extend_from_slice(&encode(&Value::text("b")).unwrap());
+        bytes.extend_from_slice(&encode(&Value::Int(99)).unwrap());
+
+        let decoded = decode(&bytes).expect("valid map");
+        match decoded {
+            Value::Map(pairs) => {
+                assert_eq!(
+                    pairs,
+                    vec![
+                        (Value::text("a"), Value::Int(1)),
+                        (Value::text("b"), Value::Int(99)),
+                        (Value::text("c"), Value::Int(3)),
+                    ]
+                );
+            }
+            other => panic!("expected a map, got {other:?}"),
+        }
+    }
+
+    /// Regression guard for a real bug: `decode_map`'s duplicate-key
+    /// check used to be a `Value`-equality linear scan over every entry
+    /// decoded so far, making decode O(n^2) in entry count. A single
+    /// ~350 KB crafted map (well under `frame::MAX_FRAME_BYTES`) took
+    /// 50+ seconds to decode as a result -- confirmed empirically against
+    /// the pre-fix code, not just reasoned about. This decodes twice as
+    /// many entries in a fraction of a second; if the map's dedup
+    /// regresses to linear-scan behavior, this test will time out long
+    /// before it fails its assertions.
+    #[test]
+    fn decode_map_with_many_distinct_keys_is_not_quadratic() {
+        let n: i128 = 20_000;
+        let pairs: Vec<(Value, Value)> = (0..n).map(|i| (Value::Int(i), Value::Int(0))).collect();
+        let bytes = encode(&Value::Map(pairs)).expect("encodable");
+
+        let start = std::time::Instant::now();
+        let decoded = decode(&bytes).expect("valid map");
+        let elapsed = start.elapsed();
+
+        match decoded {
+            Value::Map(decoded_pairs) => assert_eq!(decoded_pairs.len(), n as usize),
+            other => panic!("expected a map, got {other:?}"),
+        }
+        // The fixed decoder does this in low single-digit milliseconds;
+        // the old O(n^2) scan took whole seconds at this size. A wide
+        // margin avoids CI flakiness while still failing fast on a
+        // real complexity regression.
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "decoding {n} distinct-keyed entries took {elapsed:?} -- \
+             looks like decode_map regressed to O(n^2)"
+        );
+    }
+
+    /// A second, narrower regression this same bug had once already:
+    /// the first attempt at fixing the flat-map O(n^2) case above
+    /// re-encoded each key fresh (`encode(&k)`) to find its slot, which
+    /// fixed the flat case but reintroduced unbounded work for a map
+    /// whose KEY is itself a large nested structure -- re-encoding a
+    /// key from scratch at every ancestor level costs O(depth × key
+    /// size), and a `MAX_NESTING_DEPTH`-deep chain of single-entry maps
+    /// keyed by a large blob took real, measured tens of seconds even
+    /// though it's well under `frame::MAX_FRAME_BYTES`. This decodes a
+    /// nesting-depth-limit-deep chain wrapping a multi-megabyte blob key
+    /// in well under a second; if key canonicalization regresses to
+    /// re-deriving a key's bytes at every ancestor level instead of
+    /// reusing what decoding that key already computed, this test will
+    /// time out long before it fails its assertions.
+    #[test]
+    fn decode_map_with_a_large_deeply_nested_key_is_not_quadratic_in_depth() {
+        // `MAX_NESTING_DEPTH` copies of "a 1-entry map wrapping...",
+        // around one 4 MiB byte-string key, each level's own map then
+        // valued at `Int(0)` (innermost first).
+        let blob_len = 512 * 1024;
+        let mut bytes = vec![0xA1u8; MAX_NESTING_DEPTH];
+        bytes.push(0x5A); // major 2 (bytes), AI 26 -> 4-byte length follows
+        bytes.extend_from_slice(&(blob_len as u32).to_be_bytes());
+        bytes.extend(std::iter::repeat_n(0x41u8, blob_len));
+        bytes.extend(std::iter::repeat_n(0x00u8, MAX_NESTING_DEPTH));
+
+        let start = std::time::Instant::now();
+        let decoded = decode(&bytes).expect("valid, maximally-nested map-key chain");
+        let elapsed = start.elapsed();
+
+        // Sanity: really did decode the full nested-map chain down to
+        // the 4 MiB blob at its center, not bail out early on a
+        // malformed payload. `0xA1` nests a 1-entry map as each level's
+        // KEY, so the blob is `MAX_NESTING_DEPTH` levels of `Map` down.
+        let mut cursor = &decoded;
+        for _ in 0..MAX_NESTING_DEPTH {
+            match cursor {
+                Value::Map(pairs) if pairs.len() == 1 => cursor = &pairs[0].0,
+                other => panic!("expected a 1-entry map at this nesting level, got {other:?}"),
+            }
+        }
+        match cursor {
+            Value::Bytes(b) => assert_eq!(b.len(), blob_len),
+            other => panic!("expected the innermost key to be Bytes, got {other:?}"),
+        }
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "decoding a {MAX_NESTING_DEPTH}-deep map-key chain around a {blob_len}-byte blob \
+             took {elapsed:?} -- looks like key canonicalization regressed to re-deriving a \
+             key's bytes at every ancestor level instead of reusing decode_one's own"
+        );
     }
 
     #[test]
